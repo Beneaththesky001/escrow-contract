@@ -1291,13 +1291,15 @@ fn test_fund_rejects_empty_milestone_set() {
     let token_contract_id = env
         .register_stellar_asset_contract_v2(admin_addr.clone())
         .address();
-    let token = token::Client::new(&env, &token_contract_id);
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
+    // An empty milestone list is now rejected by `initialize` itself (#11),
+    // so a job with zero milestones can never be persisted for `fund` to
+    // reject later.
     let amounts = soroban_sdk::Vec::new(&env);
-    client.initialize(
+    let result = client.try_initialize(
         &admin_addr,
         &client_addr,
         &freelancer_addr,
@@ -1306,11 +1308,7 @@ fn test_fund_rejects_empty_milestone_set() {
         &604800,
         &amounts,
     );
-
-    let result = client.try_fund(&client_addr);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
-    assert_eq!(token.balance(&client_addr), 0);
-    assert_eq!(token.balance(&contract_id), 0);
 }
 
 #[test]
@@ -2899,6 +2897,9 @@ fn test_claim_auto_release_zero_auto_release_seconds_fails() {
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
     let amounts = vec![&env, 5_000_i128];
+    // auto_release_seconds = 0 is now rejected by `initialize` itself (#11),
+    // so a job with this value can never be persisted for claim_auto_release
+    // to reject later.
     let result = client.try_initialize(
         &admin_addr,
         &client_addr,
@@ -2908,10 +2909,6 @@ fn test_claim_auto_release_zero_auto_release_seconds_fails() {
         &0u64,
         &amounts,
     );
-    client.fund(&client_addr);
-    client.mark_delivered(&freelancer_addr, &0u32);
-
-    let result = client.try_claim_auto_release(&freelancer_addr, &0u32);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 }
 
@@ -4765,17 +4762,7 @@ fn test_initialize_auto_release_seconds_zero_fails() {
         &0u64,
         &amounts,
     );
-    assert!(
-        init_result.is_ok(),
-        "initialize with auto_release_seconds=0 should succeed"
-    );
-
-    escrow.fund(&client_addr);
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-
-    // claim_auto_release must reject auto_release_seconds=0 with InvalidAmount.
-    let claim_result = escrow.try_claim_auto_release(&freelancer_addr, &0u32);
-    assert_eq!(claim_result, Err(Ok(Error::InvalidAmount)));
+    assert_eq!(init_result, Err(Ok(Error::InvalidAmount)));
 }
 
 // ============================================================================
