@@ -221,3 +221,174 @@ Milesto/
 - Add support for multiple jobs in contract
 - Add more comprehensive integration tests for backend
 - Audit contract for security issues
+- Close issue #1 once CI confirms green on the by-wallet upgrade
+
+---
+
+## June 22, 2026 (Session 2)
+### ✅ By-Wallet Endpoint — Event-Indexed, Paginated, Role-Aware (Issue #1 Progress)
+
+**Goal**: Replace the stub RPC-based `GET /api/jobs/by-wallet/:address` with a fast, SQLite-backed implementation that reads from the local event indexer.
+
+#### What was built:
+
+**`src/indexer/db.ts`** — Added `getJobsByWallet(address, page, limit)`:
+- Queries `events` table for rows where `data_json LIKE %address%`
+- Parses `data_json` as JSON and checks role fields strictly (`client`, `freelancer`, `arbiter`) — protects against false-positive LIKE matches on other string fields
+- Groups events by `contract_id` using a `Map` — one distinct job per contract
+- Each job summary captures: `contract_id`, `role`, `milestone_count`, `latest_event_type`, `latest_ledger`, `latest_timestamp`
+- Applies `page`/`limit` pagination (1-based, safe clamping)
+- Returns `{ jobs, total, page, limit }`
+- Also exported `JobSummary` and `PaginatedJobs` TypeScript interfaces
+
+**`src/routes/jobs.ts`** — Replaced old `by-wallet` handler:
+- Removed live RPC call (`simulateTransaction` on a hardcoded single contract)
+- Now calls `getJobsByWallet(address, page, limit)` directly from SQLite — sub-millisecond reads
+- Validates `?page` and `?limit` query params with clear 400 errors
+- Response shape: `{ success: true, jobs: [...], total, page, limit }`
+
+**`__tests__/by-wallet.test.ts`** — 15 new tests:
+- Returns empty when no events for address
+- Role detection: client ✅ freelancer ✅ arbiter ✅
+- Grouping: multiple events for same contract → single job entry
+- Multi-contract: distinct jobs across C1/C2/C3
+- False-positive guard: address in `token` field is NOT returned
+- Pagination: page 1 of 2, page 2 of 2, last partial page, page beyond total
+- HTTP integration (supertest): response shape, empty address, pagination params, job field types
+
+#### Verification:
+- `npx tsc --noEmit` → ✅ Zero errors
+- `npm test` → ✅ 19/19 tests pass (3 suites: indexer, jobs, by-wallet)
+- `npm run build` → ✅ Clean
+- Commit: `9bd8508` — `feat: wire indexer into by-wallet endpoint with pagination and role detection`
+- Pushed to GitHub, CI running
+
+### 📁 Updated Project Structure:
+```
+Milesto/
+├── escrow-contract/            # Soroban smart contract
+│   ├── Cargo.toml
+│   ├── Cargo.lock
+│   ├── .gitignore
+│   ├── README.md
+│   ├── CONTRIBUTING.md
+│   ├── context.md
+│   └── contracts/
+│       └── milestone-escrow/
+│           ├── Cargo.toml
+│           ├── src/
+│           │   ├── lib.rs
+│           │   └── test.rs
+│           └── test_snapshots/
+
+├── escrow-frontend/            # Next.js frontend
+│   ├── package.json
+│   ├── package-lock.json
+│   ├── tsconfig.json
+│   ├── next.config.ts
+│   ├── tailwind.config.ts
+│   ├── postcss.config.mjs
+│   ├── .gitignore
+│   ├── .env.local
+│   ├── .env.local.example
+│   ├── README.md
+│   ├── CONTRIBUTING.md
+│   ├── app/
+│   │   ├── layout.tsx
+│   │   ├── page.tsx
+│   │   ├── globals.css
+│   │   ├── lib/
+│   │   │   └── contract.ts
+│   │   ├── context/
+│   │   │   └── WalletContext.tsx
+│   │   ├── components/
+│   │   │   ├── Navbar.tsx
+│   │   │   ├── MilestoneCard.tsx
+│   │   │   └── LoadingSkeleton.tsx
+│   │   ├── create/
+│   │   │   └── page.tsx
+│   │   └── dashboard/
+│   │       └── page.tsx
+│   └── public/
+
+└── escrow-backend/             # Express backend
+    ├── package.json
+    ├── package-lock.json
+    ├── tsconfig.json
+    ├── jest.config.ts
+    ├── .gitignore
+    ├── .env.example
+    ├── .env
+    ├── README.md
+    ├── CONTRIBUTING.md
+    ├── __tests__/
+    │   ├── jobs.test.ts
+    │   ├── indexer.test.ts
+    │   └── by-wallet.test.ts     ← NEW
+    └── src/
+        ├── index.ts
+        ├── indexer/
+        │   ├── db.ts              ← getJobsByWallet() + interfaces added
+        │   └── poller.ts
+        └── routes/
+            └── jobs.ts            ← by-wallet endpoint rebuilt
+```
+
+### 🎯 Next Steps (Updated):
+- Confirm CI green on `9bd8508`, then close issue #1 with proper comment
+- Wire remaining contract functions (fund, deliver, approve, dispute, resolve) to frontend
+- Add support for multiple jobs in contract
+- Audit contract for security issues
+- Deploy and sync generated issues to GitHub using the `sync.js` script
+
+---
+
+## June 22, 2026 (Session 3)
+### ✅ Collaborator Project Roadmap & Issue Generator (1,000 Issues)
+
+**Goal**: Break the next major phases of Milesto down into 10 distinct phrases, each comprising 100 independent, well-labelled issues (1,000 issues total) to facilitate parallel development with collaborators, including a tool to preview and sync them.
+
+#### What was built:
+
+**`milesto-roadmap/generate.js`**:
+- Programmatic Node.js generator.
+- Splits development into 10 phrases across core domains: contract safety, advanced features, API security, indexer performance, wallet integrations, component libraries, admin/arbitrator portals, financial math, notification triggers, and monitoring/telemetry.
+- Compiles exactly 100 independent issues per phrase, each referencing the target repository, validation check, implementation steps, testing guidelines, and difficulty labels.
+- Outputs structured JSON issue templates into local directories under `milesto-roadmap/issues/`.
+
+**`milesto-roadmap/sync.js`**:
+- Interactive CLI import utility.
+- Supports **Dry-Run Mode** (logs exact `gh` CLI commands to execute) and **Live Mode** (creates issues via local authenticated `gh` CLI credentials).
+- Automatically parses and resolves the owner/repo mapping for the target packages (`escrow-contract`, `escrow-backend`, `escrow-frontend`) by checking git remote urls.
+
+#### Verification:
+- Ran `node generate.js` → successfully generated 10 folders, each containing exactly 100 issue JSON configurations (1,000 total).
+- Tested `echo "1" | node sync.js` → successfully verified dry-run CLI command formatting and github remote mapping resolver.
+
+### 📁 Updated Project Structure:
+```
+Milesto/
+├── milesto-roadmap/            # NEW: Project Roadmap & Issues Manager
+│   ├── generate.js             # Generates the 1000 issue templates
+│   ├── sync.js                 # Interactive sync tool (dry-run & live)
+│   └── issues/                 # Generated issues structured by phrase
+│       ├── phrase_01_soroban_contract_safety_gas_optimization/
+│       ├── phrase_02_advanced_escrow_features/
+...     └── phrase_10_performance_monitoring_diagnostics/
+
+├── escrow-contract/            # Soroban smart contract
+│   ├── Cargo.toml
+│   ├── Cargo.lock
+│   ├── context.md
+│   └── contracts/
+│       └── milestone-escrow/
+
+├── escrow-frontend/            # Next.js frontend
+│   ├── package.json
+│   └── app/
+
+└── escrow-backend/             # Express backend
+    ├── package.json
+    └── src/
+```
+
