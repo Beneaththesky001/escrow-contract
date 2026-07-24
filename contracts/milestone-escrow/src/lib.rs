@@ -176,6 +176,10 @@ pub struct PlatformFeeAllocation {
     pub freelancer_bps: u32,
     pub treasury_bps: u32,
     pub locked: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoReleasedEvent {
     pub contract_id: Address,
     pub milestone_index: u32,
@@ -213,6 +217,10 @@ pub struct TokenRemovedEvent {
 pub struct RatioSplit {
     pub first: i128,
     pub second: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimedEvent {
     pub contract_id: Address,
     pub milestone_index: u32,
@@ -870,18 +878,11 @@ impl MilestoneEscrow {
     /// over all milestones (`checked_job_total`, `assemble_job`) are
     /// intentionally not called from this hot path.
     pub fn claim_auto_release(
-    env: Env,
-    freelancer: Address,
-    milestone_index: u32,
-) -> Result<(), Error> {
-        Self::ensure_not_paused(&env)?;
-    freelancer.require_auth();
-    let meta = Self::load_job_meta(&env)?;
         env: Env,
         freelancer: Address,
         milestone_index: u32,
     ) -> Result<(), Error> {
-        // Block the Stellar Public Key Zero Address.
+        Self::ensure_not_paused(&env)?;
         let zero_account = Address::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -1484,6 +1485,8 @@ impl MilestoneEscrow {
         }
 
         Ok(allocations)
+    }
+
     pub fn version(env: Env) -> u32 {
         env.storage()
             .instance()
