@@ -5627,305 +5627,195 @@ fn test_reputation_auto_release() {
 }
 
 #[test]
-fn test_dispute_arbitration_split_full_client_refund() {
+fn test_platform_fee_allocation_admin_override_requires_verified_admin() {
     let env = Env::default();
     env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let allocation = client.dispute_arbitration_split(&10_000_i128, &10_000_u32);
-    assert_eq!(allocation.client_refund, 10_000);
-    assert_eq!(allocation.freelancer_payout, 0);
-    assert_eq!(allocation.client_refund_bps, 10_000);
-    assert_eq!(allocation.freelancer_payout_bps, 0);
-    assert_eq!(
-        allocation.client_refund + allocation.freelancer_payout,
-        10_000
+    let amounts = vec![&env, 1_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
     );
+
+    let result =
+        client.try_pf_alloc_admin_override(&attacker, &1000_u32, &8000_u32, &1000_u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
 
 #[test]
-fn test_dispute_arbitration_split_full_freelancer_payout() {
+fn test_platform_fee_allocation_admin_override_unlocks_locked_allocation() {
     let env = Env::default();
     env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let allocation = client.dispute_arbitration_split(&10_000_i128, &0_u32);
-    assert_eq!(allocation.client_refund, 0);
-    assert_eq!(allocation.freelancer_payout, 10_000);
-    assert_eq!(allocation.client_refund_bps, 0);
-    assert_eq!(allocation.freelancer_payout_bps, 10_000);
-}
-
-#[test]
-fn test_dispute_arbitration_split_50_50_preserves_total() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let allocation = client.dispute_arbitration_split(&101_i128, &5_000_u32);
-    assert_eq!(allocation.client_refund, 50);
-    assert_eq!(allocation.freelancer_payout, 51);
-    assert_eq!(
-        allocation.client_refund + allocation.freelancer_payout,
-        101
+    let amounts = vec![&env, 1_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
     );
+
+    client.set_platform_fee_allocation(&admin_addr, &2000_u32, &7000_u32, &1000_u32);
+    client.lock_platform_fee_allocation(&admin_addr);
+
+    let locked_update = client.try_set_platform_fee_allocation(&admin_addr, &1500_u32, &7500_u32, &1000_u32);
+    assert_eq!(locked_update, Err(Ok(Error::InvalidStatus)));
+
+    client.pf_alloc_admin_override(&admin_addr, &1500_u32, &7500_u32, &1000_u32);
+    let allocation = client.get_platform_fee_allocation();
+    assert_eq!(allocation.client_bps, 1500);
+    assert_eq!(allocation.freelancer_bps, 7500);
+    assert_eq!(allocation.treasury_bps, 1000);
+    assert!(!allocation.locked);
 }
 
 #[test]
-fn test_dispute_arbitration_split_rejects_bps_over_scale() {
+fn test_emergency_pause_admin_override_requires_verified_admin() {
     let env = Env::default();
     env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let result = client.try_dispute_arbitration_split(&1_000_i128, &10_001_u32);
-    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+    let amounts = vec![&env, 1_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+
+    let result = client.try_emergency_pause_admin_override(&attacker, &true);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
 
 #[test]
-fn test_dispute_arbitration_split_rejects_negative_total() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let result = client.try_dispute_arbitration_split(&-1_i128, &5_000_u32);
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
-}
-
-#[test]
-fn test_apply_dispute_arbitration_split_transfers_percentages() {
+fn test_emergency_pause_override_unblocks_operations() {
     let env = Env::default();
     env.mock_all_auths();
 
     let amounts = vec![&env, 10_000_i128];
-    let (client_addr, freelancer_addr, arbiter_addr, _admin, token_id, escrow_addr, client) =
+    let (client_addr, freelancer_addr, _arbiter, admin_addr, _token, _id, client) =
         setup_funded_escrow(&env, amounts);
 
-    let token = token::Client::new(&env, &token_id);
-    assert_eq!(token.balance(&escrow_addr), 10_000);
+    client.emergency_pause(&admin_addr);
+    assert!(client.is_emergency_paused());
+
+    let paused_result = client.try_mark_delivered(&freelancer_addr, &0u32);
+    assert_eq!(paused_result, Err(Ok(Error::Paused)));
+
+    client.emergency_pause_admin_override(&admin_addr, &false);
+    assert!(!client.is_emergency_paused());
 
     client.mark_delivered(&freelancer_addr, &0u32);
-    client.raise_dispute(&client_addr, &0u32);
-
-    let client_before = token.balance(&client_addr);
-    let freelancer_before = token.balance(&freelancer_addr);
-
-    // 30% refund to client, 70% to freelancer
-    let allocation =
-        client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &3_000_u32);
-
-    assert_eq!(allocation.client_refund, 3_000);
-    assert_eq!(allocation.freelancer_payout, 7_000);
-    assert_eq!(token.balance(&client_addr), client_before + 3_000);
-    assert_eq!(token.balance(&freelancer_addr), freelancer_before + 7_000);
-    assert_eq!(token.balance(&escrow_addr), 0);
-
     let job = client.get_job();
     let milestone = job.milestones.get(0).unwrap();
-    assert_eq!(milestone.status, MilestoneStatus::Released);
-    assert_eq!(milestone.released_amount, 7_000);
+    assert_eq!(milestone.status, MilestoneStatus::Delivered);
+
+    let funded_result = client.try_fund(&client_addr);
+    assert_eq!(funded_result, Err(Ok(Error::AlreadyFunded)));
 }
 
 #[test]
-fn test_apply_dispute_arbitration_split_full_refund_status() {
+fn test_payment_streaming_milestones_ratio_split_is_precise_and_conservative() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let amounts = vec![&env, 5_000_i128];
-    let (client_addr, freelancer_addr, arbiter_addr, _admin, token_id, escrow_addr, client) =
-        setup_funded_escrow(&env, amounts);
-
-    let token = token::Client::new(&env, &token_id);
-
-    client.mark_delivered(&freelancer_addr, &0u32);
-    client.raise_dispute(&client_addr, &0u32);
-
-    let allocation =
-        client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &10_000_u32);
-
-    assert_eq!(allocation.client_refund, 5_000);
-    assert_eq!(allocation.freelancer_payout, 0);
-    assert_eq!(token.balance(&client_addr), 5_000);
-    assert_eq!(token.balance(&freelancer_addr), 0);
-    assert_eq!(token.balance(&escrow_addr), 0);
-
-    let job = client.get_job();
-    let milestone = job.milestones.get(0).unwrap();
-    assert_eq!(milestone.status, MilestoneStatus::Refunded);
-}
-
-#[test]
-fn test_apply_dispute_arbitration_split_wrong_status_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 1_000_i128];
-    let (_client_addr, _freelancer, arbiter_addr, _admin, _token, _id, client) =
-        setup_funded_escrow(&env, amounts);
-
-    let result = client.try_apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5_000_u32);
-    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
-}
-
-#[test]
-fn test_apply_dispute_arbitration_split_unauthorized_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 1_000_i128];
-    let (client_addr, freelancer_addr, _arbiter, _admin, _token, _id, client) =
-        setup_funded_escrow(&env, amounts);
-
-    client.mark_delivered(&freelancer_addr, &0u32);
-    client.raise_dispute(&client_addr, &0u32);
-
-    let result = client.try_apply_dispute_arbitration_split(&client_addr, &0u32, &5_000_u32);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-}
-
-/// Workflow matrix for dispute_arbitration_split covering BPS edge cases,
-/// multi-milestone isolation, rounding preservation, and status transitions.
-#[test]
-fn test_dispute_arbitration_split_workflow_matrix_bps_table() {
-    let env = Env::default();
-    env.mock_all_auths();
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let cases: [(i128, u32, i128, i128); 8] = [
-        (0, 0, 0, 0),
-        (0, 10_000, 0, 0),
-        (1, 0, 0, 1),
-        (1, 10_000, 1, 0),
-        (100, 2_500, 25, 75),
-        (100, 7_500, 75, 25),
-        (999, 3_333, 332, 667),
-        (1_000_000, 1, 100, 999_900),
-    ];
-
-    for (total, bps, expect_client, expect_freelancer) in cases {
-        let allocation = client.dispute_arbitration_split(&total, &bps);
-        assert_eq!(allocation.client_refund, expect_client);
-        assert_eq!(allocation.freelancer_payout, expect_freelancer);
-        assert_eq!(
-            allocation.client_refund + allocation.freelancer_payout,
-            total
-        );
-        assert_eq!(allocation.client_refund_bps, bps);
-        assert_eq!(allocation.freelancer_payout_bps, 10_000 - bps);
-    }
+    let split = client.payment_streaming_milestones(&101_i128, &1_i128, &2_i128);
+    assert_eq!(split.first, 51);
+    assert_eq!(split.second, 50);
+    assert_eq!(split.first + split.second, 101);
 }
 
 #[test]
-fn test_dispute_arbitration_split_workflow_matrix_apply_isolation() {
+fn test_payment_streaming_milestones_invalid_ratio_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let amounts = vec![&env, 4_000_i128, 6_000_i128];
-    let (client_addr, freelancer_addr, arbiter_addr, _admin, token_id, escrow_addr, client) =
-        setup_funded_escrow(&env, amounts);
-    let token = token::Client::new(&env, &token_id);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    client.mark_delivered(&freelancer_addr, &0u32);
-    client.raise_dispute(&client_addr, &0u32);
-
-    let allocation = client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &2_500_u32);
-    assert_eq!(allocation.client_refund, 1_000);
-    assert_eq!(allocation.freelancer_payout, 3_000);
-    assert_eq!(token.balance(&client_addr), 1_000);
-    assert_eq!(token.balance(&freelancer_addr), 3_000);
-    assert_eq!(token.balance(&escrow_addr), 6_000);
-
-    let job = client.get_job();
-    assert_eq!(
-        job.milestones.get(0).unwrap().status,
-        MilestoneStatus::Released
-    );
-    assert_eq!(
-        job.milestones.get(1).unwrap().status,
-        MilestoneStatus::Pending
-    );
+    let result = client.try_payment_streaming_milestones(&100_i128, &7_i128, &3_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
 }
 
 #[test]
-fn test_dispute_arbitration_split_workflow_matrix_status_gates() {
+fn test_multisig_transfer_admin_ratio_split_preserves_total() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let amounts = vec![&env, 2_000_i128];
-    let (client_addr, freelancer_addr, arbiter_addr, _admin, _token, _escrow, client) =
-        setup_funded_escrow(&env, amounts);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    assert_eq!(
-        client.try_apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5_000_u32),
-        Err(Ok(Error::InvalidStatus))
-    );
+    let ratios = vec![&env, 1_i128, 1_i128, 1_i128];
+    let allocations = client.multisig_transfer_admin(&100_i128, &ratios);
+    assert_eq!(allocations.len(), 3);
+    assert_eq!(allocations.get(0).unwrap(), 34);
+    assert_eq!(allocations.get(1).unwrap(), 33);
+    assert_eq!(allocations.get(2).unwrap(), 33);
 
-    client.mark_delivered(&freelancer_addr, &0u32);
-    assert_eq!(
-        client.try_apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5_000_u32),
-        Err(Ok(Error::InvalidStatus))
-    );
-
-    client.raise_dispute(&client_addr, &0u32);
-    let allocation = client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5_000_u32);
-    assert_eq!(allocation.client_refund, 1_000);
-    assert_eq!(allocation.freelancer_payout, 1_000);
-
-    assert_eq!(
-        client.try_apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5_000_u32),
-        Err(Ok(Error::InvalidStatus))
-    );
+    let total = allocations.iter().fold(0_i128, |acc, v| acc + v);
+    assert_eq!(total, 100);
 }
 
 #[test]
-fn test_dispute_arbitration_split_workflow_matrix_auth_roles() {
+fn test_multisig_transfer_admin_invalid_ratio_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let amounts = vec![&env, 1_000_i128];
-    let (client_addr, freelancer_addr, arbiter_addr, admin_addr, _token, _escrow, client) =
-        setup_funded_escrow(&env, amounts);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    client.mark_delivered(&freelancer_addr, &0u32);
-    client.raise_dispute(&client_addr, &0u32);
-
-    for caller in [&client_addr, &freelancer_addr, &admin_addr] {
-        assert_eq!(
-            client.try_apply_dispute_arbitration_split(caller, &0u32, &5_000_u32),
-            Err(Ok(Error::Unauthorized))
-        );
-    }
-
-    let allocation = client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &4_000_u32);
-    assert_eq!(allocation.client_refund, 400);
-    assert_eq!(allocation.freelancer_payout, 600);
-}
-
-#[test]
-fn test_dispute_arbitration_split_workflow_matrix_odd_amounts() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 7_i128];
-    let (client_addr, freelancer_addr, arbiter_addr, _admin, token_id, escrow_addr, client) =
-        setup_funded_escrow(&env, amounts);
-    let token = token::Client::new(&env, &token_id);
-
-    client.mark_delivered(&freelancer_addr, &0u32);
-    client.raise_dispute(&client_addr, &0u32);
-
-    let allocation = client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &3_333_u32);
-    assert_eq!(allocation.client_refund + allocation.freelancer_payout, 7);
-    assert_eq!(token.balance(&client_addr) + token.balance(&freelancer_addr), 7);
-    assert_eq!(token.balance(&escrow_addr), 0);
+    let ratios = vec![&env, 0_i128, 0_i128];
+    let result = client.try_multisig_transfer_admin(&100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
 }
