@@ -236,7 +236,7 @@ pub struct MilestoneEscrow;
 impl MilestoneEscrow {
     fn load_admin(env: &Env) -> Result<Address, Error> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)
     }
@@ -570,7 +570,6 @@ impl MilestoneEscrow {
         new_admin: Address,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &current_admin)?;
-        current_admin.require_auth();
 
         let stored_admin: Address = env
             .storage()
@@ -597,7 +596,6 @@ impl MilestoneEscrow {
 
     pub fn add_whitelisted_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        admin.require_auth();
 
         let zero_account = Address::from_str(
             &env,
@@ -661,7 +659,6 @@ impl MilestoneEscrow {
 
     pub fn remove_whitelisted_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        admin.require_auth();
 
         let stored_admin: Address = env
             .storage()
