@@ -4,6 +4,14 @@ use soroban_sdk::{
     Vec,
 };
 
+/// Maximum number of ratio slots that may be passed to `multisig_transfer_admin`.
+/// A multisig setup with more than this many signers is operationally
+/// unreasonable and would impose unbounded per-transaction CPU costs; the cap
+/// guarantees that the nested loop over `ratios` iterates at most
+/// `MAX_MULTISIG_RATIO_COUNT` times both during validation and during
+/// the largest-remainder allocation phase.
+const MAX_MULTISIG_RATIO_COUNT: u32 = 255;
+
 /// Maximum number of tokens that may be held in the whitelist at any one time.
 /// `add_whitelisted_token` enforces this cap before calling `push_back` so
 /// that the internal `u32` length counter of the Soroban `Vec` can never
@@ -542,7 +550,10 @@ impl MilestoneEscrow {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
         );
 
-        if address == &zero_account || address == &zero_contract || address == &env.current_contract_address() {
+        if address == &zero_account
+            || address == &zero_contract
+            || address == &env.current_contract_address()
+        {
             return Err(Error::InvalidAddress);
         }
 
@@ -594,7 +605,9 @@ impl MilestoneEscrow {
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::EmergencyPaused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyPaused, &false);
         env.storage().instance().set(
             &DataKey::PlatformFeeAllocation,
             &PlatformFeeAllocation {
@@ -1222,8 +1235,8 @@ impl MilestoneEscrow {
             return Err(Error::InvalidMilestone);
         }
 
-       let mut milestone = Self::load_milestone(&env, milestone_index)?;
-       if milestone.status != MilestoneStatus::Delivered {
+        let mut milestone = Self::load_milestone(&env, milestone_index)?;
+        if milestone.status != MilestoneStatus::Delivered {
             return Err(Error::InvalidStatus);
         }
 
@@ -1412,11 +1425,7 @@ impl MilestoneEscrow {
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
 
-        let current: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or(1);
+        let current: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(1);
         env.storage()
             .instance()
             .set(&DataKey::Version, &(current + 1));
@@ -1426,19 +1435,29 @@ impl MilestoneEscrow {
 
     pub fn emergency_pause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        env.storage().instance().set(&DataKey::EmergencyPaused, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyPaused, &true);
         Ok(())
     }
 
     pub fn emergency_unpause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        env.storage().instance().set(&DataKey::EmergencyPaused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyPaused, &false);
         Ok(())
     }
 
-    pub fn emergency_pause_admin_override(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
+    pub fn emergency_pause_admin_override(
+        env: Env,
+        admin: Address,
+        paused: bool,
+    ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        env.storage().instance().set(&DataKey::EmergencyPaused, &paused);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyPaused, &paused);
         Ok(())
     }
 
@@ -1534,11 +1553,22 @@ impl MilestoneEscrow {
 
     pub fn multisig_transfer_admin(
         env: Env,
+        admin: Address,
         total_amount: i128,
         ratios: Vec<i128>,
     ) -> Result<Vec<i128>, Error> {
-        if total_amount < 0 || ratios.is_empty() {
+        Self::require_admin(&env, &admin)?;
+
+        if total_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        if ratios.is_empty() {
             return Err(Error::InvalidRatio);
+        }
+
+        if ratios.len() > MAX_MULTISIG_RATIO_COUNT {
+            return Err(Error::InvalidAmount);
         }
 
         let mut ratio_sum: i128 = 0;
@@ -1558,13 +1588,17 @@ impl MilestoneEscrow {
         let mut allocated_total: i128 = 0;
 
         for ratio in ratios.iter() {
-            let weighted = total_amount.checked_mul(ratio).ok_or(Error::InvalidAmount)?;
+            let weighted = total_amount
+                .checked_mul(ratio)
+                .ok_or(Error::InvalidAmount)?;
             let base = weighted / ratio_sum;
             let rem = weighted % ratio_sum;
 
             allocations.push_back(base);
             remainders.push_back(rem);
-            allocated_total = allocated_total.checked_add(base).ok_or(Error::InvalidAmount)?;
+            allocated_total = allocated_total
+                .checked_add(base)
+                .ok_or(Error::InvalidAmount)?;
         }
 
         let remaining = total_amount
@@ -1594,10 +1628,7 @@ impl MilestoneEscrow {
     }
 
     pub fn version(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or(1)
+        env.storage().instance().get(&DataKey::Version).unwrap_or(1)
     }
 
     pub fn get_job(env: Env) -> Result<Job, Error> {
@@ -1654,11 +1685,7 @@ impl MilestoneEscrow {
     /// * `NotInitialized`   – Contract has not been initialised yet.
     /// * `Unauthorized`     – `admin` does not match the stored admin key.
     /// * `YieldRateInvalid` – `rate_bps` exceeds 10 000.
-    pub fn admin_set_yield_rate(
-        env: Env,
-        admin: Address,
-        rate_bps: u32,
-    ) -> Result<(), Error> {
+    pub fn admin_set_yield_rate(env: Env, admin: Address, rate_bps: u32) -> Result<(), Error> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
@@ -1907,11 +1934,7 @@ impl MilestoneEscrow {
             .set(&DataKey::YieldAccrued, &0_i128);
 
         let token_client = token::Client::new(&env, &meta.token);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &meta.client,
-            &remaining,
-        );
+        token_client.transfer(&env.current_contract_address(), &meta.client, &remaining);
 
         env.events().publish(
             (symbol_short!("admovrf"),),
@@ -2051,6 +2074,4 @@ impl MilestoneEscrow {
 
         Ok((rate_bps, total_accrued, is_paused))
     }
-
-
 }
