@@ -717,7 +717,6 @@ impl MilestoneEscrow {
                 whitelist.set(index as u32, last_elem);
             }
             whitelist.pop_back();
-            let remaining_count = whitelist.len();
             env.storage()
                 .instance()
                 .set(&DataKey::WhitelistedTokens, &whitelist);
@@ -1389,7 +1388,7 @@ impl MilestoneEscrow {
         Ok(())
     }
 
-    pub fn platform_fee_allocation_admin_override(
+    pub fn pf_alloc_admin_override(
         env: Env,
         admin: Address,
         client_bps: u32,

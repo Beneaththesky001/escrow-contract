@@ -5656,7 +5656,7 @@ fn test_platform_fee_allocation_admin_override_requires_verified_admin() {
     );
 
     let result =
-        client.try_platform_fee_allocation_admin_override(&attacker, &1000_u32, &8000_u32, &1000_u32);
+        client.try_pf_alloc_admin_override(&attacker, &1000_u32, &8000_u32, &1000_u32);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
 
@@ -5694,7 +5694,7 @@ fn test_platform_fee_allocation_admin_override_unlocks_locked_allocation() {
     let locked_update = client.try_set_platform_fee_allocation(&admin_addr, &1500_u32, &7500_u32, &1000_u32);
     assert_eq!(locked_update, Err(Ok(Error::InvalidStatus)));
 
-    client.platform_fee_allocation_admin_override(&admin_addr, &1500_u32, &7500_u32, &1000_u32);
+    client.pf_alloc_admin_override(&admin_addr, &1500_u32, &7500_u32, &1000_u32);
     let allocation = client.get_platform_fee_allocation();
     assert_eq!(allocation.client_bps, 1500);
     assert_eq!(allocation.freelancer_bps, 7500);
