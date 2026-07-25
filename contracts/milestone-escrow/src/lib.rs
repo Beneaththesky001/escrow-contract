@@ -974,11 +974,11 @@ impl MilestoneEscrow {
     /// This function performs a bounded, constant number of storage reads and
     /// writes regardless of the total milestone count:
     ///
-    /// - 1× instance read  (`DataKey::Job` → `JobMeta`)
-    /// - 1× temporary read (`DataKey::DeliveredAt(milestone_index)`)
-    /// - 1× persistent read  (`DataKey::Milestone(milestone_index)`)
-    /// - 1× persistent write (`DataKey::Milestone(milestone_index)`)
-    /// - 1× token transfer
+    /// - 1Ã— instance read  (`DataKey::Job` â†’ `JobMeta`)
+    /// - 1Ã— temporary read (`DataKey::DeliveredAt(milestone_index)`)
+    /// - 1Ã— persistent read  (`DataKey::Milestone(milestone_index)`)
+    /// - 1Ã— persistent write (`DataKey::Milestone(milestone_index)`)
+    /// - 1Ã— token transfer
     ///
     /// No loop over all milestones is performed here.  Functions that do loop
     /// over all milestones (`checked_job_total`, `assemble_job`) are
@@ -1014,9 +1014,9 @@ impl MilestoneEscrow {
 
         let mut milestone = Self::load_milestone(&env, milestone_index)?;
 
-        // CHECK 2: Milestone must be in the Delivered state.  Any other status —
+        // CHECK 2: Milestone must be in the Delivered state.  Any other status â€”
         // including Released (double-claim), Disputed, Refunded, Pending, or
-        // PartiallyReleased — is rejected here, making the guard the sole
+        // PartiallyReleased â€” is rejected here, making the guard the sole
         // gatekeeper against double-execution and out-of-sequence calls.
         if milestone.status != MilestoneStatus::Delivered {
             return Err(Error::InvalidStatus);
