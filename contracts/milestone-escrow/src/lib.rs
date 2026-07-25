@@ -27,6 +27,7 @@ pub enum Error {
     InvalidAddress = 12,
     Paused = 13,
     InvalidRatio = 14,
+    Reentrant = 15,
 }
 
 const BPS_SCALE: u32 = 10_000;
@@ -109,6 +110,9 @@ pub enum DataKey {
     /// the approval workflow for that milestone is permanently closed and this
     /// flag has no further use.
     MilestoneReleased(u32),
+    /// Temporary: lock set when dispute arbitration split execution is in
+    /// progress for a milestone to prevent reentrant or concurrent mutations.
+    DisputeLock(u32),
     Reputation(Address),
     // ── escrow_interest_yield admin-override keys ────────────────────────────
     /// Persistent: annual yield rate expressed in basis points (1 bp = 0.01 %).
@@ -1366,25 +1370,38 @@ impl MilestoneEscrow {
         let remaining = milestone.amount - milestone.released_amount;
         let token_client = token::Client::new(&env, &meta.token);
         if release_to_freelancer {
+            // Set terminal state before transferring to prevent reentrancy/double-claim.
+            if remaining > 0 {
+                milestone.released_amount = milestone
+                    .released_amount
+                    .checked_add(remaining)
+                    .ok_or(Error::InvalidAmount)?;
+            }
+            milestone.status = MilestoneStatus::Released;
+            Self::store_milestone(&env, milestone_index, &milestone);
+
             if remaining > 0 {
                 token_client.transfer(
                     &env.current_contract_address(),
                     &meta.freelancer,
                     &remaining,
                 );
-                milestone.released_amount = milestone.amount;
             }
-            milestone.status = MilestoneStatus::Released;
             Self::increment_reputation(&env, &meta.client);
             Self::increment_reputation(&env, &meta.freelancer);
         } else {
+            // Set terminal state before transferring to prevent reentrancy/double-claim.
+            if remaining > 0 {
+                // refunded to client; released_amount unchanged
+            }
+            milestone.status = MilestoneStatus::Refunded;
+            Self::store_milestone(&env, milestone_index, &milestone);
+
             if remaining > 0 {
                 token_client.transfer(&env.current_contract_address(), &meta.client, &remaining);
             }
-            milestone.status = MilestoneStatus::Refunded;
         }
 
-        Self::store_milestone(&env, milestone_index, &milestone);
 
         env.events().publish(
             (symbol_short!("resolve"),),
@@ -1395,6 +1412,122 @@ impl MilestoneEscrow {
         );
 
         Ok(())
+    }
+
+    /// Apply an arbiter-specified basis-points split between client and
+    /// freelancer for a disputed milestone. Returns the concrete allocation
+    /// amounts and the bps used for each side. Uses high-precision
+    /// nearest-rounding to avoid loss of value.
+    pub fn apply_dispute_arbitration_split(
+        env: Env,
+        arbiter: Address,
+        milestone_index: u32,
+        client_bps: u32,
+    ) -> Result<RefundAllocation, Error> {
+        Self::ensure_not_paused(&env)?;
+
+        // Validate arbiter and inputs
+        let zero_account = Address::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        );
+        let zero_contract = Address::from_str(
+            &env,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        );
+
+        if arbiter == zero_account || arbiter == zero_contract {
+            return Err(Error::InvalidAddress);
+        }
+        arbiter.require_auth();
+
+        let mut meta = Self::load_job_meta(&env)?;
+        if meta.arbiter != arbiter {
+            return Err(Error::Unauthorized);
+        }
+        if !meta.funded {
+            return Err(Error::NotFunded);
+        }
+
+        if client_bps > BPS_SCALE {
+            return Err(Error::InvalidRatio);
+        }
+
+        let mut milestone = Self::load_milestone(&env, milestone_index)?;
+        if milestone.status != MilestoneStatus::Disputed {
+            return Err(Error::InvalidStatus);
+        }
+
+        // Reentrancy/locking: prevent concurrent execution for the same
+        // milestone by using temporary storage as an in-memory lock.
+        let locked: bool = env
+            .storage()
+            .temporary()
+            .get::<_, bool>(&DataKey::DisputeLock(milestone_index))
+            .unwrap_or(false);
+        if locked {
+            return Err(Error::Reentrant);
+        }
+
+        // Acquire lock
+        env.storage()
+            .temporary()
+            .set(&DataKey::DisputeLock(milestone_index), &true);
+
+        let remaining = milestone
+            .amount
+            .checked_sub(milestone.released_amount)
+            .ok_or(Error::InvalidAmount)?;
+
+        // High-precision nearest rounding split
+        let split = Self::split_round_nearest(remaining, client_bps as i128, BPS_SCALE as i128)?;
+
+        // Perform transfers according to the calculated split
+        let token_client = token::Client::new(&env, &meta.token);
+        if split.first > 0 {
+            token_client.transfer(&env.current_contract_address(), &meta.client, &split.first);
+        }
+        if split.second > 0 {
+            token_client.transfer(&env.current_contract_address(), &meta.freelancer, &split.second);
+            // increase released_amount by freelancer payout
+            milestone.released_amount = milestone
+                .released_amount
+                .checked_add(split.second)
+                .ok_or(Error::InvalidAmount)?;
+        }
+
+        // Update milestone status
+        if split.second == remaining {
+            milestone.status = MilestoneStatus::Released;
+            Self::increment_reputation(&env, &meta.client);
+            Self::increment_reputation(&env, &meta.freelancer);
+        } else if split.first == remaining {
+            milestone.status = MilestoneStatus::Refunded;
+        } else {
+            milestone.status = MilestoneStatus::PartiallyReleased;
+        }
+
+        Self::store_milestone(&env, milestone_index, &milestone);
+
+        // Release lock
+        env.storage()
+            .temporary()
+            .set(&DataKey::DisputeLock(milestone_index), &false);
+
+        env.events().publish(
+            (symbol_short!("resolve"),),
+            DisputeResolvedEvent {
+                milestone_index,
+                released_to_freelancer: split.second >= split.first,
+            },
+        );
+
+        Ok(RefundAllocation {
+            client_refund: split.first,
+            freelancer_payout: split.second,
+            client_refund_bps: client_bps,
+            freelancer_payout_bps: BPS_SCALE - client_bps,
+        })
     }
 
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
