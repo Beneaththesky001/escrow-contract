@@ -25,7 +25,11 @@ pub enum Error {
     InvalidAmount = 10,
     DeadlineNotPassed = 11,
     InvalidAddress = 12,
+    InvalidRatio = 13,
 }
+
+/// Basis-point scale used by refund allocation (100% = 10_000 bps).
+const BPS_SCALE: u32 = 10_000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +74,16 @@ struct JobMeta {
     auto_release_seconds: u64,
     milestone_count: u32,
     total_amount: i128,
+}
+
+/// Result of a split-refund allocation between client and freelancer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundAllocation {
+    pub client_refund: i128,
+    pub freelancer_payout: i128,
+    pub client_refund_bps: u32,
+    pub freelancer_payout_bps: u32,
 }
 
 #[contracttype]
@@ -758,11 +772,11 @@ impl MilestoneEscrow {
     /// This function performs a bounded, constant number of storage reads and
     /// writes regardless of the total milestone count:
     ///
-    /// - 1× instance read  (`DataKey::Job` → `JobMeta`)
-    /// - 1× temporary read (`DataKey::DeliveredAt(milestone_index)`)
-    /// - 1× persistent read  (`DataKey::Milestone(milestone_index)`)
-    /// - 1× persistent write (`DataKey::Milestone(milestone_index)`)
-    /// - 1× token transfer
+    /// - 1├ù instance read  (`DataKey::Job` ΓåÆ `JobMeta`)
+    /// - 1├ù temporary read (`DataKey::DeliveredAt(milestone_index)`)
+    /// - 1├ù persistent read  (`DataKey::Milestone(milestone_index)`)
+    /// - 1├ù persistent write (`DataKey::Milestone(milestone_index)`)
+    /// - 1├ù token transfer
     ///
     /// No loop over all milestones is performed here.  Functions that do loop
     /// over all milestones (`checked_job_total`, `assemble_job`) are
@@ -798,9 +812,9 @@ impl MilestoneEscrow {
 
         let mut milestone = Self::load_milestone(&env, milestone_index)?;
 
-        // CHECK 2: Milestone must be in the Delivered state.  Any other status —
+        // CHECK 2: Milestone must be in the Delivered state.  Any other status ΓÇö
         // including Released (double-claim), Disputed, Refunded, Pending, or
-        // PartiallyReleased — is rejected here, making the guard the sole
+        // PartiallyReleased ΓÇö is rejected here, making the guard the sole
         // gatekeeper against double-execution and out-of-sequence calls.
         if milestone.status != MilestoneStatus::Delivered {
             return Err(Error::InvalidStatus);
@@ -1202,6 +1216,131 @@ impl MilestoneEscrow {
             .set(&DataKey::Version, &(current + 1));
 
         Ok(())
+    }
+
+    /// Allocate a disputed amount into client refund vs freelancer payout by BPS.
+    ///
+    /// Uses floor division for the client share and assigns the remainder to the
+    /// freelancer so the two legs always sum exactly to `total_amount` (no value
+    /// is lost to rounding).
+    fn allocate_refund_by_bps(
+        total_amount: i128,
+        client_refund_bps: u32,
+    ) -> Result<RefundAllocation, Error> {
+        if total_amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if client_refund_bps > BPS_SCALE {
+            return Err(Error::InvalidRatio);
+        }
+
+        let scale = BPS_SCALE as i128;
+        let client_refund = total_amount
+            .checked_mul(client_refund_bps as i128)
+            .ok_or(Error::InvalidAmount)?
+            / scale;
+        let freelancer_payout = total_amount
+            .checked_sub(client_refund)
+            .ok_or(Error::InvalidAmount)?;
+
+        Ok(RefundAllocation {
+            client_refund,
+            freelancer_payout,
+            client_refund_bps,
+            freelancer_payout_bps: BPS_SCALE - client_refund_bps,
+        })
+    }
+
+    /// Pure refund-allocation algorithm for split-refund dispute claims.
+    ///
+    /// Returns the exact amounts that should be transferred to the client
+    /// (refund) and freelancer (payout) for the given BPS split.
+    pub fn dispute_arbitration_split(
+        _env: Env,
+        total_amount: i128,
+        client_refund_bps: u32,
+    ) -> Result<RefundAllocation, Error> {
+        Self::allocate_refund_by_bps(total_amount, client_refund_bps)
+    }
+
+    /// Apply a BPS split-refund to a disputed milestone and transfer funds.
+    ///
+    /// Client receives `client_refund_bps` of the remaining balance; freelancer
+    /// receives the remainder. Milestone ends `Refunded` when the freelancer
+    /// share is zero, otherwise `Released`.
+    pub fn apply_dispute_arbitration_split(
+        env: Env,
+        arbiter: Address,
+        milestone_index: u32,
+        client_refund_bps: u32,
+    ) -> Result<RefundAllocation, Error> {
+        let zero_account = Address::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        );
+        let zero_contract = Address::from_str(
+            &env,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        );
+
+        if arbiter == zero_account || arbiter == zero_contract {
+            return Err(Error::InvalidAddress);
+        }
+        arbiter.require_auth();
+
+        let meta = Self::load_job_meta(&env)?;
+        if meta.arbiter != arbiter {
+            return Err(Error::Unauthorized);
+        }
+        if !meta.funded {
+            return Err(Error::NotFunded);
+        }
+
+        let mut milestone = Self::load_milestone(&env, milestone_index)?;
+        if milestone.status != MilestoneStatus::Disputed {
+            return Err(Error::InvalidStatus);
+        }
+
+        let remaining = milestone
+            .amount
+            .checked_sub(milestone.released_amount)
+            .ok_or(Error::InvalidAmount)?;
+        let allocation = Self::allocate_refund_by_bps(remaining, client_refund_bps)?;
+
+        let token_client = token::Client::new(&env, &meta.token);
+        let contract_addr = env.current_contract_address();
+
+        if allocation.client_refund > 0 {
+            token_client.transfer(&contract_addr, &meta.client, &allocation.client_refund);
+        }
+        if allocation.freelancer_payout > 0 {
+            token_client.transfer(&contract_addr, &meta.freelancer, &allocation.freelancer_payout);
+        }
+
+        milestone.released_amount = milestone
+            .released_amount
+            .checked_add(allocation.freelancer_payout)
+            .ok_or(Error::InvalidAmount)?;
+
+        if allocation.freelancer_payout == 0 {
+            milestone.status = MilestoneStatus::Refunded;
+        } else {
+            milestone.status = MilestoneStatus::Released;
+            Self::increment_reputation(&env, &meta.client);
+            Self::increment_reputation(&env, &meta.freelancer);
+        }
+
+        Self::store_milestone(&env, milestone_index, &milestone);
+
+        env.events().publish(
+            (symbol_short!("resolve"),),
+            DisputeResolvedEvent {
+                milestone_index,
+                released_to_freelancer: allocation.freelancer_payout > 0,
+            },
+        );
+
+        Ok(allocation)
     }
 
     pub fn version(env: Env) -> u32 {
