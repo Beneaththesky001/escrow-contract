@@ -5819,3 +5819,100 @@ fn test_multisig_transfer_admin_invalid_ratio_fails() {
     let result = client.try_multisig_transfer_admin(&100_i128, &ratios);
     assert_eq!(result, Err(Ok(Error::InvalidRatio)));
 }
+
+#[test]
+fn test_yield_rate_set_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 1_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+
+    client.admin_set_yield_rate(&admin_addr, &500u32);
+
+    let yield_r_topic: Val = soroban_sdk::symbol_short!("yield_r").into_val(&env);
+    let mut event_count = 0u32;
+    for event in env.events().all().iter() {
+        if let Some(topic) = event.1.get(0) {
+            if topic.get_payload() == yield_r_topic.get_payload() {
+                event_count += 1;
+                let payload: YieldRateSetEvent = event.2.try_into_val(&env).unwrap();
+                assert_eq!(payload.admin, admin_addr);
+                assert_eq!(payload.old_rate_bps, 0);
+                assert_eq!(payload.new_rate_bps, 500);
+            }
+        }
+    }
+    assert_eq!(event_count, 1, "expected exactly one yield_r event");
+}
+
+#[test]
+fn test_yield_accrued_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 1_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+    
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+    token_admin.mint(&client_addr, &1_000);
+    client.fund(&client_addr);
+
+    client.admin_accrue_yield(&admin_addr, &0u32, &50_i128);
+
+    let yield_a_topic: Val = soroban_sdk::symbol_short!("yield_a").into_val(&env);
+    let mut event_count = 0u32;
+    for event in env.events().all().iter() {
+        if let Some(topic) = event.1.get(0) {
+            if topic.get_payload() == yield_a_topic.get_payload() {
+                event_count += 1;
+                let payload: YieldAccruedEvent = event.2.try_into_val(&env).unwrap();
+                assert_eq!(payload.admin, admin_addr);
+                assert_eq!(payload.milestone_index, 0);
+                assert_eq!(payload.accrued_amount, 50);
+                assert_eq!(payload.total_accrued, 50);
+            }
+        }
+    }
+    assert_eq!(event_count, 1, "expected exactly one yield_a event");
+}
