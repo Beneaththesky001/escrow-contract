@@ -5684,3 +5684,35 @@ fn test_reputation_auto_release() {
     assert_eq!(client.get_reputation(&client_addr), 1);
     assert_eq!(client.get_reputation(&freelancer_addr), 1);
 }
+
+#[test]
+fn test_cancel_escrow_succeeds_and_locks() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _, _, _, _, client) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    // Client can call cancel_escrow
+    client.cancel_escrow(&client_addr);
+
+    // After cancel, modifying functions should fail
+    let result = client.try_mark_delivered(&freelancer_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::EscrowLocked)));
+
+    // Other party cannot approve
+    let result2 = client.try_approve_milestone(&client_addr, &0u32);
+    assert_eq!(result2, Err(Ok(Error::EscrowLocked)));
+}
+
+#[test]
+fn test_cancel_escrow_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    let bad_actor = Address::generate(&env);
+    let result = client.try_cancel_escrow(&bad_actor);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}

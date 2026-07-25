@@ -26,6 +26,7 @@ pub enum Error {
     DeadlineNotPassed = 11,
     InvalidAddress = 12,
     InvalidExtension = 13,
+    EscrowLocked = 14,
 }
 
 #[contracttype]
@@ -96,6 +97,7 @@ pub enum DataKey {
     MilestoneReleased(u32),
     Reputation(Address),
     MilestoneTimeExtension(u32),
+    CancelLock,
 }
 
 #[contracttype]
@@ -219,6 +221,13 @@ pub struct ClaimedEvent {
     pub amount: i128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelEscrowInitiatedEvent {
+    pub contract_id: Address,
+    pub caller: Address,
+}
+
 #[contract]
 pub struct MilestoneEscrow;
 
@@ -281,6 +290,14 @@ impl MilestoneEscrow {
             .persistent()
             .get(&DataKey::MilestoneTimeExtension(index))
             .unwrap_or(0)
+    }
+
+    fn assert_not_paused(env: &Env) -> Result<(), Error> {
+        let is_paused: bool = env.storage().instance().get(&DataKey::CancelLock).unwrap_or(false);
+        if is_paused {
+            return Err(Error::EscrowLocked);
+        }
+        Ok(())
     }
 
     /// Check whether `approve_milestone` has marked the given milestone index
@@ -664,6 +681,7 @@ impl MilestoneEscrow {
     }
 
     pub fn fund(env: Env, client: Address) -> Result<(), Error> {
+        Self::assert_not_paused(&env)?;
         Self::validate_fund_client(&env, &client)?;
         client.require_auth();
         let mut meta = Self::load_job_meta(&env)?;
@@ -708,6 +726,7 @@ impl MilestoneEscrow {
         freelancer: Address,
         milestone_index: u32,
     ) -> Result<(), Error> {
+        Self::assert_not_paused(&env)?;
         // Check for zero addresses (both account and contract types)
         let zero_account = Address::from_str(
             &env,
@@ -840,6 +859,7 @@ impl MilestoneEscrow {
         freelancer: Address,
         milestone_index: u32,
     ) -> Result<(), Error> {
+        Self::assert_not_paused(&env)?;
         // Block the Stellar Public Key Zero Address.
         let zero_account = Address::from_str(
             &env,
@@ -960,6 +980,7 @@ impl MilestoneEscrow {
         milestone_index: u32,
         amount: i128,
     ) -> Result<(), Error> {
+        Self::assert_not_paused(&env)?;
         let zero_1 = Address::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -1049,6 +1070,7 @@ impl MilestoneEscrow {
     }
 
     pub fn approve_milestone(env: Env, client: Address, milestone_index: u32) -> Result<(), Error> {
+        Self::assert_not_paused(&env)?;
         let zero_account = Address::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -1133,6 +1155,7 @@ impl MilestoneEscrow {
     }
 
     pub fn raise_dispute(env: Env, caller: Address, milestone_index: u32) -> Result<(), Error> {
+        Self::assert_not_paused(&env)?;
         // Check for zero addresses (both account and contract types)
         let zero_account = Address::from_str(
             &env,
@@ -1185,6 +1208,7 @@ impl MilestoneEscrow {
         milestone_index: u32,
         release_to_freelancer: bool,
     ) -> Result<(), Error> {
+        Self::assert_not_paused(&env)?;
         // Check for zero addresses (both account and contract types)
         let zero_account = Address::from_str(
             &env,
@@ -1242,6 +1266,42 @@ impl MilestoneEscrow {
             DisputeResolvedEvent {
                 milestone_index,
                 released_to_freelancer: release_to_freelancer,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn cancel_escrow(env: Env, caller: Address) -> Result<(), Error> {
+        let zero_account = Address::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        );
+        let zero_contract = Address::from_str(
+            &env,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        );
+        if caller == zero_account || caller == zero_contract {
+            return Err(Error::InvalidAddress);
+        }
+
+        caller.require_auth();
+        let meta = Self::load_job_meta(&env)?;
+
+        if caller != meta.client && caller != meta.freelancer {
+            return Err(Error::Unauthorized);
+        }
+        if !meta.funded {
+            return Err(Error::NotFunded);
+        }
+
+        env.storage().instance().set(&DataKey::CancelLock, &true);
+
+        env.events().publish(
+            (symbol_short!("cancel"),),
+            CancelEscrowInitiatedEvent {
+                contract_id: env.current_contract_address(),
+                caller,
             },
         );
 
