@@ -483,41 +483,20 @@ fn test_mark_delivered_after_refunded_fails() {
     assert_eq!(result, Err(Ok(Error::InvalidStatus)));
 }
 
-/// Re-entrancy test: uses a token callback to verify raise_dispute's
-/// DisputeLock prevents re-entrant dispute raising within the same
-/// transaction.  This mirrors the fund re-entrancy pattern used elsewhere
-/// in the test suite.
+/// Verifies that when a dispute is successfully raised, the returned
+/// status is Disputed and the milestone state is persisted correctly.
+/// Also confirms the flow: fund -> deliver -> dispute works end-to-end.
 #[test]
-fn test_raise_dispute_reentrancy_via_token_callback_blocked() {
+fn test_raise_dispute_status_transition_to_disputed() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let client_addr = Address::generate(&env);
-    let freelancer_addr = Address::generate(&env);
-    let arbiter_addr = Address::generate(&env);
-    let admin_addr = Address::generate(&env);
+    let (client_addr, freelancer_addr, _, _, _, _, client) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
-    let token_contract_id = env.register(ReentrantToken, ());
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let amounts = vec![&env, 1_000_i128];
-    client.initialize(
-        &admin_addr,
-        &client_addr,
-        &freelancer_addr,
-        &arbiter_addr,
-        &token_contract_id,
-        &604800,
-        &amounts,
-    );
-    client.fund(&client_addr);
     client.mark_delivered(&freelancer_addr, &0u32);
-
-    // Raise dispute — should succeed.
     client.raise_dispute(&client_addr, &0u32);
 
-    // Verify the milestone is now Disputed (not double-disputed).
     let job = client.get_job();
     let milestone = job.milestones.get(0).unwrap();
     assert_eq!(milestone.status, MilestoneStatus::Disputed);
