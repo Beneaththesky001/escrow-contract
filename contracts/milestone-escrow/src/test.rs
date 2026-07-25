@@ -5625,3 +5625,103 @@ fn test_reputation_auto_release() {
     assert_eq!(client.get_reputation(&client_addr), 1);
     assert_eq!(client.get_reputation(&freelancer_addr), 1);
 }
+
+#[test]
+fn test_escrow_interest_yield_lock_blocks_modifications() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    client.set_escrow_interest_yield(&admin_addr, &4_000_u32, &6_000_u32);
+    assert!(!client.is_escrow_interest_yield_locked());
+
+    client.lock_escrow_interest_yield(&admin_addr);
+    assert!(client.is_escrow_interest_yield_locked());
+
+    // Modifications while locked must fail
+    let blocked = client.try_set_escrow_interest_yield(&admin_addr, &5_000_u32, &5_000_u32);
+    assert_eq!(blocked, Err(Ok(Error::Locked)));
+
+    let state = client.get_escrow_interest_yield();
+    assert_eq!(state.client_share_bps, 4_000);
+    assert_eq!(state.freelancer_share_bps, 6_000);
+    assert!(state.locked);
+}
+
+#[test]
+fn test_escrow_interest_yield_unlock_allows_modifications() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    client.set_escrow_interest_yield(&admin_addr, &3_000_u32, &7_000_u32);
+    client.lock_escrow_interest_yield(&admin_addr);
+    client.unlock_escrow_interest_yield(&admin_addr);
+    assert!(!client.is_escrow_interest_yield_locked());
+
+    client.set_escrow_interest_yield(&admin_addr, &5_000_u32, &5_000_u32);
+    let state = client.get_escrow_interest_yield();
+    assert_eq!(state.client_share_bps, 5_000);
+    assert_eq!(state.freelancer_share_bps, 5_000);
+    assert!(!state.locked);
+}
+
+#[test]
+fn test_escrow_interest_yield_lock_requires_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (client_addr, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    client.set_escrow_interest_yield(&admin_addr, &5_000_u32, &5_000_u32);
+    assert_eq!(
+        client.try_lock_escrow_interest_yield(&client_addr),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_unlock_escrow_interest_yield(&client_addr),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn test_escrow_interest_yield_set_rejects_invalid_bps() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    assert_eq!(
+        client.try_set_escrow_interest_yield(&admin_addr, &4_000_u32, &5_000_u32),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
+fn test_escrow_interest_yield_get_before_set_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    assert_eq!(
+        client.try_get_escrow_interest_yield(),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        client.try_lock_escrow_interest_yield(&admin_addr),
+        Err(Ok(Error::NotInitialized))
+    );
+}

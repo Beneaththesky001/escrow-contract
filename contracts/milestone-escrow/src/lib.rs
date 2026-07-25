@@ -25,7 +25,9 @@ pub enum Error {
     InvalidAmount = 10,
     DeadlineNotPassed = 11,
     InvalidAddress = 12,
+    Locked = 13,
 }
+
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +74,16 @@ struct JobMeta {
     total_amount: i128,
 }
 
+/// Escrow interest/yield configuration with execution lock.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowInterestYieldState {
+    pub client_share_bps: u32,
+    pub freelancer_share_bps: u32,
+    /// When true, share modifications are blocked until unlocked.
+    pub locked: bool,
+}
+
 #[contracttype]
 pub enum DataKey {
     Job,
@@ -94,6 +106,7 @@ pub enum DataKey {
     /// flag has no further use.
     MilestoneReleased(u32),
     Reputation(Address),
+    InterestYieldState,
 }
 
 #[contracttype]
@@ -758,11 +771,11 @@ impl MilestoneEscrow {
     /// This function performs a bounded, constant number of storage reads and
     /// writes regardless of the total milestone count:
     ///
-    /// - 1× instance read  (`DataKey::Job` → `JobMeta`)
-    /// - 1× temporary read (`DataKey::DeliveredAt(milestone_index)`)
-    /// - 1× persistent read  (`DataKey::Milestone(milestone_index)`)
-    /// - 1× persistent write (`DataKey::Milestone(milestone_index)`)
-    /// - 1× token transfer
+    /// - 1Ã— instance read  (`DataKey::Job` â†’ `JobMeta`)
+    /// - 1Ã— temporary read (`DataKey::DeliveredAt(milestone_index)`)
+    /// - 1Ã— persistent read  (`DataKey::Milestone(milestone_index)`)
+    /// - 1Ã— persistent write (`DataKey::Milestone(milestone_index)`)
+    /// - 1Ã— token transfer
     ///
     /// No loop over all milestones is performed here.  Functions that do loop
     /// over all milestones (`checked_job_total`, `assemble_job`) are
@@ -798,9 +811,9 @@ impl MilestoneEscrow {
 
         let mut milestone = Self::load_milestone(&env, milestone_index)?;
 
-        // CHECK 2: Milestone must be in the Delivered state.  Any other status —
+        // CHECK 2: Milestone must be in the Delivered state.  Any other status â€”
         // including Released (double-claim), Disputed, Refunded, Pending, or
-        // PartiallyReleased — is rejected here, making the guard the sole
+        // PartiallyReleased â€” is rejected here, making the guard the sole
         // gatekeeper against double-execution and out-of-sequence calls.
         if milestone.status != MilestoneStatus::Delivered {
             return Err(Error::InvalidStatus);
@@ -1204,6 +1217,111 @@ impl MilestoneEscrow {
         Ok(())
     }
 
+
+    fn load_interest_yield_state(env: &Env) -> Result<EscrowInterestYieldState, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::InterestYieldState)
+            .ok_or(Error::NotInitialized)
+    }
+
+    fn store_interest_yield_state(env: &Env, state: &EscrowInterestYieldState) {
+        env.storage()
+            .instance()
+            .set(&DataKey::InterestYieldState, state);
+    }
+
+    fn ensure_interest_yield_unlocked(env: &Env) -> Result<(), Error> {
+        let state = Self::load_interest_yield_state(env)?;
+        if state.locked {
+            return Err(Error::Locked);
+        }
+        Ok(())
+    }
+
+    /// Initialize interest/yield share config (unlocked by default).
+    pub fn set_escrow_interest_yield(
+        env: Env,
+        admin: Address,
+        client_share_bps: u32,
+        freelancer_share_bps: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Reject modifications while an execution lock is held.
+        if env.storage().instance().has(&DataKey::InterestYieldState) {
+            Self::ensure_interest_yield_unlocked(&env)?;
+        }
+
+        let total = client_share_bps
+            .checked_add(freelancer_share_bps)
+            .ok_or(Error::InvalidAmount)?;
+        if total != 10_000 {
+            return Err(Error::InvalidAmount);
+        }
+
+        Self::store_interest_yield_state(
+            &env,
+            &EscrowInterestYieldState {
+                client_share_bps,
+                freelancer_share_bps,
+                locked: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Lock interest/yield state during pending execution.
+    pub fn lock_escrow_interest_yield(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut state = Self::load_interest_yield_state(&env)?;
+        state.locked = true;
+        Self::store_interest_yield_state(&env, &state);
+        Ok(())
+    }
+
+    /// Clear the execution lock so configuration can be modified again.
+    pub fn unlock_escrow_interest_yield(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut state = Self::load_interest_yield_state(&env)?;
+        state.locked = false;
+        Self::store_interest_yield_state(&env, &state);
+        Ok(())
+    }
+
+    pub fn is_escrow_interest_yield_locked(env: Env) -> Result<bool, Error> {
+        Ok(Self::load_interest_yield_state(&env)?.locked)
+    }
+
+    pub fn get_escrow_interest_yield(env: Env) -> Result<EscrowInterestYieldState, Error> {
+        Self::load_interest_yield_state(&env)
+    }
     pub fn version(env: Env) -> u32 {
         env.storage()
             .instance()
