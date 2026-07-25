@@ -25,9 +25,11 @@ pub enum Error {
     InvalidAmount = 10,
     DeadlineNotPassed = 11,
     InvalidAddress = 12,
-    Locked = 13,
+    Paused = 13,
+    InvalidRatio = 14,
 }
 
+const BPS_SCALE: u32 = 10_000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,6 +93,8 @@ pub enum DataKey {
     Admin,
     Version,
     WhitelistedTokens,
+    EmergencyPaused,
+    PlatformFeeAllocation,
     /// Temporary key: records the ledger timestamp at which a milestone was
     /// marked delivered.  Written by `mark_delivered`, consumed by
     /// `claim_auto_release` and `time_until_auto_release`.  Uses temporary
@@ -178,6 +182,15 @@ pub struct DisputeResolvedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformFeeAllocation {
+    pub client_bps: u32,
+    pub freelancer_bps: u32,
+    pub treasury_bps: u32,
+    pub locked: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoReleasedEvent {
     pub contract_id: Address,
     pub milestone_index: u32,
@@ -212,6 +225,13 @@ pub struct TokenRemovedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RatioSplit {
+    pub first: i128,
+    pub second: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimedEvent {
     pub contract_id: Address,
     pub milestone_index: u32,
@@ -225,6 +245,72 @@ pub struct MilestoneEscrow;
 
 #[contractimpl]
 impl MilestoneEscrow {
+    fn load_admin(env: &Env) -> Result<Address, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin = Self::load_admin(env)?;
+        if stored_admin != *admin {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn ensure_not_paused(env: &Env) -> Result<(), Error> {
+        let paused = env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::EmergencyPaused)
+            .unwrap_or(false);
+        if paused {
+            return Err(Error::Paused);
+        }
+        Ok(())
+    }
+
+    fn validate_fee_allocation(
+        client_bps: u32,
+        freelancer_bps: u32,
+        treasury_bps: u32,
+    ) -> Result<(), Error> {
+        let total = client_bps
+            .checked_add(freelancer_bps)
+            .and_then(|v| v.checked_add(treasury_bps))
+            .ok_or(Error::InvalidRatio)?;
+        if total != BPS_SCALE {
+            return Err(Error::InvalidRatio);
+        }
+        Ok(())
+    }
+
+    fn split_round_nearest(
+        total: i128,
+        numerator: i128,
+        denominator: i128,
+    ) -> Result<RatioSplit, Error> {
+        if total < 0 || numerator < 0 || denominator <= 0 || numerator > denominator {
+            return Err(Error::InvalidRatio);
+        }
+
+        let scaled = total.checked_mul(numerator).ok_or(Error::InvalidAmount)?;
+        let half = denominator / 2;
+        let rounded = scaled.checked_add(half).ok_or(Error::InvalidAmount)? / denominator;
+
+        if rounded > total {
+            return Err(Error::InvalidAmount);
+        }
+
+        Ok(RatioSplit {
+            first: rounded,
+            second: total.checked_sub(rounded).ok_or(Error::InvalidAmount)?,
+        })
+    }
+
     fn load_job_meta(env: &Env) -> Result<JobMeta, Error> {
         env.storage()
             .instance()
@@ -408,6 +494,23 @@ impl MilestoneEscrow {
             return Err(Error::InvalidAmount);
         }
 
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::EmergencyPaused, &false);
+        env.storage().instance().set(
+            &DataKey::PlatformFeeAllocation,
+            &PlatformFeeAllocation {
+                client_bps: 0,
+                freelancer_bps: BPS_SCALE,
+                treasury_bps: 0,
+                locked: false,
+            },
+        );
+
+        let mut whitelist: Vec<Address> = Vec::new(&env);
+        whitelist.push_back(token.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::WhitelistedTokens, &whitelist);
         if auto_release_seconds == 0 {
             return Err(Error::InvalidAmount);
         }
@@ -477,7 +580,7 @@ impl MilestoneEscrow {
         current_admin: Address,
         new_admin: Address,
     ) -> Result<(), Error> {
-        current_admin.require_auth();
+        Self::require_admin(&env, &current_admin)?;
 
         let stored_admin: Address = env
             .storage()
@@ -503,7 +606,7 @@ impl MilestoneEscrow {
     }
 
     pub fn add_whitelisted_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
-        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
 
         let zero_account = Address::from_str(
             &env,
@@ -566,7 +669,7 @@ impl MilestoneEscrow {
     }
 
     pub fn remove_whitelisted_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
-        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
 
         let stored_admin: Address = env
             .storage()
@@ -622,7 +725,6 @@ impl MilestoneEscrow {
                 whitelist.set(index as u32, last_elem);
             }
             whitelist.pop_back();
-            let remaining_count = whitelist.len();
             env.storage()
                 .instance()
                 .set(&DataKey::WhitelistedTokens, &whitelist);
@@ -658,6 +760,7 @@ impl MilestoneEscrow {
     }
 
     pub fn fund(env: Env, client: Address) -> Result<(), Error> {
+        Self::ensure_not_paused(&env)?;
         Self::validate_fund_client(&env, &client)?;
         client.require_auth();
         let mut meta = Self::load_job_meta(&env)?;
@@ -702,6 +805,7 @@ impl MilestoneEscrow {
         freelancer: Address,
         milestone_index: u32,
     ) -> Result<(), Error> {
+        Self::ensure_not_paused(&env)?;
         // Check for zero addresses (both account and contract types)
         let zero_account = Address::from_str(
             &env,
@@ -785,7 +889,7 @@ impl MilestoneEscrow {
         freelancer: Address,
         milestone_index: u32,
     ) -> Result<(), Error> {
-        // Block the Stellar Public Key Zero Address.
+        Self::ensure_not_paused(&env)?;
         let zero_account = Address::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -902,6 +1006,7 @@ impl MilestoneEscrow {
         milestone_index: u32,
         amount: i128,
     ) -> Result<(), Error> {
+        Self::ensure_not_paused(&env)?;
         let zero_1 = Address::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -991,6 +1096,7 @@ impl MilestoneEscrow {
     }
 
     pub fn approve_milestone(env: Env, client: Address, milestone_index: u32) -> Result<(), Error> {
+        Self::ensure_not_paused(&env)?;
         let zero_account = Address::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -1075,6 +1181,7 @@ impl MilestoneEscrow {
     }
 
     pub fn raise_dispute(env: Env, caller: Address, milestone_index: u32) -> Result<(), Error> {
+        Self::ensure_not_paused(&env)?;
         // Check for zero addresses (both account and contract types)
         let zero_account = Address::from_str(
             &env,
@@ -1127,6 +1234,7 @@ impl MilestoneEscrow {
         milestone_index: u32,
         release_to_freelancer: bool,
     ) -> Result<(), Error> {
+        Self::ensure_not_paused(&env)?;
         // Check for zero addresses (both account and contract types)
         let zero_account = Address::from_str(
             &env,
@@ -1217,111 +1325,175 @@ impl MilestoneEscrow {
         Ok(())
     }
 
-
-    fn load_interest_yield_state(env: &Env) -> Result<EscrowInterestYieldState, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::InterestYieldState)
-            .ok_or(Error::NotInitialized)
-    }
-
-    fn store_interest_yield_state(env: &Env, state: &EscrowInterestYieldState) {
-        env.storage()
-            .instance()
-            .set(&DataKey::InterestYieldState, state);
-    }
-
-    fn ensure_interest_yield_unlocked(env: &Env) -> Result<(), Error> {
-        let state = Self::load_interest_yield_state(env)?;
-        if state.locked {
-            return Err(Error::Locked);
-        }
+    pub fn emergency_pause(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::EmergencyPaused, &true);
         Ok(())
     }
 
-    /// Initialize interest/yield share config (unlocked by default).
-    pub fn set_escrow_interest_yield(
+    pub fn emergency_unpause(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::EmergencyPaused, &false);
+        Ok(())
+    }
+
+    pub fn emergency_pause_admin_override(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::EmergencyPaused, &paused);
+        Ok(())
+    }
+
+    pub fn is_emergency_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyPaused)
+            .unwrap_or(false)
+    }
+
+    pub fn set_platform_fee_allocation(
         env: Env,
         admin: Address,
-        client_share_bps: u32,
-        freelancer_share_bps: u32,
+        client_bps: u32,
+        freelancer_bps: u32,
+        treasury_bps: u32,
     ) -> Result<(), Error> {
-        admin.require_auth();
-        let stored_admin: Address = env
+        Self::require_admin(&env, &admin)?;
+        Self::validate_fee_allocation(client_bps, freelancer_bps, treasury_bps)?;
+
+        let current: PlatformFeeAllocation = env
             .storage()
-            .persistent()
-            .get(&DataKey::Admin)
+            .instance()
+            .get(&DataKey::PlatformFeeAllocation)
             .ok_or(Error::NotInitialized)?;
-        if admin != stored_admin {
-            return Err(Error::Unauthorized);
+
+        if current.locked {
+            return Err(Error::InvalidStatus);
         }
 
-        // Reject modifications while an execution lock is held.
-        if env.storage().instance().has(&DataKey::InterestYieldState) {
-            Self::ensure_interest_yield_unlocked(&env)?;
-        }
-
-        let total = client_share_bps
-            .checked_add(freelancer_share_bps)
-            .ok_or(Error::InvalidAmount)?;
-        if total != 10_000 {
-            return Err(Error::InvalidAmount);
-        }
-
-        Self::store_interest_yield_state(
-            &env,
-            &EscrowInterestYieldState {
-                client_share_bps,
-                freelancer_share_bps,
+        env.storage().instance().set(
+            &DataKey::PlatformFeeAllocation,
+            &PlatformFeeAllocation {
+                client_bps,
+                freelancer_bps,
+                treasury_bps,
                 locked: false,
             },
         );
         Ok(())
     }
 
-    /// Lock interest/yield state during pending execution.
-    pub fn lock_escrow_interest_yield(env: Env, admin: Address) -> Result<(), Error> {
-        admin.require_auth();
-        let stored_admin: Address = env
+    pub fn lock_platform_fee_allocation(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        let mut current: PlatformFeeAllocation = env
             .storage()
-            .persistent()
-            .get(&DataKey::Admin)
+            .instance()
+            .get(&DataKey::PlatformFeeAllocation)
             .ok_or(Error::NotInitialized)?;
-        if admin != stored_admin {
-            return Err(Error::Unauthorized);
-        }
-
-        let mut state = Self::load_interest_yield_state(&env)?;
-        state.locked = true;
-        Self::store_interest_yield_state(&env, &state);
+        current.locked = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformFeeAllocation, &current);
         Ok(())
     }
 
-    /// Clear the execution lock so configuration can be modified again.
-    pub fn unlock_escrow_interest_yield(env: Env, admin: Address) -> Result<(), Error> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if admin != stored_admin {
-            return Err(Error::Unauthorized);
-        }
-
-        let mut state = Self::load_interest_yield_state(&env)?;
-        state.locked = false;
-        Self::store_interest_yield_state(&env, &state);
+    pub fn pf_alloc_admin_override(
+        env: Env,
+        admin: Address,
+        client_bps: u32,
+        freelancer_bps: u32,
+        treasury_bps: u32,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        Self::validate_fee_allocation(client_bps, freelancer_bps, treasury_bps)?;
+        env.storage().instance().set(
+            &DataKey::PlatformFeeAllocation,
+            &PlatformFeeAllocation {
+                client_bps,
+                freelancer_bps,
+                treasury_bps,
+                locked: false,
+            },
+        );
         Ok(())
     }
 
-    pub fn is_escrow_interest_yield_locked(env: Env) -> Result<bool, Error> {
-        Ok(Self::load_interest_yield_state(&env)?.locked)
+    pub fn get_platform_fee_allocation(env: Env) -> Result<PlatformFeeAllocation, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlatformFeeAllocation)
+            .ok_or(Error::NotInitialized)
     }
 
-    pub fn get_escrow_interest_yield(env: Env) -> Result<EscrowInterestYieldState, Error> {
-        Self::load_interest_yield_state(&env)
+    pub fn payment_streaming_milestones(
+        _env: Env,
+        total_amount: i128,
+        numerator: i128,
+        denominator: i128,
+    ) -> Result<RatioSplit, Error> {
+        Self::split_round_nearest(total_amount, numerator, denominator)
     }
+
+    pub fn multisig_transfer_admin(
+        env: Env,
+        total_amount: i128,
+        ratios: Vec<i128>,
+    ) -> Result<Vec<i128>, Error> {
+        if total_amount < 0 || ratios.is_empty() {
+            return Err(Error::InvalidRatio);
+        }
+
+        let mut ratio_sum: i128 = 0;
+        for ratio in ratios.iter() {
+            if ratio < 0 {
+                return Err(Error::InvalidRatio);
+            }
+            ratio_sum = ratio_sum.checked_add(ratio).ok_or(Error::InvalidRatio)?;
+        }
+
+        if ratio_sum <= 0 {
+            return Err(Error::InvalidRatio);
+        }
+
+        let mut allocations: Vec<i128> = Vec::new(&env);
+        let mut remainders: Vec<i128> = Vec::new(&env);
+        let mut allocated_total: i128 = 0;
+
+        for ratio in ratios.iter() {
+            let weighted = total_amount.checked_mul(ratio).ok_or(Error::InvalidAmount)?;
+            let base = weighted / ratio_sum;
+            let rem = weighted % ratio_sum;
+
+            allocations.push_back(base);
+            remainders.push_back(rem);
+            allocated_total = allocated_total.checked_add(base).ok_or(Error::InvalidAmount)?;
+        }
+
+        let remaining = total_amount
+            .checked_sub(allocated_total)
+            .ok_or(Error::InvalidAmount)?;
+
+        for _ in 0..remaining {
+            let mut best_index: u32 = 0;
+            let mut best_remainder: i128 = i128::MIN;
+
+            for (idx, rem) in remainders.iter().enumerate() {
+                if rem > best_remainder {
+                    best_remainder = rem;
+                    best_index = idx as u32;
+                }
+            }
+
+            let current = allocations.get(best_index).ok_or(Error::InvalidAmount)?;
+            allocations.set(
+                best_index,
+                current.checked_add(1).ok_or(Error::InvalidAmount)?,
+            );
+            remainders.set(best_index, i128::MIN);
+        }
+
+        Ok(allocations)
+    }
+
     pub fn version(env: Env) -> u32 {
         env.storage()
             .instance()

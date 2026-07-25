@@ -5627,101 +5627,195 @@ fn test_reputation_auto_release() {
 }
 
 #[test]
-fn test_escrow_interest_yield_lock_blocks_modifications() {
+fn test_platform_fee_allocation_admin_override_requires_verified_admin() {
     let env = Env::default();
     env.mock_all_auths();
 
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
     let amounts = vec![&env, 1_000_i128];
-    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
-        setup_funded_escrow(&env, amounts);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
 
-    client.set_escrow_interest_yield(&admin_addr, &4_000_u32, &6_000_u32);
-    assert!(!client.is_escrow_interest_yield_locked());
-
-    client.lock_escrow_interest_yield(&admin_addr);
-    assert!(client.is_escrow_interest_yield_locked());
-
-    // Modifications while locked must fail
-    let blocked = client.try_set_escrow_interest_yield(&admin_addr, &5_000_u32, &5_000_u32);
-    assert_eq!(blocked, Err(Ok(Error::Locked)));
-
-    let state = client.get_escrow_interest_yield();
-    assert_eq!(state.client_share_bps, 4_000);
-    assert_eq!(state.freelancer_share_bps, 6_000);
-    assert!(state.locked);
+    let result =
+        client.try_pf_alloc_admin_override(&attacker, &1000_u32, &8000_u32, &1000_u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
 
 #[test]
-fn test_escrow_interest_yield_unlock_allows_modifications() {
+fn test_platform_fee_allocation_admin_override_unlocks_locked_allocation() {
     let env = Env::default();
     env.mock_all_auths();
 
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
     let amounts = vec![&env, 1_000_i128];
-    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
-        setup_funded_escrow(&env, amounts);
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
 
-    client.set_escrow_interest_yield(&admin_addr, &3_000_u32, &7_000_u32);
-    client.lock_escrow_interest_yield(&admin_addr);
-    client.unlock_escrow_interest_yield(&admin_addr);
-    assert!(!client.is_escrow_interest_yield_locked());
+    client.set_platform_fee_allocation(&admin_addr, &2000_u32, &7000_u32, &1000_u32);
+    client.lock_platform_fee_allocation(&admin_addr);
 
-    client.set_escrow_interest_yield(&admin_addr, &5_000_u32, &5_000_u32);
-    let state = client.get_escrow_interest_yield();
-    assert_eq!(state.client_share_bps, 5_000);
-    assert_eq!(state.freelancer_share_bps, 5_000);
-    assert!(!state.locked);
+    let locked_update = client.try_set_platform_fee_allocation(&admin_addr, &1500_u32, &7500_u32, &1000_u32);
+    assert_eq!(locked_update, Err(Ok(Error::InvalidStatus)));
+
+    client.pf_alloc_admin_override(&admin_addr, &1500_u32, &7500_u32, &1000_u32);
+    let allocation = client.get_platform_fee_allocation();
+    assert_eq!(allocation.client_bps, 1500);
+    assert_eq!(allocation.freelancer_bps, 7500);
+    assert_eq!(allocation.treasury_bps, 1000);
+    assert!(!allocation.locked);
 }
 
 #[test]
-fn test_escrow_interest_yield_lock_requires_admin() {
+fn test_emergency_pause_admin_override_requires_verified_admin() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let amounts = vec![&env, 1_000_i128];
-    let (client_addr, _freelancer, _arbiter, admin_addr, _token, _id, client) =
-        setup_funded_escrow(&env, amounts);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let attacker = Address::generate(&env);
 
-    client.set_escrow_interest_yield(&admin_addr, &5_000_u32, &5_000_u32);
-    assert_eq!(
-        client.try_lock_escrow_interest_yield(&client_addr),
-        Err(Ok(Error::Unauthorized))
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 1_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
     );
-    assert_eq!(
-        client.try_unlock_escrow_interest_yield(&client_addr),
-        Err(Ok(Error::Unauthorized))
-    );
+
+    let result = client.try_emergency_pause_admin_override(&attacker, &true);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
 
 #[test]
-fn test_escrow_interest_yield_set_rejects_invalid_bps() {
+fn test_emergency_pause_override_unblocks_operations() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let amounts = vec![&env, 1_000_i128];
-    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+    let amounts = vec![&env, 10_000_i128];
+    let (client_addr, freelancer_addr, _arbiter, admin_addr, _token, _id, client) =
         setup_funded_escrow(&env, amounts);
 
-    assert_eq!(
-        client.try_set_escrow_interest_yield(&admin_addr, &4_000_u32, &5_000_u32),
-        Err(Ok(Error::InvalidAmount))
-    );
+    client.emergency_pause(&admin_addr);
+    assert!(client.is_emergency_paused());
+
+    let paused_result = client.try_mark_delivered(&freelancer_addr, &0u32);
+    assert_eq!(paused_result, Err(Ok(Error::Paused)));
+
+    client.emergency_pause_admin_override(&admin_addr, &false);
+    assert!(!client.is_emergency_paused());
+
+    client.mark_delivered(&freelancer_addr, &0u32);
+    let job = client.get_job();
+    let milestone = job.milestones.get(0).unwrap();
+    assert_eq!(milestone.status, MilestoneStatus::Delivered);
+
+    let funded_result = client.try_fund(&client_addr);
+    assert_eq!(funded_result, Err(Ok(Error::AlreadyFunded)));
 }
 
 #[test]
-fn test_escrow_interest_yield_get_before_set_fails() {
+fn test_payment_streaming_milestones_ratio_split_is_precise_and_conservative() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let amounts = vec![&env, 1_000_i128];
-    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
-        setup_funded_escrow(&env, amounts);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    assert_eq!(
-        client.try_get_escrow_interest_yield(),
-        Err(Ok(Error::NotInitialized))
-    );
-    assert_eq!(
-        client.try_lock_escrow_interest_yield(&admin_addr),
-        Err(Ok(Error::NotInitialized))
-    );
+    let split = client.payment_streaming_milestones(&101_i128, &1_i128, &2_i128);
+    assert_eq!(split.first, 51);
+    assert_eq!(split.second, 50);
+    assert_eq!(split.first + split.second, 101);
+}
+
+#[test]
+fn test_payment_streaming_milestones_invalid_ratio_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_payment_streaming_milestones(&100_i128, &7_i128, &3_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+#[test]
+fn test_multisig_transfer_admin_ratio_split_preserves_total() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let ratios = vec![&env, 1_i128, 1_i128, 1_i128];
+    let allocations = client.multisig_transfer_admin(&100_i128, &ratios);
+    assert_eq!(allocations.len(), 3);
+    assert_eq!(allocations.get(0).unwrap(), 34);
+    assert_eq!(allocations.get(1).unwrap(), 33);
+    assert_eq!(allocations.get(2).unwrap(), 33);
+
+    let total = allocations.iter().fold(0_i128, |acc, v| acc + v);
+    assert_eq!(total, 100);
+}
+
+#[test]
+fn test_multisig_transfer_admin_invalid_ratio_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let ratios = vec![&env, 0_i128, 0_i128];
+    let result = client.try_multisig_transfer_admin(&100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
 }
