@@ -2042,20 +2042,5 @@ impl MilestoneEscrow {
         Ok((rate_bps, total_accrued, is_paused))
     }
 
-    // ── shared admin-identity helper ──────────────────────────────────────────
 
-    /// Verify that `admin` matches the address stored under `DataKey::Admin`.
-    /// Returns `NotInitialized` if no admin has been persisted yet (contract
-    /// not yet initialised) and `Unauthorized` on a mismatch.
-    fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
-        let stored: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        if admin != &stored {
-            return Err(Error::Unauthorized);
-        }
-        Ok(())
-    }
 }
