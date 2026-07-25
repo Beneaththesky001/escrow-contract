@@ -458,7 +458,7 @@ impl MilestoneEscrow {
             .get(&DataKey::Paused)
             .unwrap_or(false);
         if paused {
-            return Err(Error::EscrowPaused);
+            return Err(Error::Paused);
         }
         Ok(())
     }
@@ -1653,7 +1653,7 @@ impl MilestoneEscrow {
         Self::require_admin(&env, &admin)?;
 
         if rate_bps > 10_000 {
-            return Err(Error::YieldRateInvalid);
+            return Err(Error::InvalidRatio);
         }
 
         let old_rate_bps: u32 = env
