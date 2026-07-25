@@ -76,6 +76,16 @@ struct JobMeta {
     total_amount: i128,
 }
 
+/// Result of a split-refund allocation between client and freelancer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundAllocation {
+    pub client_refund: i128,
+    pub freelancer_payout: i128,
+    pub client_refund_bps: u32,
+    pub freelancer_payout_bps: u32,
+}
+
 #[contracttype]
 pub enum DataKey {
     Job,
