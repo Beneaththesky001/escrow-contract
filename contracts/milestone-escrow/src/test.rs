@@ -5625,3 +5625,1132 @@ fn test_reputation_auto_release() {
     assert_eq!(client.get_reputation(&client_addr), 1);
     assert_eq!(client.get_reputation(&freelancer_addr), 1);
 }
+
+// ============================================================================
+// escrow_interest_yield — admin override test suite (#208)
+// ============================================================================
+//
+// Coverage matrix:
+//   admin_set_yield_rate        – happy path, rate boundary, unauthorized, event
+//   admin_accrue_yield          – happy path, overflow, invalid amount, unauthorized
+//   admin_override_release      – all milestone states, unauthorized, not-funded
+//   admin_override_refund       – all milestone states, unauthorized, not-funded
+//   admin_pause_escrow          – happy path, idempotent, unauthorized, event
+//   admin_resume_escrow         – happy path, idempotent, unauthorized, event
+//   get_yield_info              – defaults, after set, after accrue, after pause
+//   pause guard on user methods – fund, mark_delivered, approve_milestone,
+//                                 approve_partial, claim_auto_release,
+//                                 raise_dispute, resolve_dispute
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+/// Minimal funded escrow with a single 10 000-token milestone.
+fn setup_yield_escrow(
+    env: &Env,
+) -> (
+    Address, // client
+    Address, // freelancer
+    Address, // arbiter
+    Address, // admin
+    Address, // token contract
+    Address, // escrow contract
+    MilestoneEscrowClient<'_>,
+) {
+    let client_addr = Address::generate(env);
+    let freelancer_addr = Address::generate(env);
+    let arbiter_addr = Address::generate(env);
+    let admin_addr = Address::generate(env);
+
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(env, &token_id);
+    token_admin.mint(&client_addr, &10_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(env, &contract_id);
+
+    escrow.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_id,
+        &604800,
+        &vec![env, 10_000_i128],
+    );
+    escrow.fund(&client_addr);
+
+    (
+        client_addr,
+        freelancer_addr,
+        arbiter_addr,
+        admin_addr,
+        token_id,
+        contract_id,
+        escrow,
+    )
+}
+
+// ── admin_set_yield_rate ──────────────────────────────────────────────────────
+
+/// Happy path: admin sets a valid rate; persisted rate is readable via
+/// `get_yield_info` and exactly one `yldrate` event is emitted with correct fields.
+#[test]
+fn test_admin_set_yield_rate_happy_path() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+
+    escrow.admin_set_yield_rate(&admin_addr, &500u32);
+
+    let (rate, _, _) = escrow.get_yield_info();
+    assert_eq!(rate, 500);
+
+    // Verify event
+    let topic_val: Val = symbol_short!("yldrate").into_val(&env);
+    let count = env.events().all().iter().fold(0u32, |acc, e| {
+        if let Some(t) = e.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() { acc + 1 } else { acc }
+        } else { acc }
+    });
+    assert_eq!(count, 1);
+}
+
+/// Boundary: rate of exactly 10 000 bps (100 %) must be accepted.
+#[test]
+fn test_admin_set_yield_rate_max_boundary_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    assert!(escrow.try_admin_set_yield_rate(&admin_addr, &10_000u32).is_ok());
+    assert_eq!(escrow.get_yield_info().0, 10_000);
+}
+
+/// Rate of 0 disables yield accrual but must not be rejected.
+#[test]
+fn test_admin_set_yield_rate_zero_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    escrow.admin_set_yield_rate(&admin_addr, &500u32);
+    escrow.admin_set_yield_rate(&admin_addr, &0u32);
+    assert_eq!(escrow.get_yield_info().0, 0);
+}
+
+/// Rate > 10 000 bps must be rejected with YieldRateInvalid.
+#[test]
+fn test_admin_set_yield_rate_exceeds_max_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    let result = escrow.try_admin_set_yield_rate(&admin_addr, &10_001u32);
+    assert_eq!(result, Err(Ok(Error::YieldRateInvalid)));
+}
+
+/// A non-admin address must be rejected with Unauthorized.
+#[test]
+fn test_admin_set_yield_rate_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
+        setup_yield_escrow(&env);
+
+    for caller in [&client_addr, &freelancer_addr, &arbiter_addr] {
+        let result = escrow.try_admin_set_yield_rate(caller, &100u32);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)), "caller should be unauthorized");
+    }
+}
+
+/// Calling before initialize must return NotInitialized.
+#[test]
+fn test_admin_set_yield_rate_before_initialize_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin_addr = Address::generate(&env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    let result = escrow.try_admin_set_yield_rate(&admin_addr, &100u32);
+    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+}
+
+/// Old rate is correctly captured in the emitted event after an update.
+#[test]
+fn test_admin_set_yield_rate_event_captures_old_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+
+    escrow.admin_set_yield_rate(&admin_addr, &200u32);
+    escrow.admin_set_yield_rate(&admin_addr, &800u32);
+
+    let topic_val: Val = symbol_short!("yldrate").into_val(&env);
+    let mut last_event: Option<YieldRateSetEvent> = None;
+    for e in env.events().all().iter() {
+        if let Some(t) = e.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() {
+                last_event = Some(YieldRateSetEvent::from_val(&env, &e.2));
+            }
+        }
+    }
+    let ev = last_event.expect("expected yldrate event");
+    assert_eq!(ev.old_rate_bps, 200);
+    assert_eq!(ev.new_rate_bps, 800);
+}
+
+// ── admin_accrue_yield ────────────────────────────────────────────────────────
+
+/// Happy path: accrued amount is stored and running total accumulates correctly.
+#[test]
+fn test_admin_accrue_yield_happy_path() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+
+    escrow.admin_set_yield_rate(&admin_addr, &500u32);
+    escrow.admin_accrue_yield(&admin_addr, &0u32, &100_i128);
+    escrow.admin_accrue_yield(&admin_addr, &0u32, &250_i128);
+
+    let (_, total, _) = escrow.get_yield_info();
+    assert_eq!(total, 350);
+}
+
+/// Emits exactly one `yldacc` event per call with correct fields.
+#[test]
+fn test_admin_accrue_yield_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+
+    escrow.admin_accrue_yield(&admin_addr, &0u32, &42_i128);
+
+    let topic_val: Val = symbol_short!("yldacc").into_val(&env);
+    let mut found: Option<YieldAccruedEvent> = None;
+    for e in env.events().all().iter() {
+        if let Some(t) = e.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() {
+                found = Some(YieldAccruedEvent::from_val(&env, &e.2));
+            }
+        }
+    }
+    let ev = found.expect("expected yldacc event");
+    assert_eq!(ev.accrued_amount, 42);
+    assert_eq!(ev.total_accrued, 42);
+    assert_eq!(ev.milestone_index, 0);
+}
+
+/// Zero or negative accrued_amount must be rejected with InvalidAmount.
+#[test]
+fn test_admin_accrue_yield_zero_amount_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    assert_eq!(
+        escrow.try_admin_accrue_yield(&admin_addr, &0u32, &0_i128),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        escrow.try_admin_accrue_yield(&admin_addr, &0u32, &-1_i128),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+/// Running total overflow is caught via checked_add and returns InvalidAmount.
+#[test]
+fn test_admin_accrue_yield_overflow_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+
+    // Seed the accumulator near i128::MAX.
+    escrow.admin_accrue_yield(&admin_addr, &0u32, &(i128::MAX - 1));
+    // Adding 2 more would overflow.
+    let result = escrow.try_admin_accrue_yield(&admin_addr, &0u32, &2_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Out-of-range milestone index returns InvalidMilestone.
+#[test]
+fn test_admin_accrue_yield_invalid_milestone_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    let result = escrow.try_admin_accrue_yield(&admin_addr, &99u32, &10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidMilestone)));
+}
+
+/// Non-admin address is rejected with Unauthorized.
+#[test]
+fn test_admin_accrue_yield_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, _, _, _, _, _, escrow) = setup_yield_escrow(&env);
+    let result = escrow.try_admin_accrue_yield(&client_addr, &0u32, &10_i128);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+// ── admin_override_release ────────────────────────────────────────────────────
+
+/// Happy path: admin force-releases a Pending milestone; tokens reach the
+/// freelancer and milestone status becomes Released.
+#[test]
+fn test_admin_override_release_pending_milestone_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, freelancer_addr, _, admin_addr, token_id, contract_id, escrow) =
+        setup_yield_escrow(&env);
+    let token = token::Client::new(&env, &token_id);
+
+    // Accrue some yield to verify it gets reset
+    escrow.admin_accrue_yield(&admin_addr, &0u32, &500_i128);
+    let (_, total, _) = escrow.get_yield_info();
+    assert_eq!(total, 500);
+
+    escrow.admin_override_release(&admin_addr, &0u32);
+
+    assert_eq!(token.balance(&freelancer_addr), 10_000);
+    assert_eq!(token.balance(&contract_id), 0);
+    let ms = escrow.get_job().milestones.get(0).unwrap();
+    assert_eq!(ms.status, MilestoneStatus::Released);
+    assert_eq!(ms.released_amount, 10_000);
+
+    // Verify yield was reset to 0
+    let (_, total_after, _) = escrow.get_yield_info();
+    assert_eq!(total_after, 0);
+}
+
+/// Admin can force-release a Delivered milestone (normal approve was skipped).
+#[test]
+fn test_admin_override_release_delivered_milestone_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, freelancer_addr, _, admin_addr, token_id, contract_id, escrow) =
+        setup_yield_escrow(&env);
+    let token = token::Client::new(&env, &token_id);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.admin_override_release(&admin_addr, &0u32);
+
+    assert_eq!(token.balance(&freelancer_addr), 10_000);
+    assert_eq!(token.balance(&contract_id), 0);
+}
+
+/// Admin can force-release a PartiallyReleased milestone; only the remaining
+/// balance is transferred.
+#[test]
+fn test_admin_override_release_partially_released_milestone_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, _, admin_addr, token_id, contract_id, escrow) =
+        setup_yield_escrow(&env);
+    let token = token::Client::new(&env, &token_id);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.approve_partial(&client_addr, &0u32, &3_000_i128);
+    escrow.admin_override_release(&admin_addr, &0u32);
+
+    // 3 000 from approve_partial + 7 000 from override = 10 000 total.
+    assert_eq!(token.balance(&freelancer_addr), 10_000);
+    assert_eq!(token.balance(&contract_id), 0);
+}
+
+/// Admin can force-release a Disputed milestone (bypasses arbiter).
+#[test]
+fn test_admin_override_release_disputed_milestone_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, _, admin_addr, token_id, contract_id, escrow) =
+        setup_yield_escrow(&env);
+    let token = token::Client::new(&env, &token_id);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.admin_override_release(&admin_addr, &0u32);
+
+    assert_eq!(token.balance(&freelancer_addr), 10_000);
+    assert_eq!(token.balance(&contract_id), 0);
+}
+
+/// Calling override_release on an already-Released milestone returns InvalidStatus.
+#[test]
+fn test_admin_override_release_already_released_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, freelancer_addr, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.approve_milestone(&client_from_escrow(&env, &escrow), &0u32);
+
+    let result = escrow.try_admin_override_release(&admin_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// Helper: extract client address from escrow job (avoids re-declaring in every test).
+fn client_from_escrow(env: &Env, escrow: &MilestoneEscrowClient) -> Address {
+    let _ = env;
+    escrow.get_job().client
+}
+
+/// Calling override_release on a Refunded milestone returns InvalidStatus.
+#[test]
+fn test_admin_override_release_already_refunded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, arbiter_addr, admin_addr, _, _, escrow) =
+        setup_yield_escrow(&env);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.resolve_dispute(&arbiter_addr, &0u32, &false);
+
+    let result = escrow.try_admin_override_release(&admin_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// Non-admin caller is rejected with Unauthorized.
+#[test]
+fn test_admin_override_release_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
+        setup_yield_escrow(&env);
+    for caller in [&client_addr, &freelancer_addr, &arbiter_addr] {
+        assert_eq!(
+            escrow.try_admin_override_release(caller, &0u32),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+}
+
+/// Unfunded escrow returns NotFunded.
+#[test]
+fn test_admin_override_release_not_funded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    escrow.initialize(
+        &admin_addr, &client_addr, &freelancer_addr, &arbiter_addr,
+        &token_id, &604800, &vec![&env, 1_000_i128],
+    );
+    // Deliberately skip fund()
+    let result = escrow.try_admin_override_release(&admin_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::NotFunded)));
+}
+
+/// Out-of-range milestone index returns InvalidMilestone.
+#[test]
+fn test_admin_override_release_invalid_index_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    assert_eq!(
+        escrow.try_admin_override_release(&admin_addr, &99u32),
+        Err(Ok(Error::InvalidMilestone))
+    );
+}
+
+/// Emits exactly one `admovrls` event with correct fields.
+#[test]
+fn test_admin_override_release_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, freelancer_addr, _, admin_addr, token_id, contract_id, escrow) =
+        setup_yield_escrow(&env);
+
+    escrow.admin_override_release(&admin_addr, &0u32);
+
+    let topic_val: Val = symbol_short!("admovrls").into_val(&env);
+    let mut found: Option<AdminOverrideReleaseEvent> = None;
+    for e in env.events().all().iter() {
+        if let Some(t) = e.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() {
+                found = Some(AdminOverrideReleaseEvent::from_val(&env, &e.2));
+            }
+        }
+    }
+    let ev = found.expect("expected admovrls event");
+    assert_eq!(ev.admin, admin_addr);
+    assert_eq!(ev.freelancer, freelancer_addr);
+    assert_eq!(ev.token, token_id);
+    assert_eq!(ev.amount, 10_000);
+    assert_eq!(ev.contract_id, contract_id);
+}
+
+// ── admin_override_refund ─────────────────────────────────────────────────────
+
+/// Happy path: admin force-refunds a Pending milestone; tokens return to client.
+#[test]
+fn test_admin_override_refund_pending_milestone_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, _, _, admin_addr, token_id, contract_id, escrow) =
+        setup_yield_escrow(&env);
+    let token = token::Client::new(&env, &token_id);
+
+    // Accrue some yield to verify it gets reset
+    escrow.admin_accrue_yield(&admin_addr, &0u32, &500_i128);
+    let (_, total, _) = escrow.get_yield_info();
+    assert_eq!(total, 500);
+
+    escrow.admin_override_refund(&admin_addr, &0u32);
+
+    assert_eq!(token.balance(&client_addr), 10_000);
+    assert_eq!(token.balance(&contract_id), 0);
+    let ms = escrow.get_job().milestones.get(0).unwrap();
+    assert_eq!(ms.status, MilestoneStatus::Refunded);
+
+    // Verify yield was reset to 0
+    let (_, total_after, _) = escrow.get_yield_info();
+    assert_eq!(total_after, 0);
+}
+
+/// Admin can force-refund a Delivered milestone.
+#[test]
+fn test_admin_override_refund_delivered_milestone_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, _, admin_addr, token_id, contract_id, escrow) =
+        setup_yield_escrow(&env);
+    let token = token::Client::new(&env, &token_id);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.admin_override_refund(&admin_addr, &0u32);
+
+    assert_eq!(token.balance(&client_addr), 10_000);
+    assert_eq!(token.balance(&contract_id), 0);
+}
+
+/// Admin can force-refund a PartiallyReleased milestone (only remainder).
+#[test]
+fn test_admin_override_refund_partially_released_milestone_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, _, admin_addr, token_id, contract_id, escrow) =
+        setup_yield_escrow(&env);
+    let token = token::Client::new(&env, &token_id);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.approve_partial(&client_addr, &0u32, &4_000_i128);
+    escrow.admin_override_refund(&admin_addr, &0u32);
+
+    // 4 000 already released to freelancer; 6 000 refunded to client.
+    assert_eq!(token.balance(&client_addr), 6_000);
+    assert_eq!(token.balance(&contract_id), 0);
+}
+
+/// Admin can force-refund a Disputed milestone.
+#[test]
+fn test_admin_override_refund_disputed_milestone_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, _, admin_addr, token_id, contract_id, escrow) =
+        setup_yield_escrow(&env);
+    let token = token::Client::new(&env, &token_id);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.admin_override_refund(&admin_addr, &0u32);
+
+    assert_eq!(token.balance(&client_addr), 10_000);
+    assert_eq!(token.balance(&contract_id), 0);
+}
+
+/// Already-Released milestone returns InvalidStatus on override_refund.
+#[test]
+fn test_admin_override_refund_already_released_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, freelancer_addr, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.approve_milestone(&escrow.get_job().client, &0u32);
+
+    assert_eq!(
+        escrow.try_admin_override_refund(&admin_addr, &0u32),
+        Err(Ok(Error::InvalidStatus))
+    );
+}
+
+/// Already-Refunded milestone returns InvalidStatus on override_refund.
+#[test]
+fn test_admin_override_refund_already_refunded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, arbiter_addr, admin_addr, _, _, escrow) =
+        setup_yield_escrow(&env);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.resolve_dispute(&arbiter_addr, &0u32, &false);
+
+    assert_eq!(
+        escrow.try_admin_override_refund(&admin_addr, &0u32),
+        Err(Ok(Error::InvalidStatus))
+    );
+}
+
+/// Non-admin caller is rejected with Unauthorized.
+#[test]
+fn test_admin_override_refund_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
+        setup_yield_escrow(&env);
+    for caller in [&client_addr, &freelancer_addr, &arbiter_addr] {
+        assert_eq!(
+            escrow.try_admin_override_refund(caller, &0u32),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+}
+
+/// Unfunded escrow returns NotFunded on override_refund.
+#[test]
+fn test_admin_override_refund_not_funded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    escrow.initialize(
+        &admin_addr, &client_addr, &freelancer_addr, &arbiter_addr,
+        &token_id, &604800, &vec![&env, 1_000_i128],
+    );
+    assert_eq!(
+        escrow.try_admin_override_refund(&admin_addr, &0u32),
+        Err(Ok(Error::NotFunded))
+    );
+}
+
+/// Out-of-range index returns InvalidMilestone.
+#[test]
+fn test_admin_override_refund_invalid_index_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    assert_eq!(
+        escrow.try_admin_override_refund(&admin_addr, &99u32),
+        Err(Ok(Error::InvalidMilestone))
+    );
+}
+
+/// Emits exactly one `admovrf` event with correct fields.
+#[test]
+fn test_admin_override_refund_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, _, _, admin_addr, token_id, contract_id, escrow) =
+        setup_yield_escrow(&env);
+
+    escrow.admin_override_refund(&admin_addr, &0u32);
+
+    let topic_val: Val = symbol_short!("admovrf").into_val(&env);
+    let mut found: Option<AdminOverrideRefundEvent> = None;
+    for e in env.events().all().iter() {
+        if let Some(t) = e.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() {
+                found = Some(AdminOverrideRefundEvent::from_val(&env, &e.2));
+            }
+        }
+    }
+    let ev = found.expect("expected admovrf event");
+    assert_eq!(ev.admin, admin_addr);
+    assert_eq!(ev.client, client_addr);
+    assert_eq!(ev.token, token_id);
+    assert_eq!(ev.amount, 10_000);
+    assert_eq!(ev.contract_id, contract_id);
+}
+
+// ── admin_pause_escrow / admin_resume_escrow ──────────────────────────────────
+
+/// Happy path: pausing sets the flag; get_yield_info reflects it.
+#[test]
+fn test_admin_pause_escrow_sets_paused_flag() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+
+    let (_, _, before) = escrow.get_yield_info();
+    assert!(!before);
+
+    escrow.admin_pause_escrow(&admin_addr);
+
+    let (_, _, after) = escrow.get_yield_info();
+    assert!(after);
+}
+
+/// Pausing is idempotent: calling twice must not error and emits only one event.
+#[test]
+fn test_admin_pause_escrow_idempotent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+
+    escrow.admin_pause_escrow(&admin_addr);
+    assert!(escrow.try_admin_pause_escrow(&admin_addr).is_ok());
+
+    let topic_val: Val = symbol_short!("pause").into_val(&env);
+    let count = env.events().all().iter().fold(0u32, |acc, e| {
+        if let Some(t) = e.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() { acc + 1 } else { acc }
+        } else { acc }
+    });
+    assert_eq!(count, 1, "idempotent re-pause must not emit a second event");
+}
+
+/// Pausing emits one `pause` event with correct fields.
+#[test]
+fn test_admin_pause_escrow_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, contract_id, escrow) = setup_yield_escrow(&env);
+
+    escrow.admin_pause_escrow(&admin_addr);
+
+    let topic_val: Val = symbol_short!("pause").into_val(&env);
+    let mut found: Option<EscrowPausedEvent> = None;
+    for e in env.events().all().iter() {
+        if let Some(t) = e.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() {
+                found = Some(EscrowPausedEvent::from_val(&env, &e.2));
+            }
+        }
+    }
+    let ev = found.expect("expected pause event");
+    assert_eq!(ev.admin, admin_addr);
+    assert_eq!(ev.contract_id, contract_id);
+}
+
+/// Non-admin caller is rejected with Unauthorized.
+#[test]
+fn test_admin_pause_escrow_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, _, _, _, _, _, escrow) = setup_yield_escrow(&env);
+    assert_eq!(
+        escrow.try_admin_pause_escrow(&client_addr),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+/// Happy path: resume clears the flag.
+#[test]
+fn test_admin_resume_escrow_clears_paused_flag() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+
+    escrow.admin_pause_escrow(&admin_addr);
+    assert!(escrow.get_yield_info().2);
+
+    escrow.admin_resume_escrow(&admin_addr);
+    assert!(!escrow.get_yield_info().2);
+}
+
+/// Resuming an already-running escrow is idempotent and emits zero events.
+#[test]
+fn test_admin_resume_escrow_idempotent_no_event_when_not_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+
+    // Never paused — resume should be a no-op.
+    assert!(escrow.try_admin_resume_escrow(&admin_addr).is_ok());
+
+    let topic_val: Val = symbol_short!("resume").into_val(&env);
+    let count = env.events().all().iter().fold(0u32, |acc, e| {
+        if let Some(t) = e.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() { acc + 1 } else { acc }
+        } else { acc }
+    });
+    assert_eq!(count, 0, "resume on non-paused escrow must not emit an event");
+}
+
+/// Resuming emits one `resume` event with correct fields.
+#[test]
+fn test_admin_resume_escrow_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, contract_id, escrow) = setup_yield_escrow(&env);
+
+    escrow.admin_pause_escrow(&admin_addr);
+    escrow.admin_resume_escrow(&admin_addr);
+
+    let topic_val: Val = symbol_short!("resume").into_val(&env);
+    let mut found: Option<EscrowResumedEvent> = None;
+    for e in env.events().all().iter() {
+        if let Some(t) = e.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() {
+                found = Some(EscrowResumedEvent::from_val(&env, &e.2));
+            }
+        }
+    }
+    let ev = found.expect("expected resume event");
+    assert_eq!(ev.admin, admin_addr);
+    assert_eq!(ev.contract_id, contract_id);
+}
+
+/// Non-admin caller is rejected on resume.
+#[test]
+fn test_admin_resume_escrow_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, freelancer_addr, _, _, _, _, escrow) = setup_yield_escrow(&env);
+    assert_eq!(
+        escrow.try_admin_resume_escrow(&freelancer_addr),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+// ── get_yield_info ────────────────────────────────────────────────────────────
+
+/// Before any admin calls: all fields are zero / false.
+#[test]
+fn test_get_yield_info_defaults_after_initialize() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, _, _, _, escrow) = setup_yield_escrow(&env);
+    let (rate, total, paused) = escrow.get_yield_info();
+    assert_eq!(rate, 0);
+    assert_eq!(total, 0);
+    assert!(!paused);
+}
+
+/// Reflects updated rate after admin_set_yield_rate.
+#[test]
+fn test_get_yield_info_reflects_rate_update() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    escrow.admin_set_yield_rate(&admin_addr, &350u32);
+    assert_eq!(escrow.get_yield_info().0, 350);
+}
+
+/// Reflects accumulated total after admin_accrue_yield.
+#[test]
+fn test_get_yield_info_reflects_accrual() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    escrow.admin_accrue_yield(&admin_addr, &0u32, &500_i128);
+    escrow.admin_accrue_yield(&admin_addr, &0u32, &300_i128);
+    assert_eq!(escrow.get_yield_info().1, 800);
+}
+
+/// Reflects paused = true after admin_pause_escrow.
+#[test]
+fn test_get_yield_info_reflects_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    escrow.admin_pause_escrow(&admin_addr);
+    assert!(escrow.get_yield_info().2);
+    escrow.admin_resume_escrow(&admin_addr);
+    assert!(!escrow.get_yield_info().2);
+}
+
+/// Calling before initialize must return NotInitialized.
+#[test]
+fn test_get_yield_info_before_initialize_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    let result = escrow.try_get_yield_info();
+    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+}
+
+// ── pause guard on all user-facing endpoints ──────────────────────────────────
+
+/// fund() returns EscrowPaused when the escrow is paused.
+/// We use a fresh, unfunded escrow to reach the fund() call.
+#[test]
+fn test_pause_guard_blocks_fund() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_id);
+    token_admin.mint(&client_addr, &1_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    escrow.initialize(
+        &admin_addr, &client_addr, &freelancer_addr, &arbiter_addr,
+        &token_id, &604800, &vec![&env, 1_000_i128],
+    );
+    escrow.admin_pause_escrow(&admin_addr);
+
+    let result = escrow.try_fund(&client_addr);
+    assert_eq!(result, Err(Ok(Error::EscrowPaused)));
+}
+
+/// mark_delivered() returns EscrowPaused when the escrow is paused.
+#[test]
+fn test_pause_guard_blocks_mark_delivered() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, freelancer_addr, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    escrow.admin_pause_escrow(&admin_addr);
+    assert_eq!(
+        escrow.try_mark_delivered(&freelancer_addr, &0u32),
+        Err(Ok(Error::EscrowPaused))
+    );
+}
+
+/// approve_milestone() returns EscrowPaused when the escrow is paused.
+#[test]
+fn test_pause_guard_blocks_approve_milestone() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.admin_pause_escrow(&admin_addr);
+    assert_eq!(
+        escrow.try_approve_milestone(&client_addr, &0u32),
+        Err(Ok(Error::EscrowPaused))
+    );
+}
+
+/// approve_partial() returns EscrowPaused when the escrow is paused.
+#[test]
+fn test_pause_guard_blocks_approve_partial() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.admin_pause_escrow(&admin_addr);
+    assert_eq!(
+        escrow.try_approve_partial(&client_addr, &0u32, &1_000_i128),
+        Err(Ok(Error::EscrowPaused))
+    );
+}
+
+/// claim_auto_release() returns EscrowPaused when the escrow is paused.
+#[test]
+fn test_pause_guard_blocks_claim_auto_release() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_id);
+    token_admin.mint(&client_addr, &1_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    escrow.initialize(
+        &admin_addr, &client_addr, &freelancer_addr, &arbiter_addr,
+        &token_id, &100u64, &vec![&env, 1_000_i128],
+    );
+    escrow.fund(&client_addr);
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    env.ledger().with_mut(|li| { li.timestamp += 200; });
+
+    escrow.admin_pause_escrow(&admin_addr);
+    assert_eq!(
+        escrow.try_claim_auto_release(&freelancer_addr, &0u32),
+        Err(Ok(Error::EscrowPaused))
+    );
+}
+
+/// raise_dispute() returns EscrowPaused when the escrow is paused.
+#[test]
+fn test_pause_guard_blocks_raise_dispute() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, _, _, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    escrow.admin_pause_escrow(&admin_addr);
+    assert_eq!(
+        escrow.try_raise_dispute(&client_addr, &0u32),
+        Err(Ok(Error::EscrowPaused))
+    );
+}
+
+/// resolve_dispute() returns EscrowPaused when the escrow is paused.
+#[test]
+fn test_pause_guard_blocks_resolve_dispute() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, _, arbiter_addr, admin_addr, _, _, escrow) = setup_yield_escrow(&env);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.admin_pause_escrow(&admin_addr);
+    assert_eq!(
+        escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true),
+        Err(Ok(Error::EscrowPaused))
+    );
+}
+
+/// After resume, normal operations work again (fund path already tested in
+/// setup_yield_escrow; here we test approve_milestone end-to-end).
+#[test]
+fn test_pause_then_resume_restores_normal_operations() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, freelancer_addr, _, admin_addr, token_id, contract_id, escrow) =
+        setup_yield_escrow(&env);
+    let token = token::Client::new(&env, &token_id);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.admin_pause_escrow(&admin_addr);
+
+    // Paused — approve must fail.
+    assert_eq!(
+        escrow.try_approve_milestone(&client_addr, &0u32),
+        Err(Ok(Error::EscrowPaused))
+    );
+
+    // Resume — approve must now succeed.
+    escrow.admin_resume_escrow(&admin_addr);
+    escrow.approve_milestone(&client_addr, &0u32);
+
+    assert_eq!(token.balance(&freelancer_addr), 10_000);
+    assert_eq!(token.balance(&contract_id), 0);
+}
+
+// ── admin override endpoints remain usable while paused ──────────────────────
+
+/// Admin override endpoints (release, refund, accrue, set_rate) must NOT be
+/// blocked by the pause guard — they are the remedy for locked conditions.
+#[test]
+fn test_admin_overrides_work_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, _, _, admin_addr, token_id, contract_id, escrow) = setup_yield_escrow(&env);
+    let token = token::Client::new(&env, &token_id);
+
+    escrow.admin_pause_escrow(&admin_addr);
+    assert!(escrow.get_yield_info().2, "should be paused");
+
+    // All admin endpoints must succeed even while paused.
+    assert!(escrow.try_admin_set_yield_rate(&admin_addr, &100u32).is_ok());
+    assert!(escrow.try_admin_accrue_yield(&admin_addr, &0u32, &50_i128).is_ok());
+    assert!(escrow.try_admin_override_release(&admin_addr, &0u32).is_ok());
+
+    // Tokens should have been transferred despite the pause.
+    assert_eq!(token.balance(&escrow.get_job().freelancer), 10_000);
+    assert_eq!(token.balance(&contract_id), 0);
+}
+
+/// A second escrow instance can be refunded while paused (mirrors the
+/// release test above for the refund path).
+#[test]
+fn test_admin_override_refund_works_while_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client_addr, _, _, admin_addr, token_id, contract_id, escrow) =
+        setup_yield_escrow(&env);
+    let token = token::Client::new(&env, &token_id);
+
+    escrow.admin_pause_escrow(&admin_addr);
+    assert!(escrow.try_admin_override_refund(&admin_addr, &0u32).is_ok());
+
+    assert_eq!(token.balance(&client_addr), 10_000);
+    assert_eq!(token.balance(&contract_id), 0);
+}
+
+// ── admin override after transfer_admin ──────────────────────────────────────
+
+/// After transferring admin rights, the old admin must be rejected and the
+/// new admin must be accepted by all override endpoints.
+#[test]
+fn test_admin_overrides_respect_transfer_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, _, old_admin, _, _, escrow) = setup_yield_escrow(&env);
+    let new_admin = Address::generate(&env);
+
+    escrow.transfer_admin(&old_admin, &new_admin);
+
+    // Old admin must now be rejected.
+    assert_eq!(
+        escrow.try_admin_set_yield_rate(&old_admin, &100u32),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        escrow.try_admin_pause_escrow(&old_admin),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        escrow.try_admin_override_release(&old_admin, &0u32),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        escrow.try_admin_override_refund(&old_admin, &0u32),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // New admin must succeed.
+    assert!(escrow.try_admin_set_yield_rate(&new_admin, &200u32).is_ok());
+    assert!(escrow.try_admin_pause_escrow(&new_admin).is_ok());
+    assert!(escrow.try_admin_resume_escrow(&new_admin).is_ok());
+    assert!(escrow.try_admin_override_release(&new_admin, &0u32).is_ok());
+}
+
+// ── multi-milestone override scenarios ───────────────────────────────────────
+
+/// Admin can override individual milestones independently; untouched
+/// milestones must not be mutated.
+#[test]
+fn test_admin_override_release_does_not_affect_sibling_milestones() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_id);
+    token_admin.mint(&client_addr, &6_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+
+    escrow.initialize(
+        &admin_addr, &client_addr, &freelancer_addr, &arbiter_addr,
+        &token_id, &604800, &vec![&env, 2_000_i128, 2_000_i128, 2_000_i128],
+    );
+    escrow.fund(&client_addr);
+
+    // Override release only milestone 1.
+    escrow.admin_override_release(&admin_addr, &1u32);
+
+    let job = escrow.get_job();
+    assert_eq!(job.milestones.get(0).unwrap().status, MilestoneStatus::Pending,
+        "milestone 0 must be untouched");
+    assert_eq!(job.milestones.get(1).unwrap().status, MilestoneStatus::Released,
+        "milestone 1 must be Released");
+    assert_eq!(job.milestones.get(2).unwrap().status, MilestoneStatus::Pending,
+        "milestone 2 must be untouched");
+}
