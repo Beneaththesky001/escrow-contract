@@ -25,6 +25,7 @@ pub enum Error {
     InvalidAmount = 10,
     DeadlineNotPassed = 11,
     InvalidAddress = 12,
+    InvalidExtension = 13,
 }
 
 #[contracttype]
@@ -94,6 +95,7 @@ pub enum DataKey {
     /// flag has no further use.
     MilestoneReleased(u32),
     Reputation(Address),
+    MilestoneTimeExtension(u32),
 }
 
 #[contracttype]
@@ -133,6 +135,16 @@ pub struct DeliveredEvent {
     pub delivered_at: u64,
     pub status: MilestoneStatus,
     pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeadlineExtendedEvent {
+    pub contract_id: Address,
+    pub milestone_index: u32,
+    pub client: Address,
+    pub extra_seconds: u64,
+    pub new_extension: u64,
 }
 
 #[contracttype]
@@ -262,6 +274,13 @@ impl MilestoneEscrow {
         env.storage()
             .temporary()
             .set(&DataKey::MilestoneReleased(index), &true);
+    }
+
+    fn load_time_extension(env: &Env, index: u32) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MilestoneTimeExtension(index))
+            .unwrap_or(0)
     }
 
     /// Check whether `approve_milestone` has marked the given milestone index
@@ -751,6 +770,55 @@ impl MilestoneEscrow {
         Ok(())
     }
 
+    /// Extends the auto-release deadline for a Delivered milestone.
+    pub fn extend_milestone_deadline(
+        env: Env,
+        client: Address,
+        milestone_index: u32,
+        extra_seconds: u64,
+    ) -> Result<(), Error> {
+        Self::assert_not_paused(&env)?;
+        client.require_auth();
+        let meta = Self::load_job_meta(&env)?;
+
+        if meta.client != client {
+            return Err(Error::Unauthorized);
+        }
+
+        if milestone_index >= meta.milestone_count {
+            return Err(Error::InvalidMilestone);
+        }
+
+        let milestone = Self::load_milestone(&env, milestone_index)?;
+        if milestone.status != MilestoneStatus::Delivered && milestone.status != MilestoneStatus::PartiallyReleased {
+            return Err(Error::InvalidStatus);
+        }
+
+        if extra_seconds == 0 {
+            return Err(Error::InvalidExtension);
+        }
+
+        let current_extension = Self::load_time_extension(&env, milestone_index);
+        let new_extension = current_extension.checked_add(extra_seconds).ok_or(Error::InvalidExtension)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MilestoneTimeExtension(milestone_index), &new_extension);
+
+        env.events().publish(
+            (symbol_short!("extend"),),
+            DeadlineExtendedEvent {
+                contract_id: env.current_contract_address(),
+                milestone_index,
+                client,
+                extra_seconds,
+                new_extension,
+            },
+        );
+
+        Ok(())
+    }
+
     /// Time-locked auto-release of a single milestone to the freelancer.
     ///
     /// # Gas complexity: O(1)
@@ -817,9 +885,11 @@ impl MilestoneEscrow {
         //    migration remain fully functional.
         let delivered_at =
             Self::load_delivered_at(&env, milestone_index).unwrap_or(milestone.delivered_at);
+        let extension = Self::load_time_extension(&env, milestone_index);
 
         let deadline = delivered_at
             .checked_add(meta.auto_release_seconds)
+            .and_then(|d| d.checked_add(extension))
             .ok_or(Error::InvalidAmount)?;
         let current = env.ledger().timestamp();
         if current < deadline {
@@ -878,7 +948,8 @@ impl MilestoneEscrow {
         // fall back to the persistent Milestone field for pre-migration entries.
         let delivered_at =
             Self::load_delivered_at(&env, milestone_index).unwrap_or(milestone.delivered_at);
-        let deadline = delivered_at + meta.auto_release_seconds;
+        let extension = Self::load_time_extension(&env, milestone_index);
+        let deadline = delivered_at + meta.auto_release_seconds + extension;
         let current = env.ledger().timestamp();
         (deadline as i64) - (current as i64)
     }
