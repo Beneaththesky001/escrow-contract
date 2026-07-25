@@ -5625,3 +5625,82 @@ fn test_reputation_auto_release() {
     assert_eq!(client.get_reputation(&client_addr), 1);
     assert_eq!(client.get_reputation(&freelancer_addr), 1);
 }
+
+#[test]
+fn test_escrow_interest_yield_preserves_total_odd_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    // 101 * 1/2 = 50.5 -> round nearest 51; remainder 50
+    let split = client.escrow_interest_yield(&101_i128, &1_i128, &2_i128);
+    assert_eq!(split.first, 51);
+    assert_eq!(split.second, 50);
+    assert_eq!(split.first + split.second, 101);
+}
+
+#[test]
+fn test_escrow_interest_yield_exact_ratio_no_rounding() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.escrow_interest_yield(&1_000_i128, &3_i128, &4_i128);
+    assert_eq!(split.first, 750);
+    assert_eq!(split.second, 250);
+    assert_eq!(split.first + split.second, 1_000);
+}
+
+#[test]
+fn test_escrow_interest_yield_rejects_invalid_ratio() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.try_escrow_interest_yield(&100_i128, &7_i128, &3_i128),
+        Err(Ok(Error::InvalidRatio))
+    );
+    assert_eq!(
+        client.try_escrow_interest_yield(&100_i128, &-1_i128, &2_i128),
+        Err(Ok(Error::InvalidRatio))
+    );
+    assert_eq!(
+        client.try_escrow_interest_yield(&-1_i128, &1_i128, &2_i128),
+        Err(Ok(Error::InvalidRatio))
+    );
+    assert_eq!(
+        client.try_escrow_interest_yield(&100_i128, &1_i128, &0_i128),
+        Err(Ok(Error::InvalidRatio))
+    );
+}
+
+#[test]
+fn test_escrow_interest_yield_bps_preserves_total() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.escrow_interest_yield_bps(&999_i128, &3_333_u32);
+    assert_eq!(split.first + split.second, 999);
+    assert_eq!(
+        client.try_escrow_interest_yield_bps(&100_i128, &10_001_u32),
+        Err(Ok(Error::InvalidRatio))
+    );
+}
+
+#[test]
+fn test_escrow_interest_yield_zero_total() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.escrow_interest_yield(&0_i128, &1_i128, &2_i128);
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 0);
+}

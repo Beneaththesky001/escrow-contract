@@ -25,7 +25,10 @@ pub enum Error {
     InvalidAmount = 10,
     DeadlineNotPassed = 11,
     InvalidAddress = 12,
+    InvalidRatio = 13,
 }
+
+const BPS_SCALE: u32 = 10_000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +73,14 @@ struct JobMeta {
     auto_release_seconds: u64,
     milestone_count: u32,
     total_amount: i128,
+}
+
+/// Two-way high-precision ratio split result (first + second == total).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RatioSplit {
+    pub first: i128,
+    pub second: i128,
 }
 
 #[contracttype]
@@ -1202,6 +1213,60 @@ impl MilestoneEscrow {
             .set(&DataKey::Version, &(current + 1));
 
         Ok(())
+    }
+
+
+    /// Round-nearest split that never loses value: first + second == total.
+    fn split_round_nearest(
+        total: i128,
+        numerator: i128,
+        denominator: i128,
+    ) -> Result<RatioSplit, Error> {
+        if total < 0 || numerator < 0 || denominator <= 0 || numerator > denominator {
+            return Err(Error::InvalidRatio);
+        }
+
+        let scaled = total.checked_mul(numerator).ok_or(Error::InvalidAmount)?;
+        let half = denominator / 2;
+        let rounded = scaled
+            .checked_add(half)
+            .ok_or(Error::InvalidAmount)?
+            / denominator;
+
+        if rounded > total {
+            return Err(Error::InvalidAmount);
+        }
+
+        Ok(RatioSplit {
+            first: rounded,
+            second: total.checked_sub(rounded).ok_or(Error::InvalidAmount)?,
+        })
+    }
+
+    /// High-precision ratio split for escrow interest/yield allocation.
+    ///
+    /// Splits `total_amount` by `numerator/denominator` using round-nearest
+    /// for the first share and assigning the remainder to the second share so
+    /// the sum always equals `total_amount` (no dust lost to truncation).
+    pub fn escrow_interest_yield(
+        _env: Env,
+        total_amount: i128,
+        numerator: i128,
+        denominator: i128,
+    ) -> Result<RatioSplit, Error> {
+        Self::split_round_nearest(total_amount, numerator, denominator)
+    }
+
+    /// Allocate yield using basis-point ratios (must sum to 10_000).
+    pub fn escrow_interest_yield_bps(
+        _env: Env,
+        total_amount: i128,
+        first_bps: u32,
+    ) -> Result<RatioSplit, Error> {
+        if first_bps > BPS_SCALE {
+            return Err(Error::InvalidRatio);
+        }
+        Self::split_round_nearest(total_amount, first_bps as i128, BPS_SCALE as i128)
     }
 
     pub fn version(env: Env) -> u32 {
