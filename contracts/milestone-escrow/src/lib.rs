@@ -27,6 +27,8 @@ pub enum Error {
     InvalidAddress = 12,
     Paused = 13,
     InvalidRatio = 14,
+    InvalidExtension = 15,
+    EscrowLocked = 16,
 }
 
 const BPS_SCALE: u32 = 10_000;
@@ -126,6 +128,8 @@ pub enum DataKey {
     /// raise_dispute, resolve_dispute) so that an emergency admin investigation
     /// cannot be interfered with.
     Paused,
+    MilestoneTimeExtension(u32),
+    CancelLock,
 }
 
 #[contracttype]
@@ -265,6 +269,23 @@ pub struct ClaimedEvent {
     pub amount: i128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelEscrowInitiatedEvent {
+    pub contract_id: Address,
+    pub caller: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeadlineExtendedEvent {
+    pub contract_id: Address,
+    pub milestone_index: u32,
+    pub client: Address,
+    pub extra_seconds: u64,
+    pub new_extension: u64,
+}
+
 // ── escrow_interest_yield admin-override events ──────────────────────────────
 
 /// Emitted by `admin_set_yield_rate` whenever the admin updates the annual
@@ -362,6 +383,14 @@ impl MilestoneEscrow {
             .unwrap_or(false);
         if paused {
             return Err(Error::Paused);
+        }
+        let cancel_locked = env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::CancelLock)
+            .unwrap_or(false);
+        if cancel_locked {
+            return Err(Error::EscrowLocked);
         }
         Ok(())
     }
@@ -463,13 +492,7 @@ impl MilestoneEscrow {
             .unwrap_or(0)
     }
 
-    fn assert_not_paused(env: &Env) -> Result<(), Error> {
-        let is_paused: bool = env.storage().instance().get(&DataKey::CancelLock).unwrap_or(false);
-        if is_paused {
-            return Err(Error::EscrowLocked);
-        }
-        Ok(())
-    }
+
 
     /// Check whether `approve_milestone` has marked the given milestone index
     /// as fully released via the temporary completion flag.  Returns `false`
