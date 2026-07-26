@@ -204,8 +204,15 @@ pub struct DisputeRaisedEvent {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeResolvedEvent {
+    pub contract_id: Address,
     pub milestone_index: u32,
+    pub arbiter: Address,
+    pub client: Address,
+    pub freelancer: Address,
+    pub token: Address,
+    pub amount: i128,
     pub released_to_freelancer: bool,
+    pub status: MilestoneStatus,
 }
 
 #[contracttype]
@@ -629,7 +636,10 @@ impl MilestoneEscrow {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
         );
 
-        if address == &zero_account || address == &zero_contract || address == &env.current_contract_address() {
+        if address == &zero_account
+            || address == &zero_contract
+            || address == &env.current_contract_address()
+        {
             return Err(Error::InvalidAddress);
         }
 
@@ -681,7 +691,9 @@ impl MilestoneEscrow {
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::EmergencyPaused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyPaused, &false);
         env.storage().instance().set(
             &DataKey::PlatformFeeAllocation,
             &PlatformFeeAllocation {
@@ -1309,8 +1321,8 @@ impl MilestoneEscrow {
             return Err(Error::InvalidMilestone);
         }
 
-       let mut milestone = Self::load_milestone(&env, milestone_index)?;
-       if milestone.status != MilestoneStatus::Delivered {
+        let mut milestone = Self::load_milestone(&env, milestone_index)?;
+        if milestone.status != MilestoneStatus::Delivered {
             return Err(Error::InvalidStatus);
         }
 
@@ -1425,7 +1437,6 @@ impl MilestoneEscrow {
         release_to_freelancer: bool,
     ) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
-        // Check for zero addresses (both account and contract types)
         let zero_account = Address::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -1435,7 +1446,10 @@ impl MilestoneEscrow {
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
         );
 
-        if arbiter == zero_account || arbiter == zero_contract {
+        if arbiter == zero_account
+            || arbiter == zero_contract
+            || arbiter == env.current_contract_address()
+        {
             return Err(Error::InvalidAddress);
         }
         arbiter.require_auth();
@@ -1454,23 +1468,36 @@ impl MilestoneEscrow {
             return Err(Error::InvalidStatus);
         }
 
-        let remaining = milestone.amount - milestone.released_amount;
+        let remaining = milestone
+            .amount
+            .checked_sub(milestone.released_amount)
+            .ok_or(Error::InvalidAmount)?;
+        if remaining <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
         let token_client = token::Client::new(&env, &meta.token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        if contract_balance <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
         if release_to_freelancer {
-            if remaining > 0 {
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &meta.freelancer,
-                    &remaining,
-                );
-                milestone.released_amount = milestone.amount;
+            let payout = remaining.min(contract_balance);
+            if payout > 0 {
+                token_client.transfer(&env.current_contract_address(), &meta.freelancer, &payout);
+                milestone.released_amount = milestone
+                    .released_amount
+                    .checked_add(payout)
+                    .ok_or(Error::InvalidAmount)?;
             }
             milestone.status = MilestoneStatus::Released;
             Self::increment_reputation(&env, &meta.client);
             Self::increment_reputation(&env, &meta.freelancer);
         } else {
-            if remaining > 0 {
-                token_client.transfer(&env.current_contract_address(), &meta.client, &remaining);
+            let refund = remaining.min(contract_balance);
+            if refund > 0 {
+                token_client.transfer(&env.current_contract_address(), &meta.client, &refund);
             }
             milestone.status = MilestoneStatus::Refunded;
         }
@@ -1480,8 +1507,15 @@ impl MilestoneEscrow {
         env.events().publish(
             (symbol_short!("resolve"),),
             DisputeResolvedEvent {
+                contract_id: env.current_contract_address(),
                 milestone_index,
+                arbiter: meta.arbiter.clone(),
+                client: meta.client.clone(),
+                freelancer: meta.freelancer.clone(),
+                token: meta.token.clone(),
+                amount: remaining,
                 released_to_freelancer: release_to_freelancer,
+                status: milestone.status.clone(),
             },
         );
 
@@ -1503,11 +1537,7 @@ impl MilestoneEscrow {
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
 
-        let current: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or(1);
+        let current: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(1);
         env.storage()
             .instance()
             .set(&DataKey::Version, &(current + 1));
@@ -1517,19 +1547,29 @@ impl MilestoneEscrow {
 
     pub fn emergency_pause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        env.storage().instance().set(&DataKey::EmergencyPaused, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyPaused, &true);
         Ok(())
     }
 
     pub fn emergency_unpause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        env.storage().instance().set(&DataKey::EmergencyPaused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyPaused, &false);
         Ok(())
     }
 
-    pub fn emergency_pause_admin_override(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
+    pub fn emergency_pause_admin_override(
+        env: Env,
+        admin: Address,
+        paused: bool,
+    ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        env.storage().instance().set(&DataKey::EmergencyPaused, &paused);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyPaused, &paused);
         Ok(())
     }
 
@@ -1649,13 +1689,17 @@ impl MilestoneEscrow {
         let mut allocated_total: i128 = 0;
 
         for ratio in ratios.iter() {
-            let weighted = total_amount.checked_mul(ratio).ok_or(Error::InvalidAmount)?;
+            let weighted = total_amount
+                .checked_mul(ratio)
+                .ok_or(Error::InvalidAmount)?;
             let base = weighted / ratio_sum;
             let rem = weighted % ratio_sum;
 
             allocations.push_back(base);
             remainders.push_back(rem);
-            allocated_total = allocated_total.checked_add(base).ok_or(Error::InvalidAmount)?;
+            allocated_total = allocated_total
+                .checked_add(base)
+                .ok_or(Error::InvalidAmount)?;
         }
 
         let remaining = total_amount
@@ -1685,10 +1729,7 @@ impl MilestoneEscrow {
     }
 
     pub fn version(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::Version)
-            .unwrap_or(1)
+        env.storage().instance().get(&DataKey::Version).unwrap_or(1)
     }
 
     pub fn get_job(env: Env) -> Result<Job, Error> {
@@ -1745,11 +1786,7 @@ impl MilestoneEscrow {
     /// * `NotInitialized`   – Contract has not been initialised yet.
     /// * `Unauthorized`     – `admin` does not match the stored admin key.
     /// * `YieldRateInvalid` – `rate_bps` exceeds 10 000.
-    pub fn admin_set_yield_rate(
-        env: Env,
-        admin: Address,
-        rate_bps: u32,
-    ) -> Result<(), Error> {
+    pub fn admin_set_yield_rate(env: Env, admin: Address, rate_bps: u32) -> Result<(), Error> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
@@ -1998,11 +2035,7 @@ impl MilestoneEscrow {
             .set(&DataKey::YieldAccrued, &0_i128);
 
         let token_client = token::Client::new(&env, &meta.token);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &meta.client,
-            &remaining,
-        );
+        token_client.transfer(&env.current_contract_address(), &meta.client, &remaining);
 
         env.events().publish(
             (symbol_short!("admovrf"),),
