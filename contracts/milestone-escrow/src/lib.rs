@@ -27,6 +27,7 @@ pub enum Error {
     InvalidAddress = 12,
     Paused = 13,
     InvalidRatio = 14,
+    InvalidExtension = 15,
 }
 
 const BPS_SCALE: u32 = 10_000;
@@ -126,6 +127,7 @@ pub enum DataKey {
     /// raise_dispute, resolve_dispute) so that an emergency admin investigation
     /// cannot be interfered with.
     Paused,
+    MilestoneTimeExtension(u32),
 }
 
 #[contracttype]
