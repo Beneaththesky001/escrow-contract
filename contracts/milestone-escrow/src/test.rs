@@ -3,7 +3,7 @@ use super::*;
 use crate::Error::NotFunded;
 use soroban_sdk::{
     contract, contractimpl, contracttype, testutils::Address as _, testutils::EnvTestConfig,
-    testutils::Events, testutils::Ledger, vec, Address, Env, FromVal, IntoVal, Symbol, Val,
+    testutils::Events, testutils::Ledger, vec, Address, Env, FromVal, IntoVal, TryIntoVal, Symbol, Val,
 };
 
 #[contracttype]
