@@ -2262,6 +2262,65 @@ fn test_whitelist_state_transitions() {
     assert!(client.is_token_whitelisted(&token3));
 }
 
+// ── extend_milestone_deadline ────────────────────────────────────────────────
+
+#[test]
+fn test_extend_milestone_deadline_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 5_000_i128];
+    let (client_addr, freelancer_addr, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+
+    let initial_time = escrow.time_until_auto_release(&0u32);
+    
+    // Extend by 1000 seconds
+    escrow.extend_milestone_deadline(&client_addr, &0u32, &1000u64);
+
+    let new_time = escrow.time_until_auto_release(&0u32);
+    assert_eq!(new_time, initial_time + 1000);
+}
+
+#[test]
+fn test_extend_milestone_deadline_not_client_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 5_000_i128];
+    let (_, freelancer_addr, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+
+    // freelancer tries to extend
+    let result = escrow.try_extend_milestone_deadline(&freelancer_addr, &0u32, &1000u64);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Unauthorized);
+}
+
+#[test]
+fn test_extend_milestone_deadline_invalid_status_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 5_000_i128];
+    let (client_addr, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    // milestone is Pending, not Delivered
+    let result = escrow.try_extend_milestone_deadline(&client_addr, &0u32, &1000u64);
+    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidStatus);
+}
+
+#[test]
+fn test_extend_milestone_deadline_zero_seconds_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 5_000_i128];
+    let (client_addr, freelancer_addr, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+
+    let result = escrow.try_extend_milestone_deadline(&client_addr, &0u32, &0u64);
+    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidExtension);
+}
+
 #[test]
 fn test_approve_partial_on_disputed_milestone_fails() {
     let env = Env::default();
