@@ -685,6 +685,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "EmergencyPauseLock"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "bool": false
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "EmergencyPaused"
                             }
                           ]
