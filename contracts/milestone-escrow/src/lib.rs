@@ -276,15 +276,6 @@ pub struct CancelEscrowInitiatedEvent {
     pub caller: Address,
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeadlineExtendedEvent {
-    pub contract_id: Address,
-    pub milestone_index: u32,
-    pub client: Address,
-    pub extra_seconds: u64,
-    pub new_extension: u64,
-}
 
 // ── escrow_interest_yield admin-override events ──────────────────────────────
 
