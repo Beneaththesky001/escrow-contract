@@ -29,15 +29,6 @@ pub enum Error {
     InvalidRatio = 14,
     InvalidExtension = 15,
     EscrowLocked = 16,
-    /// Returned when a state-modifying operation is attempted while
-    /// `tax_withholding_deductions` is executing.
-    TaxWithholdingInProgress = 17,
-    /// Returned when a state-modifying operation is attempted while
-    /// `platform_fee_allocation` is executing.
-    PlatformFeeAllocationInProgress = 18,
-    /// Returned when a state-modifying operation is attempted while
-    /// an emergency pause operation is executing.
-    EmergencyPauseInProgress = 19,
 }
 
 const BPS_SCALE: u32 = 10_000;
@@ -308,29 +299,6 @@ pub struct CancelEscrowInitiatedEvent {
     pub caller: Address,
 }
 
-/// Emitted by `admin_override_cancel_release` when the admin resolves a locked
-/// cancel state by releasing all remaining funds to the freelancer.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdminCancelOverrideReleaseEvent {
-    pub admin: Address,
-    pub contract_id: Address,
-    pub freelancer: Address,
-    pub token: Address,
-    pub total_released: i128,
-}
-
-/// Emitted by `admin_override_cancel_refund` when the admin resolves a locked
-/// cancel state by refunding all remaining funds to the client.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdminCancelOverrideRefundEvent {
-    pub admin: Address,
-    pub contract_id: Address,
-    pub client: Address,
-    pub token: Address,
-    pub total_refunded: i128,
-}
 
 // ── escrow_interest_yield admin-override events ──────────────────────────────
 
@@ -412,18 +380,6 @@ pub struct EscrowResumedEvent {
     pub contract_id: Address,
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaxWithholdingDeductionsEvent {
-    pub admin: Address,
-    pub contract_id: Address,
-    pub milestone_index: u32,
-    pub gross_amount: i128,
-    pub tax_amount: i128,
-    pub net_amount: i128,
-    pub tax_rate_bps: u32,
-}
-
 #[contract]
 pub struct MilestoneEscrow;
 
@@ -461,51 +417,6 @@ impl MilestoneEscrow {
             .unwrap_or(false);
         if cancel_locked {
             return Err(Error::EscrowLocked);
-        }
-        Ok(())
-    }
-
-    /// Return `Err(Error::TaxWithholdingInProgress)` when a tax withholding
-    /// calculation is active so that state-modifying operations can block
-    /// concurrent mutations.
-    fn assert_tax_withholding_not_locked(env: &Env) -> Result<(), Error> {
-        let locked: bool = env
-            .storage()
-            .instance()
-            .get::<_, bool>(&DataKey::TaxWithholdingLock)
-            .unwrap_or(false);
-        if locked {
-            return Err(Error::TaxWithholdingInProgress);
-        }
-        Ok(())
-    }
-
-    /// Return `Err(Error::PlatformFeeAllocationInProgress)` when a platform
-    /// fee allocation operation is active so that state-modifying operations
-    /// can block concurrent mutations.
-    fn assert_platform_fee_allocation_not_locked(env: &Env) -> Result<(), Error> {
-        let locked: bool = env
-            .storage()
-            .instance()
-            .get::<_, bool>(&DataKey::PlatformFeeAllocationLock)
-            .unwrap_or(false);
-        if locked {
-            return Err(Error::PlatformFeeAllocationInProgress);
-        }
-        Ok(())
-    }
-
-    /// Return `Err(Error::EmergencyPauseInProgress)` when an emergency pause
-    /// operation is active so that state-modifying operations can block
-    /// concurrent mutations.
-    fn assert_emergency_pause_not_locked(env: &Env) -> Result<(), Error> {
-        let locked: bool = env
-            .storage()
-            .instance()
-            .get::<_, bool>(&DataKey::EmergencyPauseLock)
-            .unwrap_or(false);
-        if locked {
-            return Err(Error::EmergencyPauseInProgress);
         }
         Ok(())
     }
@@ -1028,9 +939,6 @@ impl MilestoneEscrow {
 
     pub fn fund(env: Env, client: Address) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
-        Self::assert_tax_withholding_not_locked(&env)?;
-        Self::assert_platform_fee_allocation_not_locked(&env)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
         Self::validate_fund_client(&env, &client)?;
         client.require_auth();
         let mut meta = Self::load_job_meta(&env)?;
@@ -1076,9 +984,6 @@ impl MilestoneEscrow {
         milestone_index: u32,
     ) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
-        Self::assert_tax_withholding_not_locked(&env)?;
-        Self::assert_platform_fee_allocation_not_locked(&env)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
         // Check for zero addresses (both account and contract types)
         let zero_account = Address::from_str(
             &env,
@@ -1149,9 +1054,6 @@ impl MilestoneEscrow {
         extra_seconds: u64,
     ) -> Result<(), Error> {
         Self::assert_not_paused(&env)?;
-        Self::assert_tax_withholding_not_locked(&env)?;
-        Self::assert_platform_fee_allocation_not_locked(&env)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
         client.require_auth();
         let meta = Self::load_job_meta(&env)?;
 
@@ -1215,9 +1117,6 @@ impl MilestoneEscrow {
         milestone_index: u32,
     ) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
-        Self::assert_tax_withholding_not_locked(&env)?;
-        Self::assert_platform_fee_allocation_not_locked(&env)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
         let zero_account = Address::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -1338,9 +1237,6 @@ impl MilestoneEscrow {
         amount: i128,
     ) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
-        Self::assert_tax_withholding_not_locked(&env)?;
-        Self::assert_platform_fee_allocation_not_locked(&env)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
         let zero_1 = Address::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -1431,9 +1327,6 @@ impl MilestoneEscrow {
 
     pub fn approve_milestone(env: Env, client: Address, milestone_index: u32) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
-        Self::assert_tax_withholding_not_locked(&env)?;
-        Self::assert_platform_fee_allocation_not_locked(&env)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
         let zero_account = Address::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -1519,9 +1412,6 @@ impl MilestoneEscrow {
 
     pub fn raise_dispute(env: Env, caller: Address, milestone_index: u32) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
-        Self::assert_tax_withholding_not_locked(&env)?;
-        Self::assert_platform_fee_allocation_not_locked(&env)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
         // Check for zero addresses (both account and contract types)
         let zero_account = Address::from_str(
             &env,
@@ -1578,9 +1468,6 @@ impl MilestoneEscrow {
         release_to_freelancer: bool,
     ) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
-        Self::assert_tax_withholding_not_locked(&env)?;
-        Self::assert_platform_fee_allocation_not_locked(&env)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
         let zero_account = Address::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -1667,9 +1554,6 @@ impl MilestoneEscrow {
     }
 
     pub fn cancel_escrow(env: Env, caller: Address) -> Result<(), Error> {
-        Self::assert_tax_withholding_not_locked(&env)?;
-        Self::assert_platform_fee_allocation_not_locked(&env)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
         let zero_account = Address::from_str(
             &env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -1705,209 +1589,6 @@ impl MilestoneEscrow {
         Ok(())
     }
 
-    /// Admin emergency override: resolve a cancel-locked escrow by releasing
-    /// all remaining milestone funds to the freelancer.
-    ///
-    /// When `cancel_escrow` is called by either party, a `CancelLock` is set
-    /// that blocks all normal operations.  This endpoint lets the verified admin
-    /// break the deadlock by force-releasing every non-terminal milestone to the
-    /// freelancer in a single atomic transaction.
-    ///
-    /// # Checks (in order)
-    /// 1. `admin.require_auth()` — SDK-level signature check.
-    /// 2. `require_admin` — verified admin key matches `DataKey::Admin`.
-    /// 3. Contract must be initialised (`NotInitialized`).
-    /// 4. Escrow must be funded (`NotFunded`).
-    /// 5. `CancelLock` must be active (`InvalidStatus`).
-    ///
-    /// # Effects
-    /// - Every milestone in a non-terminal status (`!Released && !Refunded`)
-    ///   is moved to `Released` and its remaining balance is summed.
-    /// - The total is transferred from the contract to the freelancer in a
-    ///   single token call.
-    /// - `CancelLock` is cleared so subsequent queries are unblocked.
-    /// - `YieldAccrued` is reset to zero (matches the pattern used by
-    ///   `admin_override_release` / `admin_override_refund`).
-    ///
-    /// # Errors
-    /// * `NotInitialized`  – Contract not initialised.
-    /// * `Unauthorized`    – Caller is not the verified admin.
-    /// * `NotFunded`       – Escrow has not been funded.
-    /// * `InvalidStatus`   – `CancelLock` is not active.
-    /// * `InvalidAmount`   – Total remaining balance is zero (nothing to pay out).
-    pub fn admin_override_cancel_release(env: Env, admin: Address) -> Result<(), Error> {
-        Self::require_admin(&env, &admin)?;
-
-        let meta = Self::load_job_meta(&env)?;
-        if !meta.funded {
-            return Err(Error::NotFunded);
-        }
-
-        // Only valid when a cancel lock is active.
-        let cancel_locked = env
-            .storage()
-            .instance()
-            .get::<_, bool>(&DataKey::CancelLock)
-            .unwrap_or(false);
-        if !cancel_locked {
-            return Err(Error::InvalidStatus);
-        }
-
-        // Walk every milestone; accumulate remaining balance and mark Released.
-        let mut total_released: i128 = 0;
-        for index in 0..meta.milestone_count {
-            let mut milestone = Self::load_milestone(&env, index)?;
-            if milestone.status == MilestoneStatus::Released
-                || milestone.status == MilestoneStatus::Refunded
-            {
-                continue;
-            }
-            let remaining = milestone
-                .amount
-                .checked_sub(milestone.released_amount)
-                .ok_or(Error::InvalidAmount)?;
-            if remaining > 0 {
-                total_released = total_released
-                    .checked_add(remaining)
-                    .ok_or(Error::InvalidAmount)?;
-                milestone.released_amount = milestone.amount;
-                milestone.status = MilestoneStatus::Released;
-                Self::store_milestone(&env, index, &milestone);
-                Self::store_milestone_released(&env, index);
-            }
-        }
-
-        if total_released <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        // CEI: clear the lock and reset yield before the external transfer.
-        env.storage().instance().set(&DataKey::CancelLock, &false);
-        env.storage()
-            .persistent()
-            .set(&DataKey::YieldAccrued, &0_i128);
-
-        let token_client = token::Client::new(&env, &meta.token);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &meta.freelancer,
-            &total_released,
-        );
-
-        env.events().publish(
-            (symbol_short!("adcovls"),),
-            AdminCancelOverrideReleaseEvent {
-                admin,
-                contract_id: env.current_contract_address(),
-                freelancer: meta.freelancer,
-                token: meta.token,
-                total_released,
-            },
-        );
-
-        Ok(())
-    }
-
-    /// Admin emergency override: resolve a cancel-locked escrow by refunding
-    /// all remaining milestone funds to the client.
-    ///
-    /// Mirror of `admin_override_cancel_release`, but transfers funds back to
-    /// the client rather than the freelancer.  Use this when the client is
-    /// entitled to a full refund (e.g. no work was delivered).
-    ///
-    /// # Checks (in order)
-    /// 1. `admin.require_auth()` — SDK-level signature check.
-    /// 2. `require_admin` — verified admin key matches `DataKey::Admin`.
-    /// 3. Contract must be initialised (`NotInitialized`).
-    /// 4. Escrow must be funded (`NotFunded`).
-    /// 5. `CancelLock` must be active (`InvalidStatus`).
-    ///
-    /// # Effects
-    /// - Every milestone in a non-terminal status is moved to `Refunded` and
-    ///   its remaining balance is summed.
-    /// - The total is transferred from the contract to the client in a single
-    ///   token call.
-    /// - `CancelLock` is cleared.
-    /// - `YieldAccrued` is reset to zero.
-    ///
-    /// # Errors
-    /// * `NotInitialized`  – Contract not initialised.
-    /// * `Unauthorized`    – Caller is not the verified admin.
-    /// * `NotFunded`       – Escrow has not been funded.
-    /// * `InvalidStatus`   – `CancelLock` is not active.
-    /// * `InvalidAmount`   – Total remaining balance is zero (nothing to refund).
-    pub fn admin_override_cancel_refund(env: Env, admin: Address) -> Result<(), Error> {
-        Self::require_admin(&env, &admin)?;
-
-        let meta = Self::load_job_meta(&env)?;
-        if !meta.funded {
-            return Err(Error::NotFunded);
-        }
-
-        // Only valid when a cancel lock is active.
-        let cancel_locked = env
-            .storage()
-            .instance()
-            .get::<_, bool>(&DataKey::CancelLock)
-            .unwrap_or(false);
-        if !cancel_locked {
-            return Err(Error::InvalidStatus);
-        }
-
-        // Walk every milestone; accumulate remaining balance and mark Refunded.
-        let mut total_refunded: i128 = 0;
-        for index in 0..meta.milestone_count {
-            let mut milestone = Self::load_milestone(&env, index)?;
-            if milestone.status == MilestoneStatus::Released
-                || milestone.status == MilestoneStatus::Refunded
-            {
-                continue;
-            }
-            let remaining = milestone
-                .amount
-                .checked_sub(milestone.released_amount)
-                .ok_or(Error::InvalidAmount)?;
-            if remaining > 0 {
-                total_refunded = total_refunded
-                    .checked_add(remaining)
-                    .ok_or(Error::InvalidAmount)?;
-                milestone.released_amount = milestone.amount;
-                milestone.status = MilestoneStatus::Refunded;
-                Self::store_milestone(&env, index, &milestone);
-            }
-        }
-
-        if total_refunded <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        // CEI: clear the lock and reset yield before the external transfer.
-        env.storage().instance().set(&DataKey::CancelLock, &false);
-        env.storage()
-            .persistent()
-            .set(&DataKey::YieldAccrued, &0_i128);
-
-        let token_client = token::Client::new(&env, &meta.token);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &meta.client,
-            &total_refunded,
-        );
-
-        env.events().publish(
-            (symbol_short!("adcovrf"),),
-            AdminCancelOverrideRefundEvent {
-                admin,
-                contract_id: env.current_contract_address(),
-                client: meta.client,
-                token: meta.token,
-                total_refunded,
-            },
-        );
-
-        Ok(())
-    }
-
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         admin.require_auth();
 
@@ -1933,46 +1614,18 @@ impl MilestoneEscrow {
 
     pub fn emergency_pause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
-
         env.storage()
             .instance()
-            .set(&DataKey::EmergencyPauseLock, &true);
-
-        let result = (|| {
-            env.storage()
-                .instance()
-                .set(&DataKey::EmergencyPaused, &true);
-            Ok(())
-        })();
-
-        env.storage()
-            .instance()
-            .set(&DataKey::EmergencyPauseLock, &false);
-
-        result
+            .set(&DataKey::EmergencyPaused, &true);
+        Ok(())
     }
 
     pub fn emergency_unpause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
-
         env.storage()
             .instance()
-            .set(&DataKey::EmergencyPauseLock, &true);
-
-        let result = (|| {
-            env.storage()
-                .instance()
-                .set(&DataKey::EmergencyPaused, &false);
-            Ok(())
-        })();
-
-        env.storage()
-            .instance()
-            .set(&DataKey::EmergencyPauseLock, &false);
-
-        result
+            .set(&DataKey::EmergencyPaused, &false);
+        Ok(())
     }
 
     pub fn emergency_pause_admin_override(
@@ -1981,24 +1634,10 @@ impl MilestoneEscrow {
         paused: bool,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
-
         env.storage()
             .instance()
-            .set(&DataKey::EmergencyPauseLock, &true);
-
-        let result = (|| {
-            env.storage()
-                .instance()
-                .set(&DataKey::EmergencyPaused, &paused);
-            Ok(())
-        })();
-
-        env.storage()
-            .instance()
-            .set(&DataKey::EmergencyPauseLock, &false);
-
-        result
+            .set(&DataKey::EmergencyPaused, &paused);
+        Ok(())
     }
 
     pub fn is_emergency_paused(env: Env) -> bool {
@@ -2016,71 +1655,42 @@ impl MilestoneEscrow {
         treasury_bps: u32,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        Self::assert_platform_fee_allocation_not_locked(&env)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
         Self::validate_fee_allocation(client_bps, freelancer_bps, treasury_bps)?;
 
-        env.storage()
+        let current: PlatformFeeAllocation = env
+            .storage()
             .instance()
-            .set(&DataKey::PlatformFeeAllocationLock, &true);
+            .get(&DataKey::PlatformFeeAllocation)
+            .ok_or(Error::NotInitialized)?;
 
-        let result = (|| {
-            let current: PlatformFeeAllocation = env
-                .storage()
-                .instance()
-                .get(&DataKey::PlatformFeeAllocation)
-                .ok_or(Error::NotInitialized)?;
+        if current.locked {
+            return Err(Error::InvalidStatus);
+        }
 
-            if current.locked {
-                return Err(Error::InvalidStatus);
-            }
-
-            env.storage().instance().set(
-                &DataKey::PlatformFeeAllocation,
-                &PlatformFeeAllocation {
-                    client_bps,
-                    freelancer_bps,
-                    treasury_bps,
-                    locked: false,
-                },
-            );
-            Ok(())
-        })();
-
-        env.storage()
-            .instance()
-            .set(&DataKey::PlatformFeeAllocationLock, &false);
-
-        result
+        env.storage().instance().set(
+            &DataKey::PlatformFeeAllocation,
+            &PlatformFeeAllocation {
+                client_bps,
+                freelancer_bps,
+                treasury_bps,
+                locked: false,
+            },
+        );
+        Ok(())
     }
 
     pub fn lock_platform_fee_allocation(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        Self::assert_platform_fee_allocation_not_locked(&env)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
-
+        let mut current: PlatformFeeAllocation = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformFeeAllocation)
+            .ok_or(Error::NotInitialized)?;
+        current.locked = true;
         env.storage()
             .instance()
-            .set(&DataKey::PlatformFeeAllocationLock, &true);
-
-        let result = (|| {
-            let mut current: PlatformFeeAllocation = env
-                .storage()
-                .instance()
-                .get(&DataKey::PlatformFeeAllocation)
-                .ok_or(Error::NotInitialized)?;
-            current.locked = true;
-            env.storage()
-                .instance()
-                .set(&DataKey::PlatformFeeAllocation, &current);
-            Ok(())
-        })();
-
-        env.storage()
-            .instance()
-            .set(&DataKey::PlatformFeeAllocationLock, &false);
-
-        result
+            .set(&DataKey::PlatformFeeAllocation, &current);
+        Ok(())
     }
 
     pub fn pf_alloc_admin_override(
@@ -2091,32 +1701,17 @@ impl MilestoneEscrow {
         treasury_bps: u32,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        Self::assert_platform_fee_allocation_not_locked(&env)?;
-        Self::assert_emergency_pause_not_locked(&env)?;
         Self::validate_fee_allocation(client_bps, freelancer_bps, treasury_bps)?;
-
-        env.storage()
-            .instance()
-            .set(&DataKey::PlatformFeeAllocationLock, &true);
-
-        let result = (|| {
-            env.storage().instance().set(
-                &DataKey::PlatformFeeAllocation,
-                &PlatformFeeAllocation {
-                    client_bps,
-                    freelancer_bps,
-                    treasury_bps,
-                    locked: false,
-                },
-            );
-            Ok(())
-        })();
-
-        env.storage()
-            .instance()
-            .set(&DataKey::PlatformFeeAllocationLock, &false);
-
-        result
+        env.storage().instance().set(
+            &DataKey::PlatformFeeAllocation,
+            &PlatformFeeAllocation {
+                client_bps,
+                freelancer_bps,
+                treasury_bps,
+                locked: false,
+            },
+        );
+        Ok(())
     }
 
     pub fn get_platform_fee_allocation(env: Env) -> Result<PlatformFeeAllocation, Error> {
@@ -2132,107 +1727,7 @@ impl MilestoneEscrow {
         numerator: i128,
         denominator: i128,
     ) -> Result<RatioSplit, Error> {
-        if total_amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        if numerator < 0 {
-            return Err(Error::InvalidRatio);
-        }
-
-        if denominator <= 0 {
-            return Err(Error::InvalidRatio);
-        }
-
-        if numerator > denominator {
-            return Err(Error::InvalidRatio);
-        }
-
-        let split = Self::split_round_nearest(total_amount, numerator, denominator)?;
-
-        if split.first < 0 || split.second < 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        if split.first > total_amount || split.second > total_amount {
-            return Err(Error::InvalidAmount);
-        }
-
-        let recombined = split
-            .first
-            .checked_add(split.second)
-            .ok_or(Error::InvalidAmount)?;
-
-        if recombined != total_amount {
-            return Err(Error::InvalidAmount);
-        }
-
-        Ok(split)
-    }
-
-    /// Allocate a milestone's escrowed amount between two parties (typically
-    /// client and freelancer) using a high-precision ratio that reflects how
-    /// much of the extended deadline has been used.
-    ///
-    /// # Design
-    /// When a client extends a milestone's auto-release deadline, the elapsed
-    /// portion of the extended window can be used to derive a fair split of the
-    /// milestone amount:
-    ///
-    /// ```text
-    /// freelancer_share = round_nearest(amount × elapsed_seconds / total_seconds)
-    /// client_refund    = amount − freelancer_share
-    /// ```
-    ///
-    /// The arithmetic uses `split_round_nearest` which adds `denominator/2`
-    /// before the final division so that the freelancer receives the rounded
-    /// share rather than always the floor, preventing systematic value loss
-    /// through repeated rounding.  The two halves always sum to `amount` exactly.
-    ///
-    /// # Parameters
-    /// * `amount`           – Total escrowed amount to split.  Must be ≥ 0.
-    ///                        Zero is allowed (returns two zeros).
-    /// * `elapsed_seconds`  – Time already elapsed in the extension window.
-    ///                        Must satisfy 0 ≤ elapsed_seconds ≤ total_seconds.
-    /// * `total_seconds`    – Full length of the extension window.  Must be > 0.
-    ///
-    /// # Returns
-    /// A `RatioSplit` where:
-    /// * `first`  = freelancer portion (rounded to nearest stroop)
-    /// * `second` = client refund (remainder, guarantees first + second == amount)
-    ///
-    /// # Errors
-    /// * `InvalidAmount`  – `amount` is negative, or an intermediate checked
-    ///                      multiplication overflows.
-    /// * `InvalidRatio`   – `total_seconds` is zero, `elapsed_seconds` is
-    ///                      negative, or `elapsed_seconds > total_seconds`.
-    pub fn milestone_time_extensions(
-        _env: Env,
-        amount: i128,
-        elapsed_seconds: i128,
-        total_seconds: i128,
-    ) -> Result<RatioSplit, Error> {
-        // Reject negative amounts before delegating to split_round_nearest,
-        // which only accepts total >= 0.
-        if amount < 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        // Reject nonsensical time inputs before the generic ratio guard so
-        // callers get a precise error code for time-specific misuse.
-        if total_seconds <= 0 {
-            return Err(Error::InvalidRatio);
-        }
-        if elapsed_seconds < 0 || elapsed_seconds > total_seconds {
-            return Err(Error::InvalidRatio);
-        }
-
-        // Delegate to the single shared high-precision split primitive.
-        // split_round_nearest(total, numerator, denominator) computes:
-        //   first  = round_nearest(total × numerator / denominator)
-        //   second = total − first
-        // Here numerator = elapsed_seconds, denominator = total_seconds.
-        Self::split_round_nearest(amount, elapsed_seconds, total_seconds)
+        Self::split_round_nearest(total_amount, numerator, denominator)
     }
 
     pub fn multisig_transfer_admin(
@@ -2782,41 +2277,30 @@ impl MilestoneEscrow {
     /// * `NotInitialized` – Contract has not been initialised.
     /// * `Unauthorized`   – `admin` is not the stored admin.
     pub fn admin_pause_escrow(env: Env, admin: Address) -> Result<(), Error> {
-        Self::assert_emergency_pause_not_locked(&env)?;
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
-        env.storage()
+        let already_paused: bool = env
+            .storage()
             .instance()
-            .set(&DataKey::EmergencyPauseLock, &true);
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
 
-        let result = (|| {
-            let already_paused: bool = env
-                .storage()
-                .instance()
-                .get(&DataKey::Paused)
-                .unwrap_or(false);
+        env.storage().instance().set(&DataKey::Paused, &true);
 
-            env.storage().instance().set(&DataKey::Paused, &true);
+        // Only emit the event the first time so indexers can count distinct
+        // pause transitions without double-counting idempotent re-pauses.
+        if !already_paused {
+            env.events().publish(
+                (symbol_short!("pause"),),
+                EscrowPausedEvent {
+                    admin,
+                    contract_id: env.current_contract_address(),
+                },
+            );
+        }
 
-            if !already_paused {
-                env.events().publish(
-                    (symbol_short!("pause"),),
-                    EscrowPausedEvent {
-                        admin: admin.clone(),
-                        contract_id: env.current_contract_address(),
-                    },
-                );
-            }
-
-            Ok(())
-        })();
-
-        env.storage()
-            .instance()
-            .set(&DataKey::EmergencyPauseLock, &false);
-
-        result
+        Ok(())
     }
 
     /// Resume a previously paused escrow, re-enabling all normal user-facing
@@ -2831,41 +2315,28 @@ impl MilestoneEscrow {
     /// * `NotInitialized` – Contract has not been initialised.
     /// * `Unauthorized`   – `admin` is not the stored admin.
     pub fn admin_resume_escrow(env: Env, admin: Address) -> Result<(), Error> {
-        Self::assert_emergency_pause_not_locked(&env)?;
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
-        env.storage()
+        let currently_paused: bool = env
+            .storage()
             .instance()
-            .set(&DataKey::EmergencyPauseLock, &true);
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
 
-        let result = (|| {
-            let currently_paused: bool = env
-                .storage()
-                .instance()
-                .get(&DataKey::Paused)
-                .unwrap_or(false);
+        env.storage().instance().set(&DataKey::Paused, &false);
 
-            env.storage().instance().set(&DataKey::Paused, &false);
+        if currently_paused {
+            env.events().publish(
+                (symbol_short!("resume"),),
+                EscrowResumedEvent {
+                    admin,
+                    contract_id: env.current_contract_address(),
+                },
+            );
+        }
 
-            if currently_paused {
-                env.events().publish(
-                    (symbol_short!("resume"),),
-                    EscrowResumedEvent {
-                        admin: admin.clone(),
-                        contract_id: env.current_contract_address(),
-                    },
-                );
-            }
-
-            Ok(())
-        })();
-
-        env.storage()
-            .instance()
-            .set(&DataKey::EmergencyPauseLock, &false);
-
-        result
+        Ok(())
     }
 
     // ── read-only query ───────────────────────────────────────────────────────
@@ -2908,98 +2379,5 @@ impl MilestoneEscrow {
             .unwrap_or(false);
 
         Ok((rate_bps, total_accrued, is_paused))
-    }
-
-    /// Calculate tax withholding deductions for a milestone payout.
-    ///
-    /// This function sets a lock (`TaxWithholdingLock`) while executing to
-    /// prevent concurrent state mutations.  The lock is automatically cleared
-    /// when the calculation completes, ensuring that normal escrow operations
-    /// remain blocked only for the duration of the tax calculation.
-    ///
-    /// # Parameters
-    /// * `admin`           – Must match `DataKey::Admin`.
-    /// * `milestone_index` – Target milestone for tax calculation.
-    /// * `tax_rate_bps`    – Tax rate in basis points (1 bp = 0.01 %).
-    ///                       Must be ≤ 10 000 (≤ 100 %).
-    ///
-    /// # Returns
-    /// `(gross_amount, tax_amount, net_amount)` reflecting the split.
-    ///
-    /// # Errors
-    /// * `NotInitialized`   – Contract has not been initialised.
-    /// * `Unauthorized`     – `admin` does not match the stored admin key.
-    /// * `NotFunded`        – Escrow has not been funded.
-    /// * `InvalidMilestone` – `milestone_index` is out of range.
-    /// * `InvalidRatio`     – `tax_rate_bps` exceeds 10 000.
-    /// * `InvalidAmount`    – Milestone amount is ≤ 0 or arithmetic overflow.
-    pub fn tax_withholding_deductions(
-        env: Env,
-        admin: Address,
-        milestone_index: u32,
-        tax_rate_bps: u32,
-    ) -> Result<(i128, i128, i128), Error> {
-        admin.require_auth();
-        Self::require_admin(&env, &admin)?;
-
-        // Acquire lock before any state reads to prevent concurrent mutations.
-        env.storage()
-            .instance()
-            .set(&DataKey::TaxWithholdingLock, &true);
-
-        // Ensure lock is released even if the function returns early due to error.
-        // We use a defer-like pattern by clearing the lock before returning.
-        let result = (|| {
-            let meta = Self::load_job_meta(&env)?;
-            if !meta.funded {
-                return Err(Error::NotFunded);
-            }
-            if milestone_index >= meta.milestone_count {
-                return Err(Error::InvalidMilestone);
-            }
-
-            let milestone = Self::load_milestone(&env, milestone_index)?;
-
-            if milestone.amount <= 0 {
-                return Err(Error::InvalidAmount);
-            }
-
-            if tax_rate_bps > 10_000 {
-                return Err(Error::InvalidRatio);
-            }
-
-            let gross_amount = milestone.amount;
-            let tax_amount = (gross_amount * (tax_rate_bps as i128)) / (BPS_SCALE as i128);
-            let net_amount = gross_amount - tax_amount;
-
-            if net_amount < 0 {
-                return Err(Error::InvalidAmount);
-            }
-
-            Ok((gross_amount, tax_amount, net_amount))
-        })();
-
-        // Release lock regardless of success or failure.
-        env.storage()
-            .instance()
-            .set(&DataKey::TaxWithholdingLock, &false);
-
-        let (gross_amount, tax_amount, net_amount) = result?;
-
-        // Emit structured event for indexers.
-        env.events().publish(
-            (symbol_short!("taxwh"),),
-            TaxWithholdingDeductionsEvent {
-                admin,
-                contract_id: env.current_contract_address(),
-                milestone_index,
-                gross_amount,
-                tax_amount,
-                net_amount,
-                tax_rate_bps,
-            },
-        );
-
-        Ok((gross_amount, tax_amount, net_amount))
     }
 }
