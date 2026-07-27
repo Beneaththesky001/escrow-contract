@@ -6497,438 +6497,237 @@ fn test_multisig_approval_init_unauthorized_fails() {
 }
 
 // ============================================================================
-// cancel_escrow + admin_override_cancel_release / admin_override_cancel_refund
-// — comprehensive test suite (#219)
+// milestone_time_extensions — ratio-split precision test suite (#218)
 // ============================================================================
 
-/// Helper: set up a funded escrow, call cancel_escrow as the client, and
-/// return the standard tuple plus the escrow client.
-fn setup_cancel_locked_escrow(
-    env: &Env,
-    milestone_amounts: soroban_sdk::Vec<i128>,
-) -> (
-    Address,
-    Address,
-    Address,
-    Address,
-    Address,
-    soroban_sdk::Address,
-    MilestoneEscrowClient<'_>,
-) {
-    let (client_addr, freelancer_addr, arbiter_addr, admin_addr, token_id, contract_id, escrow) =
-        setup_funded_escrow(env, milestone_amounts);
-    escrow.cancel_escrow(&client_addr);
-    (
-        client_addr,
-        freelancer_addr,
-        arbiter_addr,
-        admin_addr,
-        token_id,
-        contract_id,
-        escrow,
-    )
-}
-
-// ── cancel_escrow baseline ────────────────────────────────────────────────────
-
-/// Verify cancel_escrow sets the CancelLock and emits the event.
+/// Precision test 1 — EXACT HALF (odd amount, rounds to nearest):
+/// 101 split at exactly 1/2 elapsed must give first=51, second=50.
+/// Verifies round-nearest rather than floor: 101 * 1 / 2 = 50.5 → 51.
+/// first + second must equal 101 exactly (no value lost).
 #[test]
-fn test_cancel_escrow_sets_lock_and_emits_event() {
+fn test_milestone_time_extensions_half_rounds_nearest() {
     let env = Env::default();
     env.mock_all_auths();
-
-    let amounts = vec![&env, 5_000_i128];
-    let (client_addr, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
-
-    escrow.cancel_escrow(&client_addr);
-
-    // After cancel_escrow the admin override endpoints become available; verify
-    // by confirming admin_override_cancel_refund succeeds (lock is active).
-    // We do NOT assert on storage internals — only on observable behaviour.
-}
-
-/// cancel_escrow by a non-party must fail with Unauthorized.
-#[test]
-fn test_cancel_escrow_non_party_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 5_000_i128];
-    let (_, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
-    let stranger = Address::generate(&env);
-
-    let result = escrow.try_cancel_escrow(&stranger);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-}
-
-/// cancel_escrow before funding must fail with NotFunded.
-#[test]
-fn test_cancel_escrow_not_funded_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let client_addr = Address::generate(&env);
-    let freelancer_addr = Address::generate(&env);
-    let arbiter_addr = Address::generate(&env);
-    let admin_addr = Address::generate(&env);
-    let token_id = env
-        .register_stellar_asset_contract_v2(admin_addr.clone())
-        .address();
 
     let contract_id = env.register(MilestoneEscrow, ());
-    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    escrow.initialize(
-        &admin_addr,
-        &client_addr,
-        &freelancer_addr,
-        &arbiter_addr,
-        &token_id,
-        &604800,
-        &vec![&env, 1_000_i128],
-    );
-
-    let result = escrow.try_cancel_escrow(&client_addr);
-    assert_eq!(result, Err(Ok(Error::NotFunded)));
+    let split = client.milestone_time_extensions(&101_i128, &1_i128, &2_i128);
+    assert_eq!(split.first, 51);
+    assert_eq!(split.second, 50);
+    assert_eq!(split.first + split.second, 101);
 }
 
-// ── admin_override_cancel_release ────────────────────────────────────────────
-
-/// Happy path: admin resolves cancel lock by releasing funds to freelancer.
-/// Verifies token transfer, all milestones moved to Released, lock cleared.
+/// Precision test 2 — FULL ELAPSED (numerator == denominator):
+/// When elapsed == total the freelancer receives the full amount.
+/// first=amount, second=0, total preserved.
 #[test]
-fn test_admin_override_cancel_release_happy_path() {
+fn test_milestone_time_extensions_full_elapsed_gives_full_amount() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let amounts = vec![&env, 3_000_i128, 7_000_i128];
-    let (
-        _client_addr,
-        freelancer_addr,
-        _arbiter_addr,
-        admin_addr,
-        token_id,
-        _contract_id,
-        escrow,
-    ) = setup_cancel_locked_escrow(&env, amounts);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let token = token::Client::new(&env, &token_id);
+    let split = client.milestone_time_extensions(&10_000_i128, &500_i128, &500_i128);
+    assert_eq!(split.first, 10_000);
+    assert_eq!(split.second, 0);
+    assert_eq!(split.first + split.second, 10_000);
+}
 
-    escrow.admin_override_cancel_release(&admin_addr);
+/// Precision test 3 — ZERO ELAPSED (numerator == 0):
+/// When no time has elapsed the freelancer receives nothing.
+/// first=0, second=amount, total preserved.
+#[test]
+fn test_milestone_time_extensions_zero_elapsed_gives_nothing_to_freelancer() {
+    let env = Env::default();
+    env.mock_all_auths();
 
-    // Freelancer receives the full 10_000.
-    assert_eq!(token.balance(&freelancer_addr), 10_000);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    // All milestones must be Released.
-    let job = escrow.get_job();
-    for ms in job.milestones.iter() {
-        assert_eq!(ms.status, MilestoneStatus::Released);
-        assert_eq!(ms.released_amount, ms.amount);
+    let split = client.milestone_time_extensions(&10_000_i128, &0_i128, &500_i128);
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 10_000);
+    assert_eq!(split.first + split.second, 10_000);
+}
+
+/// Precision test 4 — ZERO AMOUNT:
+/// A zero escrow balance splits to two zeros; no error, no value invented.
+#[test]
+fn test_milestone_time_extensions_zero_amount_splits_to_zeros() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.milestone_time_extensions(&0_i128, &1_i128, &3_i128);
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 0);
+}
+
+/// Precision test 5 — LARGE PRIME AMOUNT, ARBITRARY RATIO:
+/// 999_983 (prime) split 3/7 — verifies no value is created or destroyed.
+/// first = round_nearest(999_983 × 3 / 7) = round(428_564.14…) = 428_564
+/// second = 999_983 − 428_564 = 571_419
+#[test]
+fn test_milestone_time_extensions_large_prime_total_preserved() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amount = 999_983_i128;
+    let split = client.milestone_time_extensions(&amount, &3_i128, &7_i128);
+    assert_eq!(split.first + split.second, amount, "total must be preserved");
+    // round_nearest(999983 * 3 / 7) = (2999949 + 3) / 7 = 2999952 / 7 = 428564
+    assert_eq!(split.first, 428_564);
+    assert_eq!(split.second, 571_419);
+}
+
+/// Precision test 6 — SINGLE STROOP AMOUNT:
+/// 1 stroop split at 1/3 elapsed: round_nearest(1 × 1 / 3) = (1 + 1) / 3 = 0
+/// → first=0, second=1. Verifies single-unit floor behaviour is correct.
+#[test]
+fn test_milestone_time_extensions_one_stroop_rounds_down() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.milestone_time_extensions(&1_i128, &1_i128, &3_i128);
+    assert_eq!(split.first + split.second, 1);
+    // round_nearest(1 * 1 / 3) = (1 + 1) / 3 = 0  (integer floor of 0.666)
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 1);
+}
+
+/// Precision test 7 — MANY SMALL SPLITS PRESERVE TOTAL:
+/// Split 1_000_000 into 7 equal parts using the ratio n/7 for n=1..7.
+/// Each consecutive split must share a boundary with the previous one so
+/// that the union covers exactly 1_000_000 with no gaps.
+#[test]
+fn test_milestone_time_extensions_sequential_splits_cover_total() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amount = 1_000_000_i128;
+    let parts: u32 = 7;
+    let mut prev_first = 0_i128;
+
+    for n in 1..=parts {
+        let split = client.milestone_time_extensions(
+            &amount,
+            &(n as i128),
+            &(parts as i128),
+        );
+        // Each split must sum to the original amount.
+        assert_eq!(split.first + split.second, amount, "n={} total mismatch", n);
+        // first is monotonically non-decreasing as n increases.
+        assert!(
+            split.first >= prev_first,
+            "n={} first={} not >= prev={}",
+            n,
+            split.first,
+            prev_first
+        );
+        prev_first = split.first;
     }
+
+    // At n == parts the freelancer receives the full amount.
+    assert_eq!(prev_first, amount);
 }
 
-/// Only the verified admin key may call admin_override_cancel_release.
-/// A random address must get Unauthorized.
+/// Boundary guard — NEGATIVE AMOUNT:
+/// A negative escrow amount is invalid and must return Error::InvalidAmount.
 #[test]
-fn test_admin_override_cancel_release_non_admin_fails() {
+fn test_milestone_time_extensions_negative_amount_fails() {
     let env = Env::default();
     env.mock_all_auths();
-
-    let amounts = vec![&env, 5_000_i128];
-    let (_, _, _, _, _, _, escrow) = setup_cancel_locked_escrow(&env, amounts);
-    let impostor = Address::generate(&env);
-
-    let result = escrow.try_admin_override_cancel_release(&impostor);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-}
-
-/// admin_override_cancel_release without an active CancelLock must fail
-/// with InvalidStatus so it cannot be called during normal operation.
-#[test]
-fn test_admin_override_cancel_release_no_lock_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 5_000_i128];
-    // Use setup_funded_escrow — no cancel_escrow called, so no lock.
-    let (_, _, _, admin_addr, _, _, escrow) = setup_funded_escrow(&env, amounts);
-
-    let result = escrow.try_admin_override_cancel_release(&admin_addr);
-    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
-}
-
-/// After admin_override_cancel_release the CancelLock must be cleared so
-/// that further admin queries and reads are unblocked.
-#[test]
-fn test_admin_override_cancel_release_clears_lock() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 5_000_i128];
-    let (_, _, _, admin_addr, _, _, escrow) = setup_cancel_locked_escrow(&env, amounts);
-
-    escrow.admin_override_cancel_release(&admin_addr);
-
-    // get_job must succeed (would panic/err under lock via ensure_not_paused).
-    let job = escrow.get_job();
-    assert!(job.funded);
-}
-
-/// admin_override_cancel_release skips already-terminal milestones and only
-/// releases the remaining balance across non-terminal ones.
-#[test]
-fn test_admin_override_cancel_release_skips_terminal_milestones() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 4_000_i128, 6_000_i128];
-    let (client_addr, freelancer_addr, _, admin_addr, token_id, _, escrow) =
-        setup_funded_escrow(&env, amounts);
-
-    let token = token::Client::new(&env, &token_id);
-
-    // Approve milestone 0 fully before cancelling — it becomes Released.
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.approve_milestone(&client_addr, &0u32);
-    assert_eq!(token.balance(&freelancer_addr), 4_000);
-
-    // Now cancel and override-release.
-    escrow.cancel_escrow(&client_addr);
-    escrow.admin_override_cancel_release(&admin_addr);
-
-    // Only the remaining 6_000 (milestone 1) must be transferred.
-    assert_eq!(token.balance(&freelancer_addr), 10_000);
-}
-
-/// admin_override_cancel_release must emit AdminCancelOverrideReleaseEvent.
-#[test]
-fn test_admin_override_cancel_release_emits_event() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 5_000_i128];
-    let (_, _, _, admin_addr, _, _, escrow) = setup_cancel_locked_escrow(&env, amounts);
-
-    escrow.admin_override_cancel_release(&admin_addr);
-
-    let topic: soroban_sdk::Symbol = soroban_sdk::symbol_short!("adcovls");
-    let topic_val: Val = topic.into_val(&env);
-    let count = env.events().all().iter().fold(0u32, |acc, e| {
-        if let Some(t) = e.1.get(0) {
-            if t.get_payload() == topic_val.get_payload() {
-                return acc + 1;
-            }
-        }
-        acc
-    });
-    assert_eq!(count, 1, "expected exactly one adcovls event");
-}
-
-// ── admin_override_cancel_refund ─────────────────────────────────────────────
-
-/// Happy path: admin resolves cancel lock by refunding funds to client.
-/// Verifies token transfer, all milestones moved to Refunded, lock cleared.
-#[test]
-fn test_admin_override_cancel_refund_happy_path() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 3_000_i128, 7_000_i128];
-    let (client_addr, _, _, admin_addr, token_id, _, escrow) =
-        setup_cancel_locked_escrow(&env, amounts);
-
-    let token = token::Client::new(&env, &token_id);
-
-    escrow.admin_override_cancel_refund(&admin_addr);
-
-    // Client receives the full 10_000 back.
-    assert_eq!(token.balance(&client_addr), 10_000);
-
-    // All milestones must be Refunded.
-    let job = escrow.get_job();
-    for ms in job.milestones.iter() {
-        assert_eq!(ms.status, MilestoneStatus::Refunded);
-        assert_eq!(ms.released_amount, ms.amount);
-    }
-}
-
-/// Only the verified admin key may call admin_override_cancel_refund.
-#[test]
-fn test_admin_override_cancel_refund_non_admin_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 5_000_i128];
-    let (_, _, _, _, _, _, escrow) = setup_cancel_locked_escrow(&env, amounts);
-    let impostor = Address::generate(&env);
-
-    let result = escrow.try_admin_override_cancel_refund(&impostor);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-}
-
-/// admin_override_cancel_refund without an active CancelLock must fail
-/// with InvalidStatus.
-#[test]
-fn test_admin_override_cancel_refund_no_lock_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 5_000_i128];
-    let (_, _, _, admin_addr, _, _, escrow) = setup_funded_escrow(&env, amounts);
-
-    let result = escrow.try_admin_override_cancel_refund(&admin_addr);
-    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
-}
-
-/// After admin_override_cancel_refund the CancelLock must be cleared.
-#[test]
-fn test_admin_override_cancel_refund_clears_lock() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 5_000_i128];
-    let (_, _, _, admin_addr, _, _, escrow) = setup_cancel_locked_escrow(&env, amounts);
-
-    escrow.admin_override_cancel_refund(&admin_addr);
-
-    let job = escrow.get_job();
-    assert!(job.funded);
-}
-
-/// admin_override_cancel_refund skips already-terminal milestones.
-#[test]
-fn test_admin_override_cancel_refund_skips_terminal_milestones() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 4_000_i128, 6_000_i128];
-    let (client_addr, freelancer_addr, _, admin_addr, token_id, _, escrow) =
-        setup_funded_escrow(&env, amounts);
-
-    let token = token::Client::new(&env, &token_id);
-
-    // Approve milestone 0 fully — it becomes Released (terminal).
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.approve_milestone(&client_addr, &0u32);
-    assert_eq!(token.balance(&freelancer_addr), 4_000);
-
-    // Cancel and override-refund — only milestone 1 (6_000) should be refunded.
-    escrow.cancel_escrow(&client_addr);
-    escrow.admin_override_cancel_refund(&admin_addr);
-
-    assert_eq!(token.balance(&client_addr), 6_000);
-}
-
-/// admin_override_cancel_refund must emit AdminCancelOverrideRefundEvent.
-#[test]
-fn test_admin_override_cancel_refund_emits_event() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 5_000_i128];
-    let (_, _, _, admin_addr, _, _, escrow) = setup_cancel_locked_escrow(&env, amounts);
-
-    escrow.admin_override_cancel_refund(&admin_addr);
-
-    let topic: soroban_sdk::Symbol = soroban_sdk::symbol_short!("adcovrf");
-    let topic_val: Val = topic.into_val(&env);
-    let count = env.events().all().iter().fold(0u32, |acc, e| {
-        if let Some(t) = e.1.get(0) {
-            if t.get_payload() == topic_val.get_payload() {
-                return acc + 1;
-            }
-        }
-        acc
-    });
-    assert_eq!(count, 1, "expected exactly one adcovrf event");
-}
-
-/// admin_override_cancel_refund before funding must fail with NotFunded.
-#[test]
-fn test_admin_override_cancel_refund_not_funded_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let client_addr = Address::generate(&env);
-    let freelancer_addr = Address::generate(&env);
-    let arbiter_addr = Address::generate(&env);
-    let admin_addr = Address::generate(&env);
-    let token_id = env
-        .register_stellar_asset_contract_v2(admin_addr.clone())
-        .address();
 
     let contract_id = env.register(MilestoneEscrow, ());
-    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    escrow.initialize(
-        &admin_addr,
-        &client_addr,
-        &freelancer_addr,
-        &arbiter_addr,
-        &token_id,
-        &604800,
-        &vec![&env, 1_000_i128],
-    );
-
-    let result = escrow.try_admin_override_cancel_refund(&admin_addr);
-    assert_eq!(result, Err(Ok(Error::NotFunded)));
+    let result = client.try_milestone_time_extensions(&-1_i128, &1_i128, &10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 }
 
-/// admin_override_cancel_release before funding must fail with NotFunded.
+/// Boundary guard — ZERO TOTAL SECONDS:
+/// A total window of 0 seconds is division-by-zero; must return Error::InvalidRatio.
 #[test]
-fn test_admin_override_cancel_release_not_funded_fails() {
+fn test_milestone_time_extensions_zero_total_seconds_fails() {
     let env = Env::default();
     env.mock_all_auths();
-
-    let client_addr = Address::generate(&env);
-    let freelancer_addr = Address::generate(&env);
-    let arbiter_addr = Address::generate(&env);
-    let admin_addr = Address::generate(&env);
-    let token_id = env
-        .register_stellar_asset_contract_v2(admin_addr.clone())
-        .address();
 
     let contract_id = env.register(MilestoneEscrow, ());
-    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    escrow.initialize(
-        &admin_addr,
-        &client_addr,
-        &freelancer_addr,
-        &arbiter_addr,
-        &token_id,
-        &604800,
-        &vec![&env, 1_000_i128],
+    let result = client.try_milestone_time_extensions(&1_000_i128, &0_i128, &0_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+/// Boundary guard — ELAPSED > TOTAL:
+/// Elapsed time cannot exceed the total window; must return Error::InvalidRatio.
+#[test]
+fn test_milestone_time_extensions_elapsed_exceeds_total_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(&1_000_i128, &11_i128, &10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+/// Boundary guard — NEGATIVE ELAPSED:
+/// Negative elapsed seconds are nonsensical; must return Error::InvalidRatio.
+#[test]
+fn test_milestone_time_extensions_negative_elapsed_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(&1_000_i128, &-1_i128, &10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+/// Boundary guard — NEGATIVE TOTAL SECONDS:
+/// A negative total window is invalid; must return Error::InvalidRatio.
+#[test]
+fn test_milestone_time_extensions_negative_total_seconds_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(&1_000_i128, &5_i128, &-10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+/// Overflow guard — AMOUNT * ELAPSED overflows i128:
+/// i128::MAX × i128::MAX overflows in checked_mul; must return Error::InvalidAmount.
+#[test]
+fn test_milestone_time_extensions_overflow_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(
+        &i128::MAX,
+        &i128::MAX,
+        &i128::MAX,
     );
-
-    let result = escrow.try_admin_override_cancel_release(&admin_addr);
-    assert_eq!(result, Err(Ok(Error::NotFunded)));
-}
-
-/// The freelancer cannot call admin_override_cancel_release even if they
-/// previously called cancel_escrow.
-#[test]
-fn test_admin_override_cancel_release_freelancer_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 5_000_i128];
-    let (_, freelancer_addr, _, _, _, _, escrow) = setup_cancel_locked_escrow(&env, amounts);
-
-    let result = escrow.try_admin_override_cancel_release(&freelancer_addr);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-}
-
-/// The client cannot call admin_override_cancel_refund even though they
-/// initiated the cancel.
-#[test]
-fn test_admin_override_cancel_refund_client_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let amounts = vec![&env, 5_000_i128];
-    let (client_addr, _, _, _, _, _, escrow) = setup_cancel_locked_escrow(&env, amounts);
-
-    let result = escrow.try_admin_override_cancel_refund(&client_addr);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 }

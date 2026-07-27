@@ -1956,6 +1956,71 @@ impl MilestoneEscrow {
         Self::split_round_nearest(total_amount, numerator, denominator)
     }
 
+    /// Allocate a milestone's escrowed amount between two parties (typically
+    /// client and freelancer) using a high-precision ratio that reflects how
+    /// much of the extended deadline has been used.
+    ///
+    /// # Design
+    /// When a client extends a milestone's auto-release deadline, the elapsed
+    /// portion of the extended window can be used to derive a fair split of the
+    /// milestone amount:
+    ///
+    /// ```text
+    /// freelancer_share = round_nearest(amount × elapsed_seconds / total_seconds)
+    /// client_refund    = amount − freelancer_share
+    /// ```
+    ///
+    /// The arithmetic uses `split_round_nearest` which adds `denominator/2`
+    /// before the final division so that the freelancer receives the rounded
+    /// share rather than always the floor, preventing systematic value loss
+    /// through repeated rounding.  The two halves always sum to `amount` exactly.
+    ///
+    /// # Parameters
+    /// * `amount`           – Total escrowed amount to split.  Must be ≥ 0.
+    ///                        Zero is allowed (returns two zeros).
+    /// * `elapsed_seconds`  – Time already elapsed in the extension window.
+    ///                        Must satisfy 0 ≤ elapsed_seconds ≤ total_seconds.
+    /// * `total_seconds`    – Full length of the extension window.  Must be > 0.
+    ///
+    /// # Returns
+    /// A `RatioSplit` where:
+    /// * `first`  = freelancer portion (rounded to nearest stroop)
+    /// * `second` = client refund (remainder, guarantees first + second == amount)
+    ///
+    /// # Errors
+    /// * `InvalidAmount`  – `amount` is negative, or an intermediate checked
+    ///                      multiplication overflows.
+    /// * `InvalidRatio`   – `total_seconds` is zero, `elapsed_seconds` is
+    ///                      negative, or `elapsed_seconds > total_seconds`.
+    pub fn milestone_time_extensions(
+        _env: Env,
+        amount: i128,
+        elapsed_seconds: i128,
+        total_seconds: i128,
+    ) -> Result<RatioSplit, Error> {
+        // Reject negative amounts before delegating to split_round_nearest,
+        // which only accepts total >= 0.
+        if amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Reject nonsensical time inputs before the generic ratio guard so
+        // callers get a precise error code for time-specific misuse.
+        if total_seconds <= 0 {
+            return Err(Error::InvalidRatio);
+        }
+        if elapsed_seconds < 0 || elapsed_seconds > total_seconds {
+            return Err(Error::InvalidRatio);
+        }
+
+        // Delegate to the single shared high-precision split primitive.
+        // split_round_nearest(total, numerator, denominator) computes:
+        //   first  = round_nearest(total × numerator / denominator)
+        //   second = total − first
+        // Here numerator = elapsed_seconds, denominator = total_seconds.
+        Self::split_round_nearest(amount, elapsed_seconds, total_seconds)
+    }
+
     pub fn multisig_transfer_admin(
         env: Env,
         total_amount: i128,
