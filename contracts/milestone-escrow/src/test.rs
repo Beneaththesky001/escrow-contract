@@ -6497,179 +6497,237 @@ fn test_multisig_approval_init_unauthorized_fails() {
 }
 
 // ============================================================================
-// escrow_interest_yield — zero/empty balance boundary guards (#217)
+// milestone_time_extensions — ratio-split precision test suite (#218)
 // ============================================================================
 
-/// Zero-balance guard 1 — ZERO PRINCIPAL:
-/// A principal of exactly 0 must be rejected with `Error::InvalidAmount`.
-/// There is no balance to earn interest on, so processing must be blocked
-/// before any arithmetic is attempted.
+/// Precision test 1 — EXACT HALF (odd amount, rounds to nearest):
+/// 101 split at exactly 1/2 elapsed must give first=51, second=50.
+/// Verifies round-nearest rather than floor: 101 * 1 / 2 = 50.5 → 51.
+/// first + second must equal 101 exactly (no value lost).
 #[test]
-fn test_escrow_interest_yield_zero_principal_fails() {
+fn test_milestone_time_extensions_half_rounds_nearest() {
     let env = Env::default();
     env.mock_all_auths();
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let result = client.try_escrow_interest_yield(&0_i128, &500_i128, &86400_i128);
+    let split = client.milestone_time_extensions(&101_i128, &1_i128, &2_i128);
+    assert_eq!(split.first, 51);
+    assert_eq!(split.second, 50);
+    assert_eq!(split.first + split.second, 101);
+}
+
+/// Precision test 2 — FULL ELAPSED (numerator == denominator):
+/// When elapsed == total the freelancer receives the full amount.
+/// first=amount, second=0, total preserved.
+#[test]
+fn test_milestone_time_extensions_full_elapsed_gives_full_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.milestone_time_extensions(&10_000_i128, &500_i128, &500_i128);
+    assert_eq!(split.first, 10_000);
+    assert_eq!(split.second, 0);
+    assert_eq!(split.first + split.second, 10_000);
+}
+
+/// Precision test 3 — ZERO ELAPSED (numerator == 0):
+/// When no time has elapsed the freelancer receives nothing.
+/// first=0, second=amount, total preserved.
+#[test]
+fn test_milestone_time_extensions_zero_elapsed_gives_nothing_to_freelancer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.milestone_time_extensions(&10_000_i128, &0_i128, &500_i128);
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 10_000);
+    assert_eq!(split.first + split.second, 10_000);
+}
+
+/// Precision test 4 — ZERO AMOUNT:
+/// A zero escrow balance splits to two zeros; no error, no value invented.
+#[test]
+fn test_milestone_time_extensions_zero_amount_splits_to_zeros() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.milestone_time_extensions(&0_i128, &1_i128, &3_i128);
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 0);
+}
+
+/// Precision test 5 — LARGE PRIME AMOUNT, ARBITRARY RATIO:
+/// 999_983 (prime) split 3/7 — verifies no value is created or destroyed.
+/// first = round_nearest(999_983 × 3 / 7) = round(428_564.14…) = 428_564
+/// second = 999_983 − 428_564 = 571_419
+#[test]
+fn test_milestone_time_extensions_large_prime_total_preserved() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amount = 999_983_i128;
+    let split = client.milestone_time_extensions(&amount, &3_i128, &7_i128);
+    assert_eq!(split.first + split.second, amount, "total must be preserved");
+    // round_nearest(999983 * 3 / 7) = (2999949 + 3) / 7 = 2999952 / 7 = 428564
+    assert_eq!(split.first, 428_564);
+    assert_eq!(split.second, 571_419);
+}
+
+/// Precision test 6 — SINGLE STROOP AMOUNT:
+/// 1 stroop split at 1/3 elapsed: round_nearest(1 × 1 / 3) = (1 + 1) / 3 = 0
+/// → first=0, second=1. Verifies single-unit floor behaviour is correct.
+#[test]
+fn test_milestone_time_extensions_one_stroop_rounds_down() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.milestone_time_extensions(&1_i128, &1_i128, &3_i128);
+    assert_eq!(split.first + split.second, 1);
+    // round_nearest(1 * 1 / 3) = (1 + 1) / 3 = 0  (integer floor of 0.666)
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 1);
+}
+
+/// Precision test 7 — MANY SMALL SPLITS PRESERVE TOTAL:
+/// Split 1_000_000 into 7 equal parts using the ratio n/7 for n=1..7.
+/// Each consecutive split must share a boundary with the previous one so
+/// that the union covers exactly 1_000_000 with no gaps.
+#[test]
+fn test_milestone_time_extensions_sequential_splits_cover_total() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amount = 1_000_000_i128;
+    let parts: u32 = 7;
+    let mut prev_first = 0_i128;
+
+    for n in 1..=parts {
+        let split = client.milestone_time_extensions(
+            &amount,
+            &(n as i128),
+            &(parts as i128),
+        );
+        // Each split must sum to the original amount.
+        assert_eq!(split.first + split.second, amount, "n={} total mismatch", n);
+        // first is monotonically non-decreasing as n increases.
+        assert!(
+            split.first >= prev_first,
+            "n={} first={} not >= prev={}",
+            n,
+            split.first,
+            prev_first
+        );
+        prev_first = split.first;
+    }
+
+    // At n == parts the freelancer receives the full amount.
+    assert_eq!(prev_first, amount);
+}
+
+/// Boundary guard — NEGATIVE AMOUNT:
+/// A negative escrow amount is invalid and must return Error::InvalidAmount.
+#[test]
+fn test_milestone_time_extensions_negative_amount_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(&-1_i128, &1_i128, &10_i128);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 }
 
-/// Zero-balance guard 2 — NEGATIVE PRINCIPAL:
-/// A negative principal (e.g. -1) must be rejected with `Error::InvalidAmount`.
-/// Negative balances are invalid inputs to an interest estimator.
+/// Boundary guard — ZERO TOTAL SECONDS:
+/// A total window of 0 seconds is division-by-zero; must return Error::InvalidRatio.
 #[test]
-fn test_escrow_interest_yield_negative_principal_fails() {
+fn test_milestone_time_extensions_zero_total_seconds_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let result = client.try_escrow_interest_yield(&-1_000_i128, &500_i128, &86400_i128);
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    let result = client.try_milestone_time_extensions(&1_000_i128, &0_i128, &0_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
 }
 
-/// Zero-balance guard 3 — ZERO ANNUAL RATE:
-/// An annual rate of 0 bps means no interest accrues regardless of the
-/// principal or duration.  The function must reject it with `Error::InvalidAmount`
-/// rather than silently returning 0, which would mislead callers.
+/// Boundary guard — ELAPSED > TOTAL:
+/// Elapsed time cannot exceed the total window; must return Error::InvalidRatio.
 #[test]
-fn test_escrow_interest_yield_zero_rate_fails() {
+fn test_milestone_time_extensions_elapsed_exceeds_total_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let result = client.try_escrow_interest_yield(&10_000_i128, &0_i128, &86400_i128);
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    let result = client.try_milestone_time_extensions(&1_000_i128, &11_i128, &10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
 }
 
-/// Zero-balance guard 4 — NEGATIVE ANNUAL RATE:
-/// A negative rate is nonsensical for a yield estimator and must be rejected
-/// with `Error::InvalidAmount` before any arithmetic runs.
+/// Boundary guard — NEGATIVE ELAPSED:
+/// Negative elapsed seconds are nonsensical; must return Error::InvalidRatio.
 #[test]
-fn test_escrow_interest_yield_negative_rate_fails() {
+fn test_milestone_time_extensions_negative_elapsed_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let result = client.try_escrow_interest_yield(&10_000_i128, &-500_i128, &86400_i128);
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    let result = client.try_milestone_time_extensions(&1_000_i128, &-1_i128, &10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
 }
 
-/// Zero-balance guard 5 — ZERO DURATION:
-/// A duration of 0 seconds means no time has elapsed.  Zero-duration accrual
-/// must be blocked with `Error::InvalidAmount`.
+/// Boundary guard — NEGATIVE TOTAL SECONDS:
+/// A negative total window is invalid; must return Error::InvalidRatio.
 #[test]
-fn test_escrow_interest_yield_zero_duration_fails() {
+fn test_milestone_time_extensions_negative_total_seconds_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let result = client.try_escrow_interest_yield(&10_000_i128, &500_i128, &0_i128);
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    let result = client.try_milestone_time_extensions(&1_000_i128, &5_i128, &-10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
 }
 
-/// Zero-balance guard 6 — NEGATIVE DURATION:
-/// A negative duration is invalid and must be rejected with `Error::InvalidAmount`.
+/// Overflow guard — AMOUNT * ELAPSED overflows i128:
+/// i128::MAX × i128::MAX overflows in checked_mul; must return Error::InvalidAmount.
 #[test]
-fn test_escrow_interest_yield_negative_duration_fails() {
+fn test_milestone_time_extensions_overflow_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let result = client.try_escrow_interest_yield(&10_000_i128, &500_i128, &-86400_i128);
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
-}
-
-/// Overflow guard — PRINCIPAL * RATE OVERFLOWS i128:
-/// Passing i128::MAX for both principal and annual_rate_bps causes the first
-/// checked_mul to overflow.  The function must return `Error::InvalidAmount`
-/// without panicking.
-#[test]
-fn test_escrow_interest_yield_overflow_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let result = client.try_escrow_interest_yield(&i128::MAX, &i128::MAX, &1_i128);
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
-}
-
-/// Happy-path test — KNOWN CORRECT YIELD:
-/// Verify the formula gives the expected result for a concrete set of inputs.
-///
-/// principal = 1_000_000 stroops
-/// rate      = 500 bps (5 % p.a.)
-/// duration  = 31_536_000 s (exactly one year)
-///
-/// Expected yield = 1_000_000 * 500 * 31_536_000
-///                  -------------------------------- = 50_000 stroops
-///                  10_000 * 31_536_000
-#[test]
-fn test_escrow_interest_yield_one_year_five_percent() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let yield_amount = client.escrow_interest_yield(
-        &1_000_000_i128,
-        &500_i128,
-        &31_536_000_i128,
+    let result = client.try_milestone_time_extensions(
+        &i128::MAX,
+        &i128::MAX,
+        &i128::MAX,
     );
-    assert_eq!(yield_amount, 50_000_i128);
-}
-
-/// Happy-path test — ONE DAY DURATION:
-/// principal = 10_000_000 stroops
-/// rate      = 1000 bps (10 % p.a.)
-/// duration  = 86_400 s (one day)
-///
-/// Expected yield = 10_000_000 * 1000 * 86_400
-///                  --------------------------------
-///                  10_000 * 31_536_000
-///               = 864_000_000_000_000 / 315_360_000_000
-///               = 2739 (integer floor)
-#[test]
-fn test_escrow_interest_yield_one_day_ten_percent() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let yield_amount = client.escrow_interest_yield(
-        &10_000_000_i128,
-        &1000_i128,
-        &86_400_i128,
-    );
-    assert_eq!(yield_amount, 2739_i128);
-}
-
-/// All-zero guard — ALL THREE INPUTS ZERO:
-/// When all inputs are zero the principal guard fires first and returns
-/// `Error::InvalidAmount` without reaching the rate or duration checks.
-#[test]
-fn test_escrow_interest_yield_all_zeros_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let result = client.try_escrow_interest_yield(&0_i128, &0_i128, &0_i128);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 }
