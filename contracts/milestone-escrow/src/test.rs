@@ -6225,26 +6225,15 @@ fn test_raise_dispute_no_auth_fails() {
 }
 
 // ============================================================================
-// multisig_approval — comprehensive unit test suite (Issue #184)
+// multisig_approval — comprehensive unit test suite (Issue #184, #166)
 // ============================================================================
 
-/// Helper: register a fresh contract and initialise multisig with three
-/// signers and a threshold of 2.
-fn setup_multisig(
-    env: &Env,
-    threshold: u32,
-) -> (MilestoneEscrowClient<'_>, Address, Vec<Address>) {
+/// Helper: register and initialise escrow (admin present) without multisig setup.
+fn setup_escrow_for_multisig(env: &Env) -> (MilestoneEscrowClient<'_>, Address) {
     let admin = Address::generate(env);
-    let signer1 = Address::generate(env);
-    let signer2 = Address::generate(env);
-    let signer3 = Address::generate(env);
-    let signers = vec![env, signer1.clone(), signer2.clone(), signer3.clone()];
-
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(env, &contract_id);
 
-    // Need to initialise the main escrow first because require_admin needs
-    // an admin key.
     let token_id = env
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
@@ -6262,6 +6251,21 @@ fn setup_multisig(
         &604800,
         &amounts,
     );
+
+    (client, admin)
+}
+
+/// Helper: register a fresh contract and initialise multisig with three
+/// signers and a threshold of 2.
+fn setup_multisig(
+    env: &Env,
+    threshold: u32,
+) -> (MilestoneEscrowClient<'_>, Address, Vec<Address>) {
+    let (client, admin) = setup_escrow_for_multisig(env);
+    let signer1 = Address::generate(env);
+    let signer2 = Address::generate(env);
+    let signer3 = Address::generate(env);
+    let signers = vec![env, signer1.clone(), signer2.clone(), signer3.clone()];
 
     client.multisig_approval_init(&admin, &signers, &threshold);
 
@@ -6301,41 +6305,73 @@ fn test_multisig_approval_init_duplicate_fails() {
 /// Initialisation: zero signers must be rejected.
 #[test]
 fn test_multisig_approval_init_zero_signers_fails() {
-    let env = Env::default();
+    let env = env_without_snapshot();
     env.mock_all_auths();
 
-    let admin = Address::generate(&env);
+    let (client, admin) = setup_escrow_for_multisig(&env);
     let empty: Vec<Address> = Vec::new(&env);
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
     let result = client.try_multisig_approval_init(&admin, &empty, &1u32);
-    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+    assert_eq!(result, Err(Ok(Error::MultiSigNoSigners)));
 }
 
 /// Initialisation: threshold of 0 must be rejected.
 #[test]
 fn test_multisig_approval_init_zero_threshold_fails() {
-    let env = Env::default();
+    let env = env_without_snapshot();
     env.mock_all_auths();
 
-    let (client, _admin, _signers) = setup_multisig(&env, 2);
+    let (client, admin) = setup_escrow_for_multisig(&env);
+    let signer = Address::generate(&env);
+    let signers = vec![&env, signer];
 
-    let state = client.try_is_multisig_approved(&0u32).unwrap().unwrap();
-    assert_eq!(state.threshold, 2);
+    let result = client.try_multisig_approval_init(&admin, &signers, &0u32);
+    assert_eq!(result, Err(Ok(Error::MultiSigInvalidThreshold)));
 }
 
 /// Initialisation: threshold exceeding signer count must be rejected.
 #[test]
 fn test_multisig_approval_init_threshold_exceeds_signers_fails() {
-    let env = Env::default();
+    let env = env_without_snapshot();
     env.mock_all_auths();
 
-    let (client, _admin, _signers) = setup_multisig(&env, 2);
+    let (client, admin) = setup_escrow_for_multisig(&env);
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+    let signers = vec![&env, signer1, signer2];
 
-    let state = client.try_is_multisig_approved(&0u32).unwrap().unwrap();
-    assert_eq!(state.threshold, 2);
+    let result = client.try_multisig_approval_init(&admin, &signers, &3u32);
+    assert_eq!(result, Err(Ok(Error::MultiSigInvalidThreshold)));
+}
+
+/// Initialisation: more than 32 signers must be rejected.
+#[test]
+fn test_multisig_approval_init_too_many_signers_fails() {
+    let env = env_without_snapshot();
+    env.mock_all_auths();
+
+    let (client, admin) = setup_escrow_for_multisig(&env);
+    let mut signers = vec![&env];
+    for _ in 0..33 {
+        signers.push_back(Address::generate(&env));
+    }
+
+    let result = client.try_multisig_approval_init(&admin, &signers, &1u32);
+    assert_eq!(result, Err(Ok(Error::MultiSigTooManySigners)));
+}
+
+/// Initialisation: duplicate signer addresses must be rejected.
+#[test]
+fn test_multisig_approval_init_duplicate_signer_fails() {
+    let env = env_without_snapshot();
+    env.mock_all_auths();
+
+    let (client, admin) = setup_escrow_for_multisig(&env);
+    let signer = Address::generate(&env);
+    let signers = vec![&env, signer.clone(), signer];
+
+    let result = client.try_multisig_approval_init(&admin, &signers, &2u32);
+    assert_eq!(result, Err(Ok(Error::MultiSigDuplicateSigner)));
 }
 
 /// Approval flow: single signer approves, threshold (2) not yet reached.
