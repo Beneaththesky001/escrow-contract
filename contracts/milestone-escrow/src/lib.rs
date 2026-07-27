@@ -130,6 +130,22 @@ pub enum DataKey {
     Paused,
     MilestoneTimeExtension(u32),
     CancelLock,
+    // ── multisig approval compact storage keys ─────────────────────────────
+    /// The full list of registered multisig signers (instance storage, written
+    /// once by `multisig_approval_init`).  Stored as a single `Vec<Address>`
+    /// rather than N individual keys to minimise read overhead and total bytes.
+    MultiSigSigners,
+    /// The minimum number of approvals required for a multisig decision.
+    /// Written once during initialisation, read on every approval check.
+    MultiSigThreshold,
+    /// Transient approval-bitmap for a given proposal index.  Uses **temporary**
+    /// storage so the ledger footprint does not persist beyond the proposal
+    /// lifecycle.  Each bit position corresponds to a signer index in the
+    /// `MultiSigSigners` vec; a set bit means that signer has approved.
+    /// The `u32` value is treated as a bitset, supporting up to 32 signers.
+    /// Key type: `u32` (the proposal index) — significantly smaller than a
+    /// composite `(Address, u32)` alternative.
+    MultiSigApproval(u32),
 }
 
 #[contracttype]
@@ -333,6 +349,18 @@ pub struct AdminOverrideRefundEvent {
     pub client: Address,
     pub token: Address,
     pub amount: i128,
+}
+
+/// Result of checking whether a multisig proposal has reached the threshold.
+/// Returned by `is_multisig_approved` to give callers both the boolean
+/// decision and the raw approval bitmap for off-chain inspection.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiSigApprovalState {
+    pub approved: bool,
+    pub approvals: u32,
+    pub threshold: u32,
+    pub bitmap: u32,
 }
 
 /// Emitted by `admin_pause_escrow` when the admin freezes normal operations.
@@ -1409,11 +1437,14 @@ impl MilestoneEscrow {
 
         let mut milestone = Self::load_milestone(&env, milestone_index)?;
 
-        if milestone.status != MilestoneStatus::Pending
-            && milestone.status != MilestoneStatus::Delivered
-            && milestone.status != MilestoneStatus::PartiallyReleased
-        {
-            return Err(Error::InvalidStatus);
+        // Strict state machine: only Pending, Delivered, or PartiallyReleased
+        // may transition to Disputed. All other statuses (Released, Refunded,
+        // Disputed) are rejected.
+        match milestone.status {
+            MilestoneStatus::Pending
+            | MilestoneStatus::Delivered
+            | MilestoneStatus::PartiallyReleased => {}
+            _ => return Err(Error::InvalidStatus),
         }
 
         milestone.status = MilestoneStatus::Disputed;
@@ -1762,6 +1793,144 @@ impl MilestoneEscrow {
         }
 
         Ok(allocations)
+    }
+
+    // ── multisig approval: storage-optimised key design ────────────────────
+    //
+    // Design rationale
+    // ─────────────────
+    // Traditional multisig implementations store approval state as individual
+    // `(Address, ProposalId) → bool` entries, which is expensive on Soroban
+    // because each Address contributes ~32 bytes to the ledger key footprint.
+    //
+    // This implementation uses three optimisations to minimise bytes stored:
+    //
+    // 1. **Signer list is stored once** (instance storage) under a single
+    //    `MultiSigSigners` key rather than storing individual key-value pairs
+    //    per signer.
+    //
+    // 2. **Approval tracking uses a compact u32 bitmap** in temporary storage
+    //    under `MultiSigApproval(proposal_id)`.  Each bit represents one signer
+    //    by its index in the signers vec, eliminating the Address overhead from
+    //    every approval entry.  Up to 32 signers are supported per proposal.
+    //
+    // 3. **Temporary storage tier** is used for the bitmap so that the ledger
+    //    footprint is automatically evicted once the proposal lifecycle ends,
+    //    rather than persisting indefinitely.
+
+    const MAX_MULTISIG_SIGNERS: u32 = 32;
+
+    /// Initialise a multisig approval regime with a fixed set of signers and
+    /// the required approval threshold.  Must be called exactly once.
+    pub fn multisig_approval_init(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+
+        if env.storage().instance().has(&DataKey::MultiSigSigners) {
+            return Err(Error::AlreadyInitialized);
+        }
+
+        let count = signers.len();
+        if count == 0 || count > Self::MAX_MULTISIG_SIGNERS {
+            return Err(Error::InvalidAmount);
+        }
+        if threshold == 0 || threshold > count {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiSigSigners, &signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiSigThreshold, &threshold);
+
+        Ok(())
+    }
+
+    /// Record an approval from one of the registered signers for the given
+    /// proposal.  Idempotent — calling twice from the same signer has no
+    /// effect and is not an error.
+    pub fn multisig_approve(
+        env: Env,
+        signer: Address,
+        proposal_id: u32,
+    ) -> Result<MultiSigApprovalState, Error> {
+        signer.require_auth();
+
+        let signers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigSigners)
+            .ok_or(Error::NotInitialized)?;
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigThreshold)
+            .ok_or(Error::NotInitialized)?;
+
+        // Find the signer's index in the list (O(n) but n ≤ 32).
+        let signer_index = signers
+            .iter()
+            .position(|s| s == signer)
+            .ok_or(Error::Unauthorized)?;
+
+        // Read the current bitmap from temporary storage (default: 0 = no approvals).
+        let mut bitmap: u32 = env
+            .storage()
+            .temporary()
+            .get(&DataKey::MultiSigApproval(proposal_id))
+            .unwrap_or(0);
+
+        // Set the bit for this signer (idempotent).
+        let idx: u32 = signer_index.try_into().map_err(|_| Error::InvalidAmount)?;
+        let mask = 1u32.checked_shl(idx).ok_or(Error::InvalidAmount)?;
+        bitmap |= mask;
+
+        // Write the updated bitmap back to temporary storage.
+        env.storage()
+            .temporary()
+            .set(&DataKey::MultiSigApproval(proposal_id), &bitmap);
+
+        let approvals = bitmap.count_ones();
+        let approved = approvals >= threshold;
+
+        Ok(MultiSigApprovalState {
+            approved,
+            approvals,
+            threshold,
+            bitmap,
+        })
+    }
+
+    /// Query whether a proposal has reached the required approval threshold.
+    /// Pure read — does not require auth and does not mutate state.
+    pub fn is_multisig_approved(env: Env, proposal_id: u32) -> Result<MultiSigApprovalState, Error> {
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigThreshold)
+            .ok_or(Error::NotInitialized)?;
+
+        let bitmap: u32 = env
+            .storage()
+            .temporary()
+            .get(&DataKey::MultiSigApproval(proposal_id))
+            .unwrap_or(0);
+
+        let approvals = bitmap.count_ones();
+
+        Ok(MultiSigApprovalState {
+            approved: approvals >= threshold,
+            approvals,
+            threshold,
+            bitmap,
+        })
     }
 
     pub fn version(env: Env) -> u32 {
