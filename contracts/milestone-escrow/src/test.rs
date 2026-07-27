@@ -4356,3 +4356,181 @@ fn test_add_whitelisted_token_unauthorized_before_cap_check() {
     let result = client.try_add_whitelisted_token(&bad_actor, &new_token);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
+
+// ============================================================================
+// escrow_interest_yield — zero/empty balance boundary guards (#217)
+// ============================================================================
+
+/// Zero-balance guard 1 — ZERO PRINCIPAL:
+/// A principal of exactly 0 must be rejected with `Error::InvalidAmount`.
+/// There is no balance to earn interest on, so processing must be blocked
+/// before any arithmetic is attempted.
+#[test]
+fn test_escrow_interest_yield_zero_principal_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&0_i128, &500_i128, &86400_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Zero-balance guard 2 — NEGATIVE PRINCIPAL:
+/// A negative principal (e.g. -1) must be rejected with `Error::InvalidAmount`.
+/// Negative balances are invalid inputs to an interest estimator.
+#[test]
+fn test_escrow_interest_yield_negative_principal_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&-1_000_i128, &500_i128, &86400_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Zero-balance guard 3 — ZERO ANNUAL RATE:
+/// An annual rate of 0 bps means no interest accrues regardless of the
+/// principal or duration.  The function must reject it with `Error::InvalidAmount`
+/// rather than silently returning 0, which would mislead callers.
+#[test]
+fn test_escrow_interest_yield_zero_rate_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&10_000_i128, &0_i128, &86400_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Zero-balance guard 4 — NEGATIVE ANNUAL RATE:
+/// A negative rate is nonsensical for a yield estimator and must be rejected
+/// with `Error::InvalidAmount` before any arithmetic runs.
+#[test]
+fn test_escrow_interest_yield_negative_rate_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&10_000_i128, &-500_i128, &86400_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Zero-balance guard 5 — ZERO DURATION:
+/// A duration of 0 seconds means no time has elapsed.  Zero-duration accrual
+/// must be blocked with `Error::InvalidAmount`.
+#[test]
+fn test_escrow_interest_yield_zero_duration_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&10_000_i128, &500_i128, &0_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Zero-balance guard 6 — NEGATIVE DURATION:
+/// A negative duration is invalid and must be rejected with `Error::InvalidAmount`.
+#[test]
+fn test_escrow_interest_yield_negative_duration_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&10_000_i128, &500_i128, &-86400_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Overflow guard — PRINCIPAL * RATE OVERFLOWS i128:
+/// Passing i128::MAX for both principal and annual_rate_bps causes the first
+/// checked_mul to overflow.  The function must return `Error::InvalidAmount`
+/// without panicking.
+#[test]
+fn test_escrow_interest_yield_overflow_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&i128::MAX, &i128::MAX, &1_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Happy-path test — KNOWN CORRECT YIELD:
+/// Verify the formula gives the expected result for a concrete set of inputs.
+///
+/// principal = 1_000_000 stroops
+/// rate      = 500 bps (5 % p.a.)
+/// duration  = 31_536_000 s (exactly one year)
+///
+/// Expected yield = 1_000_000 * 500 * 31_536_000
+///                  -------------------------------- = 50_000 stroops
+///                  10_000 * 31_536_000
+#[test]
+fn test_escrow_interest_yield_one_year_five_percent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let yield_amount = client.escrow_interest_yield(
+        &1_000_000_i128,
+        &500_i128,
+        &31_536_000_i128,
+    );
+    assert_eq!(yield_amount, 50_000_i128);
+}
+
+/// Happy-path test — ONE DAY DURATION:
+/// principal = 10_000_000 stroops
+/// rate      = 1000 bps (10 % p.a.)
+/// duration  = 86_400 s (one day)
+///
+/// Expected yield = 10_000_000 * 1000 * 86_400
+///                  --------------------------------
+///                  10_000 * 31_536_000
+///               = 864_000_000_000_000 / 315_360_000_000
+///               = 2739 (integer floor)
+#[test]
+fn test_escrow_interest_yield_one_day_ten_percent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let yield_amount = client.escrow_interest_yield(
+        &10_000_000_i128,
+        &1000_i128,
+        &86_400_i128,
+    );
+    assert_eq!(yield_amount, 2739_i128);
+}
+
+/// All-zero guard — ALL THREE INPUTS ZERO:
+/// When all inputs are zero the principal guard fires first and returns
+/// `Error::InvalidAmount` without reaching the rate or duration checks.
+#[test]
+fn test_escrow_interest_yield_all_zeros_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&0_i128, &0_i128, &0_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}

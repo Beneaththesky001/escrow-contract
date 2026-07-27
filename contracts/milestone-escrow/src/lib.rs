@@ -806,6 +806,82 @@ impl MilestoneEscrow {
         let meta = Self::load_job_meta(&env)?;
         Self::assemble_job(&env, &meta)
     }
+
+    /// Estimate the interest yield that would accrue on the escrowed balance
+    /// over a given duration, using a simple-interest model.
+    ///
+    /// # Parameters
+    /// * `principal`         – The balance (in token stroops) on which interest
+    ///                         is calculated.  Must be > 0; returns
+    ///                         `Error::InvalidAmount` otherwise.
+    /// * `annual_rate_bps`   – Annual interest rate expressed in basis points
+    ///                         (1 bp = 0.01 %).  E.g. 500 = 5 % p.a.
+    ///                         Must be > 0; returns `Error::InvalidAmount`
+    ///                         otherwise.
+    /// * `duration_seconds`  – The time period over which interest accrues,
+    ///                         in seconds.  Must be > 0; returns
+    ///                         `Error::InvalidAmount` otherwise.
+    ///
+    /// # Formula
+    /// ```text
+    /// yield = principal * annual_rate_bps * duration_seconds
+    ///         -----------------------------------------------
+    ///               10_000 * SECONDS_PER_YEAR
+    /// ```
+    /// All intermediate multiplications use checked arithmetic so that
+    /// adversarially large inputs fail gracefully with `Error::InvalidAmount`
+    /// rather than panicking.
+    ///
+    /// # Returns
+    /// The estimated yield in the same unit as `principal` (stroops), or an
+    /// `Error` if any input is zero or an intermediate calculation overflows.
+    pub fn escrow_interest_yield(
+        _env: Env,
+        principal: i128,
+        annual_rate_bps: i128,
+        duration_seconds: i128,
+    ) -> Result<i128, Error> {
+        // Guard: zero or negative principal means no balance to earn interest on.
+        if principal <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Guard: zero or negative rate produces a meaningless (zero) result and
+        // likely indicates a caller bug.
+        if annual_rate_bps <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Guard: zero or negative duration means no time has elapsed.
+        if duration_seconds <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Seconds in a standard Gregorian year (365 days).
+        const SECONDS_PER_YEAR: i128 = 31_536_000;
+        // Basis-point denominator: 1 bps = 1/10_000.
+        const BPS_DENOMINATOR: i128 = 10_000;
+
+        // Numerator: principal * annual_rate_bps * duration_seconds
+        // All three values are positive, so overflow is the only risk.
+        let numerator = principal
+            .checked_mul(annual_rate_bps)
+            .ok_or(Error::InvalidAmount)?
+            .checked_mul(duration_seconds)
+            .ok_or(Error::InvalidAmount)?;
+
+        // Denominator: 10_000 * 31_536_000 = 315_360_000_000 (fits in i128).
+        let denominator = BPS_DENOMINATOR
+            .checked_mul(SECONDS_PER_YEAR)
+            .ok_or(Error::InvalidAmount)?;
+
+        // Integer division — caller receives the floor of the yield.
+        let yield_amount = numerator
+            .checked_div(denominator)
+            .ok_or(Error::InvalidAmount)?;
+
+        Ok(yield_amount)
+    }
 }
 
 mod test;
