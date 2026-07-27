@@ -403,6 +403,30 @@ pub struct EscrowResumedEvent {
     pub contract_id: Address,
 }
 
+// ── NEW EVENTS ─────────────────────────────────────────────
+
+#[contracttype]
+pub struct WhitelistedTokenAddedEvent {
+    pub token: Address,
+}
+
+#[contracttype]
+pub struct WhitelistedTokenRemovedEvent {
+    pub token: Address,
+}
+
+#[contracttype]
+pub struct PartialReleaseApprovedEvent {
+    pub milestone_index: u32,
+    pub amount: i128,
+}
+
+#[contracttype]
+pub struct AutoReleaseClaimedEvent {
+    pub milestone_index: u32,
+    pub amount: i128,
+}
+
 #[contract]
 pub struct MilestoneEscrow;
 
