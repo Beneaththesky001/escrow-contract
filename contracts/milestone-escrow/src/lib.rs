@@ -2306,11 +2306,6 @@ impl MilestoneEscrow {
     /// * `NotInitialized`   – Contract has not been initialised yet.
     /// * `Unauthorized`     – `admin` does not match the stored admin key.
     /// * `YieldRateInvalid` – `rate_bps` exceeds 10 000.
-    pub fn admin_set_yield_rate(
-        env: Env,
-        admin: Address,
-        rate_bps: u32,
-    ) -> Result<(), Error> {
     pub fn admin_set_yield_rate(env: Env, admin: Address, rate_bps: u32) -> Result<(), Error> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
