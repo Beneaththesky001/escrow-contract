@@ -130,6 +130,16 @@ pub enum DataKey {
     Paused,
     MilestoneTimeExtension(u32),
     CancelLock,
+    // ── tax_withholding_deductions storage keys ──────────────────────────────
+    /// Persistent: tax rate in basis points (1 bp = 0.01 %) set by
+    /// `admin_set_tax_rate`.  Range 0–10 000 (0 %–100 %).
+    TaxRate,
+    /// Persistent per-milestone: written by `tax_withholding_deductions` when
+    /// tax has been computed and the milestone is pending admin resolution.
+    /// Stores a `TaxWithholdingRecord` containing the computed net payout and
+    /// withheld tax amount.  Cleared by the admin override endpoints once
+    /// the locked condition is resolved.
+    TaxWithholdingLock(u32),
     // ── multisig approval compact storage keys ─────────────────────────────
     /// The full list of registered multisig signers (instance storage, written
     /// once by `multisig_approval_init`).  Stored as a single `Vec<Address>`
@@ -299,6 +309,60 @@ pub struct CancelEscrowInitiatedEvent {
     pub caller: Address,
 }
 
+
+// ── tax_withholding_deductions types and events ──────────────────────────────
+
+/// Stored in `DataKey::TaxWithholdingLock(milestone_index)` by
+/// `tax_withholding_deductions`.  Holds the pre-computed split so admin
+/// override endpoints do not need to recompute tax arithmetic.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaxWithholdingRecord {
+    pub gross_amount: i128,
+    pub tax_amount: i128,
+    pub net_amount: i128,
+    pub tax_rate_bps: u32,
+}
+
+/// Emitted by `tax_withholding_deductions` when tax is successfully computed
+/// and the milestone is locked pending admin resolution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaxWithholdingAppliedEvent {
+    pub contract_id: Address,
+    pub milestone_index: u32,
+    pub gross_amount: i128,
+    pub tax_amount: i128,
+    pub net_amount: i128,
+    pub tax_rate_bps: u32,
+}
+
+/// Emitted by `admin_override_tax_release` when the admin resolves a
+/// tax-locked milestone by releasing the net amount to the freelancer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminOverrideTaxReleaseEvent {
+    pub admin: Address,
+    pub contract_id: Address,
+    pub milestone_index: u32,
+    pub freelancer: Address,
+    pub token: Address,
+    pub net_amount: i128,
+    pub tax_amount: i128,
+}
+
+/// Emitted by `admin_override_tax_refund` when the admin resolves a
+/// tax-locked milestone by refunding the gross amount to the client.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminOverrideTaxRefundEvent {
+    pub admin: Address,
+    pub contract_id: Address,
+    pub milestone_index: u32,
+    pub client: Address,
+    pub token: Address,
+    pub gross_amount: i128,
+}
 
 // ── escrow_interest_yield admin-override events ──────────────────────────────
 
@@ -2339,10 +2403,263 @@ impl MilestoneEscrow {
         Ok(())
     }
 
+    // ── tax_withholding_deductions ────────────────────────────────────────────
+
+    /// Compute and record a tax withholding deduction for a specific milestone.
+    ///
+    /// Calculates the tax owed on the milestone's remaining gross balance using
+    /// the supplied `tax_rate_bps`, writes the result to
+    /// `DataKey::TaxWithholdingLock(milestone_index)` and emits an event.
+    /// The milestone is left in its current state so the normal approval flow
+    /// remains intact; the admin override endpoints read the stored record to
+    /// resolve any locked condition.
+    ///
+    /// # Parameters
+    /// * `milestone_index` – Target milestone (must be in a non-terminal status).
+    /// * `tax_rate_bps`    – Tax rate in basis points (0–10 000).  Zero is
+    ///                       accepted and records a nil withholding.
+    ///
+    /// # Errors
+    /// * `NotInitialized`   – Contract not initialised.
+    /// * `NotFunded`        – Escrow not yet funded.
+    /// * `InvalidMilestone` – `milestone_index` is out of range.
+    /// * `InvalidStatus`    – Milestone is already terminal (Released/Refunded).
+    /// * `InvalidRatio`     – `tax_rate_bps > 10_000`.
+    /// * `InvalidAmount`    – Remaining balance is zero or arithmetic overflow.
+    pub fn tax_withholding_deductions(
+        env: Env,
+        milestone_index: u32,
+        tax_rate_bps: u32,
+    ) -> Result<TaxWithholdingRecord, Error> {
+        let meta = Self::load_job_meta(&env)?;
+
+        if !meta.funded {
+            return Err(Error::NotFunded);
+        }
+        if milestone_index >= meta.milestone_count {
+            return Err(Error::InvalidMilestone);
+        }
+        if tax_rate_bps > BPS_SCALE {
+            return Err(Error::InvalidRatio);
+        }
+
+        let milestone = Self::load_milestone(&env, milestone_index)?;
+
+        if milestone.status == MilestoneStatus::Released
+            || milestone.status == MilestoneStatus::Refunded
+        {
+            return Err(Error::InvalidStatus);
+        }
+
+        let gross_amount = milestone
+            .amount
+            .checked_sub(milestone.released_amount)
+            .ok_or(Error::InvalidAmount)?;
+        if gross_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // tax_amount = round_nearest(gross × rate / 10_000)
+        let tax_split = Self::split_round_nearest(
+            gross_amount,
+            tax_rate_bps as i128,
+            BPS_SCALE as i128,
+        )?;
+        let tax_amount = tax_split.first;
+        let net_amount = tax_split.second;
+
+        let record = TaxWithholdingRecord {
+            gross_amount,
+            tax_amount,
+            net_amount,
+            tax_rate_bps,
+        };
+
+        // Persist the record so admin override endpoints can read it without
+        // recomputing tax arithmetic.
+        env.storage()
+            .persistent()
+            .set(&DataKey::TaxWithholdingLock(milestone_index), &record);
+
+        env.events().publish(
+            (symbol_short!("taxwith"),),
+            TaxWithholdingAppliedEvent {
+                contract_id: env.current_contract_address(),
+                milestone_index,
+                gross_amount,
+                tax_amount,
+                net_amount,
+                tax_rate_bps,
+            },
+        );
+
+        Ok(record)
+    }
+
+    /// Admin emergency override: resolve a tax-locked milestone by releasing
+    /// the net (post-tax) amount to the freelancer.
+    ///
+    /// Reads the `TaxWithholdingRecord` written by `tax_withholding_deductions`,
+    /// transfers `net_amount` to the freelancer, marks the milestone `Released`,
+    /// and removes the lock entry.
+    ///
+    /// Only the verified admin key can call this function.
+    ///
+    /// # Errors
+    /// * `NotInitialized`   – Contract not initialised.
+    /// * `Unauthorized`     – Caller is not the verified admin.
+    /// * `NotFunded`        – Escrow not yet funded.
+    /// * `InvalidMilestone` – `milestone_index` is out of range.
+    /// * `InvalidStatus`    – No tax-withholding lock exists for this milestone,
+    ///                        or the milestone is already terminal.
+    /// * `InvalidAmount`    – Net amount is zero.
+    pub fn admin_override_tax_release(
+        env: Env,
+        admin: Address,
+        milestone_index: u32,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+
+        let meta = Self::load_job_meta(&env)?;
+        if !meta.funded {
+            return Err(Error::NotFunded);
+        }
+        if milestone_index >= meta.milestone_count {
+            return Err(Error::InvalidMilestone);
+        }
+
+        let record: TaxWithholdingRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TaxWithholdingLock(milestone_index))
+            .ok_or(Error::InvalidStatus)?;
+
+        let mut milestone = Self::load_milestone(&env, milestone_index)?;
+        if milestone.status == MilestoneStatus::Released
+            || milestone.status == MilestoneStatus::Refunded
+        {
+            return Err(Error::InvalidStatus);
+        }
+        if record.net_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // CEI: commit state before external call.
+        milestone.released_amount = milestone.amount;
+        milestone.status = MilestoneStatus::Released;
+        Self::store_milestone(&env, milestone_index, &milestone);
+        Self::store_milestone_released(&env, milestone_index);
+
+        // Remove the lock entry.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TaxWithholdingLock(milestone_index));
+
+        let token_client = token::Client::new(&env, &meta.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &meta.freelancer,
+            &record.net_amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("adtxrls"),),
+            AdminOverrideTaxReleaseEvent {
+                admin,
+                contract_id: env.current_contract_address(),
+                milestone_index,
+                freelancer: meta.freelancer,
+                token: meta.token,
+                net_amount: record.net_amount,
+                tax_amount: record.tax_amount,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Admin emergency override: resolve a tax-locked milestone by refunding
+    /// the gross amount to the client.
+    ///
+    /// Reads the `TaxWithholdingRecord`, transfers `gross_amount` to the client,
+    /// marks the milestone `Refunded`, and removes the lock entry.
+    ///
+    /// Only the verified admin key can call this function.
+    ///
+    /// # Errors
+    /// * `NotInitialized`   – Contract not initialised.
+    /// * `Unauthorized`     – Caller is not the verified admin.
+    /// * `NotFunded`        – Escrow not yet funded.
+    /// * `InvalidMilestone` – `milestone_index` is out of range.
+    /// * `InvalidStatus`    – No tax-withholding lock exists for this milestone,
+    ///                        or the milestone is already terminal.
+    /// * `InvalidAmount`    – Gross amount is zero.
+    pub fn admin_override_tax_refund(
+        env: Env,
+        admin: Address,
+        milestone_index: u32,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+
+        let meta = Self::load_job_meta(&env)?;
+        if !meta.funded {
+            return Err(Error::NotFunded);
+        }
+        if milestone_index >= meta.milestone_count {
+            return Err(Error::InvalidMilestone);
+        }
+
+        let record: TaxWithholdingRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TaxWithholdingLock(milestone_index))
+            .ok_or(Error::InvalidStatus)?;
+
+        let mut milestone = Self::load_milestone(&env, milestone_index)?;
+        if milestone.status == MilestoneStatus::Released
+            || milestone.status == MilestoneStatus::Refunded
+        {
+            return Err(Error::InvalidStatus);
+        }
+        if record.gross_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // CEI: commit state before external call.
+        milestone.released_amount = milestone.amount;
+        milestone.status = MilestoneStatus::Refunded;
+        Self::store_milestone(&env, milestone_index, &milestone);
+
+        // Remove the lock entry.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TaxWithholdingLock(milestone_index));
+
+        let token_client = token::Client::new(&env, &meta.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &meta.client,
+            &record.gross_amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("adtxrfd"),),
+            AdminOverrideTaxRefundEvent {
+                admin,
+                contract_id: env.current_contract_address(),
+                milestone_index,
+                client: meta.client,
+                token: meta.token,
+                gross_amount: record.gross_amount,
+            },
+        );
+
+        Ok(())
+    }
+
     // ── read-only query ───────────────────────────────────────────────────────
 
-    /// Return a snapshot of the current yield and pause state.
-    ///
+    /// Return a snapshot of the current yield and pause state.    ///
     /// All fields are safe to call even before any admin has set a yield rate
     /// (defaults to zero) or paused the contract (defaults to `false`).
     ///

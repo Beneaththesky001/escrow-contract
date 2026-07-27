@@ -6495,3 +6495,510 @@ fn test_multisig_approval_init_unauthorized_fails() {
     let result = client.try_multisig_approval_init(&impostor, &new_signers, &1u32);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
+
+// ============================================================================
+// tax_withholding_deductions + admin_override_tax_release/refund (#220)
+// ============================================================================
+
+// ── tax_withholding_deductions ────────────────────────────────────────────────
+
+/// Happy path: tax computed correctly, record stored, event emitted.
+/// 10 000 gross × 2000 bps (20 %) = 2 000 tax, 8 000 net.
+#[test]
+fn test_tax_withholding_deductions_happy_path() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 10_000_i128];
+    let (_, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    let record = escrow.tax_withholding_deductions(&0u32, &2000u32);
+
+    assert_eq!(record.gross_amount, 10_000);
+    assert_eq!(record.tax_rate_bps, 2000);
+    assert_eq!(record.tax_amount, 2_000);
+    assert_eq!(record.net_amount, 8_000);
+    assert_eq!(record.tax_amount + record.net_amount, record.gross_amount);
+}
+
+/// Zero tax rate: tax_amount = 0, net_amount = gross_amount.
+#[test]
+fn test_tax_withholding_deductions_zero_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    let record = escrow.tax_withholding_deductions(&0u32, &0u32);
+
+    assert_eq!(record.tax_amount, 0);
+    assert_eq!(record.net_amount, 5_000);
+}
+
+/// 100 % tax rate: net_amount = 0, tax_amount = gross_amount.
+#[test]
+fn test_tax_withholding_deductions_full_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 3_000_i128];
+    let (_, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    let record = escrow.tax_withholding_deductions(&0u32, &10_000u32);
+
+    assert_eq!(record.tax_amount, 3_000);
+    assert_eq!(record.net_amount, 0);
+}
+
+/// Odd gross with fractional tax rounds to nearest: total always preserved.
+/// 1001 × 3333 bps = 333.6633 → tax = 334, net = 667, sum = 1001.
+#[test]
+fn test_tax_withholding_deductions_odd_gross_rounds_nearest() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_001_i128];
+    let (_, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    let record = escrow.tax_withholding_deductions(&0u32, &3333u32);
+
+    assert_eq!(record.tax_amount + record.net_amount, 1_001);
+}
+
+/// tax_rate_bps > 10_000 is rejected with InvalidRatio.
+#[test]
+fn test_tax_withholding_deductions_rate_exceeds_max_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    let result = escrow.try_tax_withholding_deductions(&0u32, &10_001u32);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+/// Calling on an out-of-range milestone index fails with InvalidMilestone.
+#[test]
+fn test_tax_withholding_deductions_invalid_index_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    let result = escrow.try_tax_withholding_deductions(&99u32, &1000u32);
+    assert_eq!(result, Err(Ok(Error::InvalidMilestone)));
+}
+
+/// Calling on a Released milestone fails with InvalidStatus.
+#[test]
+fn test_tax_withholding_deductions_released_milestone_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (client_addr, freelancer_addr, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, amounts);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.approve_milestone(&client_addr, &0u32);
+
+    let result = escrow.try_tax_withholding_deductions(&0u32, &1000u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// Calling before funding fails with NotFunded.
+#[test]
+fn test_tax_withholding_deductions_not_funded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    escrow.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_id,
+        &604800,
+        &vec![&env, 5_000_i128],
+    );
+
+    let result = escrow.try_tax_withholding_deductions(&0u32, &1000u32);
+    assert_eq!(result, Err(Ok(Error::NotFunded)));
+}
+
+/// tax_withholding_deductions emits exactly one taxwith event.
+#[test]
+fn test_tax_withholding_deductions_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    escrow.tax_withholding_deductions(&0u32, &500u32);
+
+    let topic: soroban_sdk::Symbol = soroban_sdk::symbol_short!("taxwith");
+    let topic_val: Val = topic.into_val(&env);
+    let count = env.events().all().iter().fold(0u32, |acc, e| {
+        if let Some(t) = e.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() {
+                return acc + 1;
+            }
+        }
+        acc
+    });
+    assert_eq!(count, 1);
+}
+
+// ── admin_override_tax_release ────────────────────────────────────────────────
+
+/// Happy path: net amount transferred to freelancer, milestone Released.
+#[test]
+fn test_admin_override_tax_release_happy_path() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 10_000_i128];
+    let (_, freelancer_addr, _, admin_addr, token_id, _, escrow) =
+        setup_funded_escrow(&env, amounts);
+    let token = token::Client::new(&env, &token_id);
+
+    // Apply 20 % tax withholding → net = 8 000.
+    escrow.tax_withholding_deductions(&0u32, &2000u32);
+
+    escrow.admin_override_tax_release(&admin_addr, &0u32);
+
+    // Freelancer receives net amount only.
+    assert_eq!(token.balance(&freelancer_addr), 8_000);
+
+    // Milestone must be Released.
+    let job = escrow.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Released
+    );
+}
+
+/// Only the verified admin may call admin_override_tax_release.
+#[test]
+fn test_admin_override_tax_release_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+    escrow.tax_withholding_deductions(&0u32, &1000u32);
+
+    let impostor = Address::generate(&env);
+    let result = escrow.try_admin_override_tax_release(&impostor, &0u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+/// Without a prior tax_withholding_deductions call, InvalidStatus is returned.
+#[test]
+fn test_admin_override_tax_release_no_lock_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, admin_addr, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    // No tax_withholding_deductions called — no lock record.
+    let result = escrow.try_admin_override_tax_release(&admin_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// admin_override_tax_release removes the lock so a second call fails.
+#[test]
+fn test_admin_override_tax_release_removes_lock() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, admin_addr, _, _, escrow) = setup_funded_escrow(&env, amounts);
+    escrow.tax_withholding_deductions(&0u32, &500u32);
+
+    escrow.admin_override_tax_release(&admin_addr, &0u32);
+
+    // Second call: milestone is now Released → InvalidStatus.
+    let result = escrow.try_admin_override_tax_release(&admin_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// admin_override_tax_release emits exactly one adtxrls event.
+#[test]
+fn test_admin_override_tax_release_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, admin_addr, _, _, escrow) = setup_funded_escrow(&env, amounts);
+    escrow.tax_withholding_deductions(&0u32, &1000u32);
+
+    escrow.admin_override_tax_release(&admin_addr, &0u32);
+
+    let topic: soroban_sdk::Symbol = soroban_sdk::symbol_short!("adtxrls");
+    let topic_val: Val = topic.into_val(&env);
+    let count = env.events().all().iter().fold(0u32, |acc, e| {
+        if let Some(t) = e.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() {
+                return acc + 1;
+            }
+        }
+        acc
+    });
+    assert_eq!(count, 1);
+}
+
+/// admin_override_tax_release with an out-of-range index fails with InvalidMilestone.
+#[test]
+fn test_admin_override_tax_release_invalid_index_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, admin_addr, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    let result = escrow.try_admin_override_tax_release(&admin_addr, &99u32);
+    assert_eq!(result, Err(Ok(Error::InvalidMilestone)));
+}
+
+// ── admin_override_tax_refund ─────────────────────────────────────────────────
+
+/// Happy path: gross amount refunded to client, milestone Refunded.
+#[test]
+fn test_admin_override_tax_refund_happy_path() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 10_000_i128];
+    let (client_addr, _, _, admin_addr, token_id, _, escrow) =
+        setup_funded_escrow(&env, amounts);
+    let token = token::Client::new(&env, &token_id);
+
+    escrow.tax_withholding_deductions(&0u32, &2000u32);
+
+    escrow.admin_override_tax_refund(&admin_addr, &0u32);
+
+    // Client receives the full gross amount back.
+    assert_eq!(token.balance(&client_addr), 10_000);
+
+    let job = escrow.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Refunded
+    );
+}
+
+/// Only the verified admin may call admin_override_tax_refund.
+#[test]
+fn test_admin_override_tax_refund_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+    escrow.tax_withholding_deductions(&0u32, &1000u32);
+
+    let impostor = Address::generate(&env);
+    let result = escrow.try_admin_override_tax_refund(&impostor, &0u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+/// Without a prior tax_withholding_deductions call, InvalidStatus is returned.
+#[test]
+fn test_admin_override_tax_refund_no_lock_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, admin_addr, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    let result = escrow.try_admin_override_tax_refund(&admin_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// admin_override_tax_refund removes the lock so a second call fails.
+#[test]
+fn test_admin_override_tax_refund_removes_lock() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, admin_addr, _, _, escrow) = setup_funded_escrow(&env, amounts);
+    escrow.tax_withholding_deductions(&0u32, &500u32);
+
+    escrow.admin_override_tax_refund(&admin_addr, &0u32);
+
+    // Second call: milestone is Refunded → InvalidStatus.
+    let result = escrow.try_admin_override_tax_refund(&admin_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// admin_override_tax_refund emits exactly one adtxrfd event.
+#[test]
+fn test_admin_override_tax_refund_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, admin_addr, _, _, escrow) = setup_funded_escrow(&env, amounts);
+    escrow.tax_withholding_deductions(&0u32, &1000u32);
+
+    escrow.admin_override_tax_refund(&admin_addr, &0u32);
+
+    let topic: soroban_sdk::Symbol = soroban_sdk::symbol_short!("adtxrfd");
+    let topic_val: Val = topic.into_val(&env);
+    let count = env.events().all().iter().fold(0u32, |acc, e| {
+        if let Some(t) = e.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() {
+                return acc + 1;
+            }
+        }
+        acc
+    });
+    assert_eq!(count, 1);
+}
+
+/// admin_override_tax_refund with an out-of-range index fails with InvalidMilestone.
+#[test]
+fn test_admin_override_tax_refund_invalid_index_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, _, _, admin_addr, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    let result = escrow.try_admin_override_tax_refund(&admin_addr, &99u32);
+    assert_eq!(result, Err(Ok(Error::InvalidMilestone)));
+}
+
+/// admin_override_tax_release not_funded fails with NotFunded.
+#[test]
+fn test_admin_override_tax_release_not_funded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    escrow.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_id,
+        &604800,
+        &vec![&env, 5_000_i128],
+    );
+
+    let result = escrow.try_admin_override_tax_release(&admin_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::NotFunded)));
+}
+
+/// admin_override_tax_refund not_funded fails with NotFunded.
+#[test]
+fn test_admin_override_tax_refund_not_funded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    escrow.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_id,
+        &604800,
+        &vec![&env, 5_000_i128],
+    );
+
+    let result = escrow.try_admin_override_tax_refund(&admin_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::NotFunded)));
+}
+
+/// The freelancer cannot call admin_override_tax_release.
+#[test]
+fn test_admin_override_tax_release_freelancer_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (_, freelancer_addr, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+    escrow.tax_withholding_deductions(&0u32, &1000u32);
+
+    let result = escrow.try_admin_override_tax_release(&freelancer_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+/// The client cannot call admin_override_tax_refund.
+#[test]
+fn test_admin_override_tax_refund_client_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (client_addr, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+    escrow.tax_withholding_deductions(&0u32, &1000u32);
+
+    let result = escrow.try_admin_override_tax_refund(&client_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+/// Multi-milestone: tax applied independently per milestone; overrides are
+/// independent and do not affect sibling milestones.
+#[test]
+fn test_tax_withholding_multi_milestone_independent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 4_000_i128, 6_000_i128];
+    let (client_addr, freelancer_addr, _, admin_addr, token_id, _, escrow) =
+        setup_funded_escrow(&env, amounts);
+    let token = token::Client::new(&env, &token_id);
+
+    // Apply tax on milestone 0 (10 % → net 3 600) and milestone 1 (20 % → net 4 800).
+    escrow.tax_withholding_deductions(&0u32, &1000u32);
+    escrow.tax_withholding_deductions(&1u32, &2000u32);
+
+    // Release milestone 0 via tax override.
+    escrow.admin_override_tax_release(&admin_addr, &0u32);
+    assert_eq!(token.balance(&freelancer_addr), 3_600);
+
+    // Refund milestone 1 via tax override.
+    escrow.admin_override_tax_refund(&admin_addr, &1u32);
+    assert_eq!(token.balance(&client_addr), 6_000);
+
+    let job = escrow.get_job();
+    assert_eq!(job.milestones.get(0).unwrap().status, MilestoneStatus::Released);
+    assert_eq!(job.milestones.get(1).unwrap().status, MilestoneStatus::Refunded);
+}
