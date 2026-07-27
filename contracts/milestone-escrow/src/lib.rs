@@ -302,7 +302,6 @@ pub struct CancelEscrowInitiatedEvent {
     pub caller: Address,
 }
 
-
 // ── escrow_interest_yield admin-override events ──────────────────────────────
 
 /// Emitted by `admin_set_yield_rate` whenever the admin updates the annual
@@ -520,8 +519,6 @@ impl MilestoneEscrow {
             .get(&DataKey::MilestoneTimeExtension(index))
             .unwrap_or(0)
     }
-
-
 
     /// Check whether `approve_milestone` has marked the given milestone index
     /// as fully released via the temporary completion flag.  Returns `false`
@@ -1069,7 +1066,9 @@ impl MilestoneEscrow {
         }
 
         let milestone = Self::load_milestone(&env, milestone_index)?;
-        if milestone.status != MilestoneStatus::Delivered && milestone.status != MilestoneStatus::PartiallyReleased {
+        if milestone.status != MilestoneStatus::Delivered
+            && milestone.status != MilestoneStatus::PartiallyReleased
+        {
             return Err(Error::InvalidStatus);
         }
 
@@ -1078,11 +1077,14 @@ impl MilestoneEscrow {
         }
 
         let current_extension = Self::load_time_extension(&env, milestone_index);
-        let new_extension = current_extension.checked_add(extra_seconds).ok_or(Error::InvalidExtension)?;
+        let new_extension = current_extension
+            .checked_add(extra_seconds)
+            .ok_or(Error::InvalidExtension)?;
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::MilestoneTimeExtension(milestone_index), &new_extension);
+        env.storage().persistent().set(
+            &DataKey::MilestoneTimeExtension(milestone_index),
+            &new_extension,
+        );
 
         env.events().publish(
             (symbol_short!("extend"),),
@@ -1497,7 +1499,6 @@ impl MilestoneEscrow {
         }
 
         let mut milestone = Self::load_milestone(&env, milestone_index)?;
-
         if milestone.status != MilestoneStatus::Disputed {
             return Err(Error::InvalidStatus);
         }
@@ -1516,49 +1517,28 @@ impl MilestoneEscrow {
             return Err(Error::InvalidAmount);
         }
 
+        let payout = remaining.min(contract_balance);
         if release_to_freelancer {
-            // Set terminal state before transferring to prevent reentrancy/double-claim.
-            if remaining > 0 {
-                milestone.released_amount = milestone
-                    .released_amount
-                    .checked_add(remaining)
-                    .ok_or(Error::InvalidAmount)?;
-            }
+            milestone.released_amount = milestone
+                .released_amount
+                .checked_add(payout)
+                .ok_or(Error::InvalidAmount)?;
             milestone.status = MilestoneStatus::Released;
             Self::store_milestone(&env, milestone_index, &milestone);
 
-            if remaining > 0 {
-                token_client.transfer(
-                    &env.current_contract_address(),
-                    &meta.freelancer,
-                    &remaining,
-                );
-            let payout = remaining.min(contract_balance);
             if payout > 0 {
                 token_client.transfer(&env.current_contract_address(), &meta.freelancer, &payout);
-                milestone.released_amount = milestone
-                    .released_amount
-                    .checked_add(payout)
-                    .ok_or(Error::InvalidAmount)?;
             }
             Self::increment_reputation(&env, &meta.client);
             Self::increment_reputation(&env, &meta.freelancer);
         } else {
-            // Set terminal state before transferring to prevent reentrancy/double-claim.
-            if remaining > 0 {
-                // refunded to client; released_amount unchanged
-            let refund = remaining.min(contract_balance);
-            if refund > 0 {
-                token_client.transfer(&env.current_contract_address(), &meta.client, &refund);
-            }
             milestone.status = MilestoneStatus::Refunded;
             Self::store_milestone(&env, milestone_index, &milestone);
 
-            if remaining > 0 {
-                token_client.transfer(&env.current_contract_address(), &meta.client, &remaining);
+            if payout > 0 {
+                token_client.transfer(&env.current_contract_address(), &meta.client, &payout);
             }
         }
-
 
         env.events().publish(
             (symbol_short!("resolve"),),
@@ -1569,7 +1549,7 @@ impl MilestoneEscrow {
                 client: meta.client.clone(),
                 freelancer: meta.freelancer.clone(),
                 token: meta.token.clone(),
-                amount: remaining,
+                amount: payout,
                 released_to_freelancer: release_to_freelancer,
                 status: milestone.status.clone(),
             },
@@ -1818,144 +1798,6 @@ impl MilestoneEscrow {
         }
 
         Ok(allocations)
-    }
-
-    // ── multisig approval: storage-optimised key design ────────────────────
-    //
-    // Design rationale
-    // ─────────────────
-    // Traditional multisig implementations store approval state as individual
-    // `(Address, ProposalId) → bool` entries, which is expensive on Soroban
-    // because each Address contributes ~32 bytes to the ledger key footprint.
-    //
-    // This implementation uses three optimisations to minimise bytes stored:
-    //
-    // 1. **Signer list is stored once** (instance storage) under a single
-    //    `MultiSigSigners` key rather than storing individual key-value pairs
-    //    per signer.
-    //
-    // 2. **Approval tracking uses a compact u32 bitmap** in temporary storage
-    //    under `MultiSigApproval(proposal_id)`.  Each bit represents one signer
-    //    by its index in the signers vec, eliminating the Address overhead from
-    //    every approval entry.  Up to 32 signers are supported per proposal.
-    //
-    // 3. **Temporary storage tier** is used for the bitmap so that the ledger
-    //    footprint is automatically evicted once the proposal lifecycle ends,
-    //    rather than persisting indefinitely.
-
-    const MAX_MULTISIG_SIGNERS: u32 = 32;
-
-    /// Initialise a multisig approval regime with a fixed set of signers and
-    /// the required approval threshold.  Must be called exactly once.
-    pub fn multisig_approval_init(
-        env: Env,
-        admin: Address,
-        signers: Vec<Address>,
-        threshold: u32,
-    ) -> Result<(), Error> {
-        Self::require_admin(&env, &admin)?;
-
-        if env.storage().instance().has(&DataKey::MultiSigSigners) {
-            return Err(Error::AlreadyInitialized);
-        }
-
-        let count = signers.len();
-        if count == 0 || count > Self::MAX_MULTISIG_SIGNERS {
-            return Err(Error::InvalidAmount);
-        }
-        if threshold == 0 || threshold > count {
-            return Err(Error::InvalidAmount);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::MultiSigSigners, &signers);
-        env.storage()
-            .instance()
-            .set(&DataKey::MultiSigThreshold, &threshold);
-
-        Ok(())
-    }
-
-    /// Record an approval from one of the registered signers for the given
-    /// proposal.  Idempotent — calling twice from the same signer has no
-    /// effect and is not an error.
-    pub fn multisig_approve(
-        env: Env,
-        signer: Address,
-        proposal_id: u32,
-    ) -> Result<MultiSigApprovalState, Error> {
-        signer.require_auth();
-
-        let signers: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiSigSigners)
-            .ok_or(Error::NotInitialized)?;
-
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiSigThreshold)
-            .ok_or(Error::NotInitialized)?;
-
-        // Find the signer's index in the list (O(n) but n ≤ 32).
-        let signer_index = signers
-            .iter()
-            .position(|s| s == signer)
-            .ok_or(Error::Unauthorized)?;
-
-        // Read the current bitmap from temporary storage (default: 0 = no approvals).
-        let mut bitmap: u32 = env
-            .storage()
-            .temporary()
-            .get(&DataKey::MultiSigApproval(proposal_id))
-            .unwrap_or(0);
-
-        // Set the bit for this signer (idempotent).
-        let idx: u32 = signer_index.try_into().map_err(|_| Error::InvalidAmount)?;
-        let mask = 1u32.checked_shl(idx).ok_or(Error::InvalidAmount)?;
-        bitmap |= mask;
-
-        // Write the updated bitmap back to temporary storage.
-        env.storage()
-            .temporary()
-            .set(&DataKey::MultiSigApproval(proposal_id), &bitmap);
-
-        let approvals = bitmap.count_ones();
-        let approved = approvals >= threshold;
-
-        Ok(MultiSigApprovalState {
-            approved,
-            approvals,
-            threshold,
-            bitmap,
-        })
-    }
-
-    /// Query whether a proposal has reached the required approval threshold.
-    /// Pure read — does not require auth and does not mutate state.
-    pub fn is_multisig_approved(env: Env, proposal_id: u32) -> Result<MultiSigApprovalState, Error> {
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiSigThreshold)
-            .ok_or(Error::NotInitialized)?;
-
-        let bitmap: u32 = env
-            .storage()
-            .temporary()
-            .get(&DataKey::MultiSigApproval(proposal_id))
-            .unwrap_or(0);
-
-        let approvals = bitmap.count_ones();
-
-        Ok(MultiSigApprovalState {
-            approved: approvals >= threshold,
-            approvals,
-            threshold,
-            bitmap,
-        })
     }
 
     pub fn version(env: Env) -> u32 {

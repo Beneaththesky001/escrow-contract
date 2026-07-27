@@ -72,9 +72,10 @@ impl ReentrantToken {
             .persistent()
             .get(&ReentrantTokenDataKey::Balance(to.clone()))
             .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&ReentrantTokenDataKey::Balance(to.clone()), &(current + amount));
+        env.storage().persistent().set(
+            &ReentrantTokenDataKey::Balance(to.clone()),
+            &(current + amount),
+        );
     }
 
     pub fn balance(env: Env, who: Address) -> i128 {
@@ -85,9 +86,6 @@ impl ReentrantToken {
     }
 
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
-        if env.storage().instance().has(&ReentrantTokenDataKey::Reentered) {
-            // idempotent early return
-    pub fn transfer(env: Env, from: Address, to: Address, _amount: i128) {
         if env
             .storage()
             .instance()
@@ -100,8 +98,6 @@ impl ReentrantToken {
             .instance()
             .set(&ReentrantTokenDataKey::Reentered, &true);
 
-        // Attempt reentrant calls against both `to` and `from` in case the
-        // escrow contract appears in either position depending on call-site.
         let esc_to = MilestoneEscrowClient::new(&env, &to);
         let _ = esc_to.try_get_job().and_then(|job: Job| {
             let _ = esc_to.try_apply_dispute_arbitration_split(&job.arbiter, &0u32, &5000u32);
@@ -114,7 +110,6 @@ impl ReentrantToken {
             Ok(())
         });
 
-        // Perform balance transfer
         let from_bal: i128 = env
             .storage()
             .persistent()
@@ -126,12 +121,14 @@ impl ReentrantToken {
             .get(&ReentrantTokenDataKey::Balance(to.clone()))
             .unwrap_or(0);
 
-        env.storage()
-            .persistent()
-            .set(&ReentrantTokenDataKey::Balance(from.clone()), &(from_bal - amount));
-        env.storage()
-            .persistent()
-            .set(&ReentrantTokenDataKey::Balance(to.clone()), &(to_bal + amount));
+        env.storage().persistent().set(
+            &ReentrantTokenDataKey::Balance(from.clone()),
+            &(from_bal - amount),
+        );
+        env.storage().persistent().set(
+            &ReentrantTokenDataKey::Balance(to.clone()),
+            &(to_bal + amount),
+        );
     }
 
     pub fn callback_attempted(env: Env) -> bool {
@@ -352,8 +349,8 @@ fn test_apply_dispute_arbitration_split_transfers_percentages() {
 
     // Apply a 30% refund to client (3000 bps). During transfers the token
     // will attempt a reentrant call which should be blocked by the lock.
-    let alloc: RefundAllocation = client
-        .apply_dispute_arbitration_split(&arbiter_addr, &0u32, &3000u32);
+    let alloc: RefundAllocation =
+        client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &3000u32);
 
     assert_eq!(alloc.client_refund, 3_000);
     assert_eq!(alloc.freelancer_payout, 7_000);
@@ -382,8 +379,8 @@ fn test_apply_dispute_arbitration_split_full_refund_status() {
     client.raise_dispute(&client_addr, &0u32);
 
     // Apply 100% refund to client
-    let alloc: RefundAllocation = client
-        .apply_dispute_arbitration_split(&arbiter_addr, &0u32, &10000u32);
+    let alloc: RefundAllocation =
+        client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &10000u32);
 
     assert_eq!(alloc.client_refund, 10_000);
     assert_eq!(alloc.freelancer_payout, 0);
@@ -412,8 +409,8 @@ fn test_apply_dispute_arbitration_split_odd_amounts() {
 
     // Raise dispute on tiny amount and apply 50/50 split
     client.raise_dispute(&client_addr, &0u32);
-    let alloc: RefundAllocation = client
-        .apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5000u32);
+    let alloc: RefundAllocation =
+        client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5000u32);
 
     // Using nearest rounding the single unit should go to client (ties round up)
     assert_eq!(alloc.client_refund + alloc.freelancer_payout, 1_i128);
@@ -2537,7 +2534,7 @@ fn test_extend_milestone_deadline_succeeds() {
     escrow.mark_delivered(&freelancer_addr, &0u32);
 
     let initial_time = escrow.time_until_auto_release(&0u32);
-    
+
     // Extend by 1000 seconds
     escrow.extend_milestone_deadline(&client_addr, &0u32, &1000u64);
 
@@ -6422,8 +6419,7 @@ fn test_raise_dispute_no_auth_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (client_addr, _, _, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let (client_addr, _, _, _, _, _, escrow) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
     env.set_auths(&[]);
 
@@ -6438,10 +6434,7 @@ fn test_raise_dispute_no_auth_fails() {
 
 /// Helper: register a fresh contract and initialise multisig with three
 /// signers and a threshold of 2.
-fn setup_multisig(
-    env: &Env,
-    threshold: u32,
-) -> (MilestoneEscrowClient<'_>, Address, Vec<Address>) {
+fn setup_multisig(env: &Env, threshold: u32) -> (MilestoneEscrowClient<'_>, Address, Vec<Address>) {
     let admin = Address::generate(env);
     let signer1 = Address::generate(env);
     let signer2 = Address::generate(env);
@@ -6555,7 +6548,10 @@ fn test_multisig_approval_partial_approval() {
     let (client, _admin, signers) = setup_multisig(&env, 2);
 
     let signer1 = signers.get(0).unwrap();
-    let state = client.try_multisig_approve(&signer1, &1u32).unwrap().unwrap();
+    let state = client
+        .try_multisig_approve(&signer1, &1u32)
+        .unwrap()
+        .unwrap();
 
     assert!(!state.approved);
     assert_eq!(state.approvals, 1);
@@ -6574,7 +6570,10 @@ fn test_multisig_approval_reaches_threshold() {
     let signer2 = signers.get(1).unwrap();
 
     let _ = client.multisig_approve(&signer1, &2u32);
-    let state = client.try_multisig_approve(&signer2, &2u32).unwrap().unwrap();
+    let state = client
+        .try_multisig_approve(&signer2, &2u32)
+        .unwrap()
+        .unwrap();
 
     assert!(state.approved);
     assert_eq!(state.approvals, 2);
@@ -6595,7 +6594,10 @@ fn test_multisig_approval_exceeds_threshold() {
 
     let _ = client.multisig_approve(&signer1, &3u32);
     let _ = client.multisig_approve(&signer2, &3u32);
-    let state = client.try_multisig_approve(&signer3, &3u32).unwrap().unwrap();
+    let state = client
+        .try_multisig_approve(&signer3, &3u32)
+        .unwrap()
+        .unwrap();
 
     assert!(state.approved);
     assert_eq!(state.approvals, 3);
@@ -6612,7 +6614,10 @@ fn test_multisig_approval_idempotent() {
 
     let signer1 = signers.get(0).unwrap();
     let _ = client.multisig_approve(&signer1, &4u32);
-    let state = client.try_multisig_approve(&signer1, &4u32).unwrap().unwrap();
+    let state = client
+        .try_multisig_approve(&signer1, &4u32)
+        .unwrap()
+        .unwrap();
 
     assert!(!state.approved);
     assert_eq!(state.approvals, 1);
