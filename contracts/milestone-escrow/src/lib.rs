@@ -29,6 +29,10 @@ pub enum Error {
     InvalidRatio = 14,
     InvalidExtension = 15,
     EscrowLocked = 16,
+    MultiSigNoSigners = 17,
+    MultiSigTooManySigners = 18,
+    MultiSigInvalidThreshold = 19,
+    MultiSigDuplicateSigner = 20,
 }
 
 const BPS_SCALE: u32 = 10_000;
@@ -2135,6 +2139,37 @@ impl MilestoneEscrow {
 
     const MAX_MULTISIG_SIGNERS: u32 = 32;
 
+    /// Validates multisig signer list and approval threshold before persistence.
+    ///
+    /// Rejects empty or oversized signer sets, thresholds outside `1..=signer_count`,
+    /// and duplicate signer addresses.
+    fn validate_multisig_setup(signers: &Vec<Address>, threshold: u32) -> Result<(), Error> {
+        let count = signers.len();
+        if count == 0 {
+            return Err(Error::MultiSigNoSigners);
+        }
+        if count > Self::MAX_MULTISIG_SIGNERS {
+            return Err(Error::MultiSigTooManySigners);
+        }
+        if threshold == 0 || threshold > count {
+            return Err(Error::MultiSigInvalidThreshold);
+        }
+
+        let mut i = 0u32;
+        while i < count {
+            let mut j = i + 1;
+            while j < count {
+                if signers.get(i).unwrap() == signers.get(j).unwrap() {
+                    return Err(Error::MultiSigDuplicateSigner);
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+
+        Ok(())
+    }
+
     /// Initialise a multisig approval regime with a fixed set of signers and
     /// the required approval threshold.  Must be called exactly once.
     pub fn multisig_approval_init(
@@ -2149,13 +2184,7 @@ impl MilestoneEscrow {
             return Err(Error::AlreadyInitialized);
         }
 
-        let count = signers.len();
-        if count == 0 || count > Self::MAX_MULTISIG_SIGNERS {
-            return Err(Error::InvalidAmount);
-        }
-        if threshold == 0 || threshold > count {
-            return Err(Error::InvalidAmount);
-        }
+        Self::validate_multisig_setup(&signers, threshold)?;
 
         env.storage()
             .instance()
