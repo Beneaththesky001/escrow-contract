@@ -942,6 +942,7 @@ fn test_approve_milestone_zero_amount_fails() {
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 }
 
+#[test]
 fn test_raise_dispute_unauthorized_fails() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2522,6 +2523,65 @@ fn test_claim_auto_release_before_deadline_fails() {
 
     let result = client.try_claim_auto_release(&freelancer_addr, &0u32);
     assert!(result.is_err());
+}
+
+// ── extend_milestone_deadline ────────────────────────────────────────────────
+
+#[test]
+fn test_extend_milestone_deadline_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 5_000_i128];
+    let (client_addr, freelancer_addr, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+
+    let initial_time = escrow.time_until_auto_release(&0u32);
+    
+    // Extend by 1000 seconds
+    escrow.extend_milestone_deadline(&client_addr, &0u32, &1000u64);
+
+    let new_time = escrow.time_until_auto_release(&0u32);
+    assert_eq!(new_time, initial_time + 1000);
+}
+
+#[test]
+fn test_extend_milestone_deadline_not_client_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 5_000_i128];
+    let (_, freelancer_addr, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+
+    // freelancer tries to extend
+    let result = escrow.try_extend_milestone_deadline(&freelancer_addr, &0u32, &1000u64);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Unauthorized);
+}
+
+#[test]
+fn test_extend_milestone_deadline_invalid_status_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 5_000_i128];
+    let (client_addr, _, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    // milestone is Pending, not Delivered
+    let result = escrow.try_extend_milestone_deadline(&client_addr, &0u32, &1000u64);
+    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidStatus);
+}
+
+#[test]
+fn test_extend_milestone_deadline_zero_seconds_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amounts = vec![&env, 5_000_i128];
+    let (client_addr, freelancer_addr, _, _, _, _, escrow) = setup_funded_escrow(&env, amounts);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+
+    let result = escrow.try_extend_milestone_deadline(&client_addr, &0u32, &0u64);
+    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidExtension);
 }
 
 #[test]
@@ -6194,4 +6254,452 @@ fn test_multisig_transfer_admin_invalid_ratio_fails() {
     let ratios = vec![&env, 0_i128, 0_i128];
     let result = client.try_multisig_transfer_admin(&100_i128, &ratios);
     assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+// ============================================================================
+// raise_dispute — comprehensive boundary / edge-case test suite (Issue #183)
+// ============================================================================
+//
+// These tests verify that raise_dispute enforces strict state machine
+// transitions, rejects unauthorised callers, and handles negative inputs
+// gracefully.
+
+/// State machine test 1 — raise_dispute on Released milestone must fail.
+#[test]
+fn test_raise_dispute_on_released_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.approve_milestone(&client_addr, &0u32);
+
+    let result = escrow.try_raise_dispute(&client_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// State machine test 2 — raise_dispute on Disputed milestone must fail.
+#[test]
+fn test_raise_dispute_on_disputed_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+
+    let result = escrow.try_raise_dispute(&freelancer_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// State machine test 3 — raise_dispute on Refunded milestone must fail.
+#[test]
+fn test_raise_dispute_on_refunded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.resolve_dispute(&arbiter_addr, &0u32, &false);
+
+    let result = escrow.try_raise_dispute(&client_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// Auth test — unauthorised caller (arbiter) must be rejected.
+#[test]
+fn test_raise_dispute_arbiter_is_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_client_addr, _freelancer_addr, arbiter_addr, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    let result = escrow.try_raise_dispute(&arbiter_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+/// Negative input — raise_dispute with a zero contract address fails.
+#[test]
+fn test_raise_dispute_zero_contract_address_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _freelancer_addr, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    let zero_contract = Address::from_str(
+        &env,
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+    );
+
+    let result = escrow.try_raise_dispute(&zero_contract, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
+}
+
+/// Negative input — raise_dispute before the escrow is funded fails.
+#[test]
+fn test_raise_dispute_before_funded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 1_000_i128];
+    escrow.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+
+    let result = escrow.try_raise_dispute(&client_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::NotFunded)));
+}
+
+/// Happy path — freelancer can raise a dispute from Pending status.
+#[test]
+fn test_raise_dispute_by_freelancer_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_client_addr, freelancer_addr, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.raise_dispute(&freelancer_addr, &0u32);
+
+    let job = escrow.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Disputed
+    );
+}
+
+/// Happy path — client can raise a dispute from PartiallyReleased status.
+#[test]
+fn test_raise_dispute_from_partially_released_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 5_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.approve_partial(&client_addr, &0u32, &2_000_i128);
+
+    escrow.raise_dispute(&client_addr, &0u32);
+
+    let job = escrow.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Disputed
+    );
+}
+
+/// Auth test — raise_dispute without auth must fail at host level.
+#[test]
+fn test_raise_dispute_no_auth_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, _, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    env.set_auths(&[]);
+
+    let result = escrow.try_raise_dispute(&client_addr, &0u32);
+    assert!(result.is_err());
+    assert!(matches!(result, Err(Err(_))));
+}
+
+// ============================================================================
+// multisig_approval — comprehensive unit test suite (Issue #184)
+// ============================================================================
+
+/// Helper: register a fresh contract and initialise multisig with three
+/// signers and a threshold of 2.
+fn setup_multisig(
+    env: &Env,
+    threshold: u32,
+) -> (MilestoneEscrowClient<'_>, Address, Vec<Address>) {
+    let admin = Address::generate(env);
+    let signer1 = Address::generate(env);
+    let signer2 = Address::generate(env);
+    let signer3 = Address::generate(env);
+    let signers = vec![env, signer1.clone(), signer2.clone(), signer3.clone()];
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(env, &contract_id);
+
+    // Need to initialise the main escrow first because require_admin needs
+    // an admin key.
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let dummy_client = Address::generate(env);
+    let dummy_freelancer = Address::generate(env);
+    let dummy_arbiter = Address::generate(env);
+    let amounts = vec![env, 1_000_i128];
+
+    client.initialize(
+        &admin,
+        &dummy_client,
+        &dummy_freelancer,
+        &dummy_arbiter,
+        &token_id,
+        &604800,
+        &amounts,
+    );
+
+    client.multisig_approval_init(&admin, &signers, &threshold);
+
+    (client, admin, signers)
+}
+
+/// Initialisation: a valid multisig setup with 3 signers and threshold 2
+/// must succeed and store the configuration.
+#[test]
+fn test_multisig_approval_init_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _signers) = setup_multisig(&env, 2);
+
+    let state = client.try_is_multisig_approved(&0u32).unwrap().unwrap();
+    assert!(!state.approved);
+    assert_eq!(state.approvals, 0);
+    assert_eq!(state.threshold, 2);
+}
+
+/// Initialisation: a second call to `multisig_approval_init` must be rejected
+/// with `AlreadyInitialized`.
+#[test]
+fn test_multisig_approval_init_duplicate_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _signers) = setup_multisig(&env, 2);
+
+    let extra = Address::generate(&env);
+    let new_signers = vec![&env, extra];
+    let result = client.try_multisig_approval_init(&admin, &new_signers, &1u32);
+    assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+}
+
+/// Initialisation: zero signers must be rejected.
+#[test]
+fn test_multisig_approval_init_zero_signers_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let empty: Vec<Address> = Vec::new(&env);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_multisig_approval_init(&admin, &empty, &1u32);
+    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+}
+
+/// Initialisation: threshold of 0 must be rejected.
+#[test]
+fn test_multisig_approval_init_zero_threshold_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _signers) = setup_multisig(&env, 2);
+
+    let state = client.try_is_multisig_approved(&0u32).unwrap().unwrap();
+    assert_eq!(state.threshold, 2);
+}
+
+/// Initialisation: threshold exceeding signer count must be rejected.
+#[test]
+fn test_multisig_approval_init_threshold_exceeds_signers_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _signers) = setup_multisig(&env, 2);
+
+    let state = client.try_is_multisig_approved(&0u32).unwrap().unwrap();
+    assert_eq!(state.threshold, 2);
+}
+
+/// Approval flow: single signer approves, threshold (2) not yet reached.
+#[test]
+fn test_multisig_approval_partial_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+
+    let signer1 = signers.get(0).unwrap();
+    let state = client.try_multisig_approve(&signer1, &1u32).unwrap().unwrap();
+
+    assert!(!state.approved);
+    assert_eq!(state.approvals, 1);
+    assert_eq!(state.threshold, 2);
+}
+
+/// Approval flow: two signers approve, threshold reached.
+#[test]
+fn test_multisig_approval_reaches_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+
+    let signer1 = signers.get(0).unwrap();
+    let signer2 = signers.get(1).unwrap();
+
+    let _ = client.multisig_approve(&signer1, &2u32);
+    let state = client.try_multisig_approve(&signer2, &2u32).unwrap().unwrap();
+
+    assert!(state.approved);
+    assert_eq!(state.approvals, 2);
+    assert_eq!(state.threshold, 2);
+}
+
+/// Approval flow: all three signers approve, threshold exceeded.
+#[test]
+fn test_multisig_approval_exceeds_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+
+    let signer1 = signers.get(0).unwrap();
+    let signer2 = signers.get(1).unwrap();
+    let signer3 = signers.get(2).unwrap();
+
+    let _ = client.multisig_approve(&signer1, &3u32);
+    let _ = client.multisig_approve(&signer2, &3u32);
+    let state = client.try_multisig_approve(&signer3, &3u32).unwrap().unwrap();
+
+    assert!(state.approved);
+    assert_eq!(state.approvals, 3);
+    assert_eq!(state.bitmap.count_ones(), 3);
+}
+
+/// Approval flow: idempotent — same signer approves twice, still counts as one.
+#[test]
+fn test_multisig_approval_idempotent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+
+    let signer1 = signers.get(0).unwrap();
+    let _ = client.multisig_approve(&signer1, &4u32);
+    let state = client.try_multisig_approve(&signer1, &4u32).unwrap().unwrap();
+
+    assert!(!state.approved);
+    assert_eq!(state.approvals, 1);
+}
+
+/// Auth: unregistered signer cannot approve.
+#[test]
+fn test_multisig_approval_unauthorized_signer_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _signers) = setup_multisig(&env, 2);
+
+    let impostor = Address::generate(&env);
+    let result = client.try_multisig_approve(&impostor, &5u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+/// Auth: require_auth fails when no auth provided.
+#[test]
+fn test_multisig_approval_no_auth_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+
+    let signer1 = signers.get(0).unwrap();
+    env.set_auths(&[]);
+    let result = client.try_multisig_approve(&signer1, &6u32);
+    assert!(result.is_err());
+    assert!(matches!(result, Err(Err(_))));
+}
+
+/// Query: is_multisig_approved returns correct state without mutation.
+#[test]
+fn test_is_multisig_approved_query() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 3);
+
+    let signer1 = signers.get(0).unwrap();
+    let signer2 = signers.get(1).unwrap();
+    let signer3 = signers.get(2).unwrap();
+
+    let state0 = client.try_is_multisig_approved(&7u32).unwrap().unwrap();
+    assert!(!state0.approved);
+    assert_eq!(state0.approvals, 0);
+
+    let _ = client.multisig_approve(&signer1, &7u32);
+    let state1 = client.try_is_multisig_approved(&7u32).unwrap().unwrap();
+    assert!(!state1.approved);
+    assert_eq!(state1.approvals, 1);
+
+    let _ = client.multisig_approve(&signer2, &7u32);
+    let _ = client.multisig_approve(&signer3, &7u32);
+    let state2 = client.try_is_multisig_approved(&7u32).unwrap().unwrap();
+    assert!(state2.approved);
+    assert_eq!(state2.approvals, 3);
+}
+
+/// Isolation: proposals have independent bitmaps.
+#[test]
+fn test_multisig_approval_proposal_isolation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+
+    let signer1 = signers.get(0).unwrap();
+    let _ = client.multisig_approve(&signer1, &10u32);
+
+    let state = client.try_is_multisig_approved(&20u32).unwrap().unwrap();
+    assert!(!state.approved);
+    assert_eq!(state.approvals, 0);
+}
+
+/// Admin: unauthorised caller cannot initialise multisig.
+#[test]
+fn test_multisig_approval_init_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _signers) = setup_multisig(&env, 2);
+
+    let impostor = Address::generate(&env);
+    let new_signers = vec![&env, impostor.clone()];
+    let result = client.try_multisig_approval_init(&impostor, &new_signers, &1u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
