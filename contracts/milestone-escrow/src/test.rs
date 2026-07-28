@@ -7318,6 +7318,7 @@ fn test_raise_dispute_zero_addresses_rejected_on_any_milestone() {
         let r2 = escrow.try_raise_dispute(&zero_contract, &idx);
         assert_eq!(r2, Err(Ok(Error::InvalidAddress)), "zero contract on milestone {}", idx);
     }
+}
 // resolve_dispute — strict state machine transition matrix (Issue #201)
 // ============================================================================
 //
