@@ -704,6 +704,7 @@ impl MilestoneEscrow {
         total.checked_add(amount).ok_or(Error::InvalidAmount)
     }
 
+    #[allow(dead_code)]
     fn checked_initialize_total(milestone_amounts: &Vec<i128>) -> Result<i128, Error> {
         if milestone_amounts.is_empty() {
             return Err(Error::InvalidAmount);
@@ -1639,8 +1640,19 @@ impl MilestoneEscrow {
 
         let mut milestone = Self::load_milestone(&env, milestone_index)?;
 
-        if milestone.status != MilestoneStatus::Disputed {
-            return Err(Error::InvalidStatus);
+        // Strict state machine: resolve_dispute may only run while the
+        // milestone is Disputed. Every other source status is rejected with
+        // InvalidStatus before any payment or status mutation occurs.
+        // Allowed transitions:
+        //   Disputed → Released  (release_to_freelancer = true)
+        //   Disputed → Refunded  (release_to_freelancer = false)
+        match milestone.status {
+            MilestoneStatus::Disputed => {}
+            MilestoneStatus::Pending
+            | MilestoneStatus::Delivered
+            | MilestoneStatus::PartiallyReleased
+            | MilestoneStatus::Released
+            | MilestoneStatus::Refunded => return Err(Error::InvalidStatus),
         }
 
         let remaining = milestone
