@@ -734,6 +734,7 @@ fn test_approve_milestone_zero_amount_fails() {
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 }
 
+#[test]
 fn test_raise_dispute_unauthorized_fails() {
     let env = Env::default();
     env.mock_all_auths();
@@ -871,7 +872,7 @@ fn test_resolve_dispute_wrong_status_fails() {
     client.fund(&client_addr);
 
     let result = client.try_resolve_dispute(&arbiter_addr, &0u32, &true);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
 }
 
 #[test]
@@ -2274,7 +2275,7 @@ fn test_extend_milestone_deadline_succeeds() {
     escrow.mark_delivered(&freelancer_addr, &0u32);
 
     let initial_time = escrow.time_until_auto_release(&0u32);
-    
+
     // Extend by 1000 seconds
     escrow.extend_milestone_deadline(&client_addr, &0u32, &1000u64);
 
@@ -5950,7 +5951,7 @@ fn test_multisig_transfer_admin_ratio_split_preserves_total() {
     assert_eq!(allocations.get(1).unwrap(), 33);
     assert_eq!(allocations.get(2).unwrap(), 33);
 
-    let total = allocations.iter().fold(0_i128, |acc, v| acc + v);
+    let total: i128 = allocations.iter().sum();
     assert_eq!(total, 100);
 }
 
@@ -5965,4 +5966,1039 @@ fn test_multisig_transfer_admin_invalid_ratio_fails() {
     let ratios = vec![&env, 0_i128, 0_i128];
     let result = client.try_multisig_transfer_admin(&100_i128, &ratios);
     assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+// ============================================================================
+// raise_dispute — comprehensive boundary / edge-case test suite (Issue #183)
+// ============================================================================
+//
+// These tests verify that raise_dispute enforces strict state machine
+// transitions, rejects unauthorised callers, and handles negative inputs
+// gracefully.
+
+/// State machine test 1 — raise_dispute on Released milestone must fail.
+#[test]
+fn test_raise_dispute_on_released_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.approve_milestone(&client_addr, &0u32);
+
+    let result = escrow.try_raise_dispute(&client_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// State machine test 2 — raise_dispute on Disputed milestone must fail.
+#[test]
+fn test_raise_dispute_on_disputed_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+
+    let result = escrow.try_raise_dispute(&freelancer_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// State machine test 3 — raise_dispute on Refunded milestone must fail.
+#[test]
+fn test_raise_dispute_on_refunded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.resolve_dispute(&arbiter_addr, &0u32, &false);
+
+    let result = escrow.try_raise_dispute(&client_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// Auth test — unauthorised caller (arbiter) must be rejected.
+#[test]
+fn test_raise_dispute_arbiter_is_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_client_addr, _freelancer_addr, arbiter_addr, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    let result = escrow.try_raise_dispute(&arbiter_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+/// Negative input — raise_dispute with a zero contract address fails.
+#[test]
+fn test_raise_dispute_zero_contract_address_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _freelancer_addr, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    let zero_contract = Address::from_str(
+        &env,
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+    );
+
+    let result = escrow.try_raise_dispute(&zero_contract, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
+}
+
+/// Negative input — raise_dispute before the escrow is funded fails.
+#[test]
+fn test_raise_dispute_before_funded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 1_000_i128];
+    escrow.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+
+    let result = escrow.try_raise_dispute(&client_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::NotFunded)));
+}
+
+/// Happy path — freelancer can raise a dispute from Pending status.
+#[test]
+fn test_raise_dispute_by_freelancer_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_client_addr, freelancer_addr, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.raise_dispute(&freelancer_addr, &0u32);
+
+    let job = escrow.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Disputed
+    );
+}
+
+/// Happy path — client can raise a dispute from PartiallyReleased status.
+#[test]
+fn test_raise_dispute_from_partially_released_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 5_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.approve_partial(&client_addr, &0u32, &2_000_i128);
+
+    escrow.raise_dispute(&client_addr, &0u32);
+
+    let job = escrow.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Disputed
+    );
+}
+
+/// Auth test — raise_dispute without auth must fail at host level.
+#[test]
+fn test_raise_dispute_no_auth_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, _, _, _, _, _, escrow) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    env.set_auths(&[]);
+
+    let result = escrow.try_raise_dispute(&client_addr, &0u32);
+    assert!(result.is_err());
+    assert!(matches!(result, Err(Err(_))));
+}
+
+// ============================================================================
+// multisig_approval — comprehensive unit test suite (Issue #184, #166)
+// ============================================================================
+
+/// Helper: register and initialise escrow (admin present) without multisig setup.
+fn setup_escrow_for_multisig(env: &Env) -> (MilestoneEscrowClient<'_>, Address) {
+    let admin = Address::generate(env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(env, &contract_id);
+
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let dummy_client = Address::generate(env);
+    let dummy_freelancer = Address::generate(env);
+    let dummy_arbiter = Address::generate(env);
+    let amounts = vec![env, 1_000_i128];
+
+    client.initialize(
+        &admin,
+        &dummy_client,
+        &dummy_freelancer,
+        &dummy_arbiter,
+        &token_id,
+        &604800,
+        &amounts,
+    );
+
+    (client, admin)
+}
+
+/// Helper: register a fresh contract and initialise multisig with three
+/// signers and a threshold of 2.
+fn setup_multisig(env: &Env, threshold: u32) -> (MilestoneEscrowClient<'_>, Address, Vec<Address>) {
+    let (client, admin) = setup_escrow_for_multisig(env);
+    let signer1 = Address::generate(env);
+    let signer2 = Address::generate(env);
+    let signer3 = Address::generate(env);
+    let signers = vec![env, signer1.clone(), signer2.clone(), signer3.clone()];
+
+    client.multisig_approval_init(&admin, &signers, &threshold);
+
+    (client, admin, signers)
+}
+
+/// Initialisation: a valid multisig setup with 3 signers and threshold 2
+/// must succeed and store the configuration.
+#[test]
+fn test_multisig_approval_init_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _signers) = setup_multisig(&env, 2);
+
+    let state = client.try_is_multisig_approved(&0u32).unwrap().unwrap();
+    assert!(!state.approved);
+    assert_eq!(state.approvals, 0);
+    assert_eq!(state.threshold, 2);
+}
+
+/// Initialisation: a second call to `multisig_approval_init` must be rejected
+/// with `AlreadyInitialized`.
+#[test]
+fn test_multisig_approval_init_duplicate_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _signers) = setup_multisig(&env, 2);
+
+    let extra = Address::generate(&env);
+    let new_signers = vec![&env, extra];
+    let result = client.try_multisig_approval_init(&admin, &new_signers, &1u32);
+    assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+}
+
+/// Initialisation: zero signers must be rejected.
+#[test]
+fn test_multisig_approval_init_zero_signers_fails() {
+    let env = env_without_snapshot();
+    env.mock_all_auths();
+
+    let (client, admin) = setup_escrow_for_multisig(&env);
+    let empty: Vec<Address> = Vec::new(&env);
+
+    let result = client.try_multisig_approval_init(&admin, &empty, &1u32);
+    assert_eq!(result, Err(Ok(Error::MultiSigNoSigners)));
+}
+
+/// Initialisation: threshold of 0 must be rejected.
+#[test]
+fn test_multisig_approval_init_zero_threshold_fails() {
+    let env = env_without_snapshot();
+    env.mock_all_auths();
+
+    let (client, admin) = setup_escrow_for_multisig(&env);
+    let signer = Address::generate(&env);
+    let signers = vec![&env, signer];
+
+    let result = client.try_multisig_approval_init(&admin, &signers, &0u32);
+    assert_eq!(result, Err(Ok(Error::MultiSigInvalidThreshold)));
+}
+
+/// Initialisation: threshold exceeding signer count must be rejected.
+#[test]
+fn test_multisig_approval_init_threshold_exceeds_signers_fails() {
+    let env = env_without_snapshot();
+    env.mock_all_auths();
+
+    let (client, admin) = setup_escrow_for_multisig(&env);
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+    let signers = vec![&env, signer1, signer2];
+
+    let result = client.try_multisig_approval_init(&admin, &signers, &3u32);
+    assert_eq!(result, Err(Ok(Error::MultiSigInvalidThreshold)));
+}
+
+/// Initialisation: more than 32 signers must be rejected.
+#[test]
+fn test_multisig_approval_init_too_many_signers_fails() {
+    let env = env_without_snapshot();
+    env.mock_all_auths();
+
+    let (client, admin) = setup_escrow_for_multisig(&env);
+    let mut signers = vec![&env];
+    for _ in 0..33 {
+        signers.push_back(Address::generate(&env));
+    }
+
+    let result = client.try_multisig_approval_init(&admin, &signers, &1u32);
+    assert_eq!(result, Err(Ok(Error::MultiSigTooManySigners)));
+}
+
+/// Initialisation: duplicate signer addresses must be rejected.
+#[test]
+fn test_multisig_approval_init_duplicate_signer_fails() {
+    let env = env_without_snapshot();
+    env.mock_all_auths();
+
+    let (client, admin) = setup_escrow_for_multisig(&env);
+    let signer = Address::generate(&env);
+    let signers = vec![&env, signer.clone(), signer];
+
+    let result = client.try_multisig_approval_init(&admin, &signers, &2u32);
+    assert_eq!(result, Err(Ok(Error::MultiSigDuplicateSigner)));
+}
+
+/// Approval flow: single signer approves, threshold (2) not yet reached.
+#[test]
+fn test_multisig_approval_partial_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+
+    let signer1 = signers.get(0).unwrap();
+    let state = client
+        .try_multisig_approve(&signer1, &1u32)
+        .unwrap()
+        .unwrap();
+
+    assert!(!state.approved);
+    assert_eq!(state.approvals, 1);
+    assert_eq!(state.threshold, 2);
+}
+
+/// Approval flow: two signers approve, threshold reached.
+#[test]
+fn test_multisig_approval_reaches_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+
+    let signer1 = signers.get(0).unwrap();
+    let signer2 = signers.get(1).unwrap();
+
+    let _ = client.multisig_approve(&signer1, &2u32);
+    let state = client
+        .try_multisig_approve(&signer2, &2u32)
+        .unwrap()
+        .unwrap();
+
+    assert!(state.approved);
+    assert_eq!(state.approvals, 2);
+    assert_eq!(state.threshold, 2);
+}
+
+/// Approval flow: all three signers approve, threshold exceeded.
+#[test]
+fn test_multisig_approval_exceeds_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+
+    let signer1 = signers.get(0).unwrap();
+    let signer2 = signers.get(1).unwrap();
+    let signer3 = signers.get(2).unwrap();
+
+    let _ = client.multisig_approve(&signer1, &3u32);
+    let _ = client.multisig_approve(&signer2, &3u32);
+    let state = client
+        .try_multisig_approve(&signer3, &3u32)
+        .unwrap()
+        .unwrap();
+
+    assert!(state.approved);
+    assert_eq!(state.approvals, 3);
+    assert_eq!(state.bitmap.count_ones(), 3);
+}
+
+/// Approval flow: idempotent — same signer approves twice, still counts as one.
+#[test]
+fn test_multisig_approval_idempotent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+
+    let signer1 = signers.get(0).unwrap();
+    let _ = client.multisig_approve(&signer1, &4u32);
+    let state = client
+        .try_multisig_approve(&signer1, &4u32)
+        .unwrap()
+        .unwrap();
+
+    assert!(!state.approved);
+    assert_eq!(state.approvals, 1);
+}
+
+/// Auth: unregistered signer cannot approve.
+#[test]
+fn test_multisig_approval_unauthorized_signer_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _signers) = setup_multisig(&env, 2);
+
+    let impostor = Address::generate(&env);
+    let result = client.try_multisig_approve(&impostor, &5u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+/// Auth: require_auth fails when no auth provided.
+#[test]
+fn test_multisig_approval_no_auth_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+
+    let signer1 = signers.get(0).unwrap();
+    env.set_auths(&[]);
+    let result = client.try_multisig_approve(&signer1, &6u32);
+    assert!(result.is_err());
+    assert!(matches!(result, Err(Err(_))));
+}
+
+/// Query: is_multisig_approved returns correct state without mutation.
+#[test]
+fn test_is_multisig_approved_query() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 3);
+
+    let signer1 = signers.get(0).unwrap();
+    let signer2 = signers.get(1).unwrap();
+    let signer3 = signers.get(2).unwrap();
+
+    let state0 = client.try_is_multisig_approved(&7u32).unwrap().unwrap();
+    assert!(!state0.approved);
+    assert_eq!(state0.approvals, 0);
+
+    let _ = client.multisig_approve(&signer1, &7u32);
+    let state1 = client.try_is_multisig_approved(&7u32).unwrap().unwrap();
+    assert!(!state1.approved);
+    assert_eq!(state1.approvals, 1);
+
+    let _ = client.multisig_approve(&signer2, &7u32);
+    let _ = client.multisig_approve(&signer3, &7u32);
+    let state2 = client.try_is_multisig_approved(&7u32).unwrap().unwrap();
+    assert!(state2.approved);
+    assert_eq!(state2.approvals, 3);
+}
+
+/// Isolation: proposals have independent bitmaps.
+#[test]
+fn test_multisig_approval_proposal_isolation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+
+    let signer1 = signers.get(0).unwrap();
+    let _ = client.multisig_approve(&signer1, &10u32);
+
+    let state = client.try_is_multisig_approved(&20u32).unwrap().unwrap();
+    assert!(!state.approved);
+    assert_eq!(state.approvals, 0);
+}
+
+/// Admin: unauthorised caller cannot initialise multisig.
+#[test]
+fn test_multisig_approval_init_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _signers) = setup_multisig(&env, 2);
+
+    let impostor = Address::generate(&env);
+    let new_signers = vec![&env, impostor.clone()];
+    let result = client.try_multisig_approval_init(&impostor, &new_signers, &1u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+// ============================================================================
+// milestone_time_extensions — ratio-split precision test suite (#218)
+// ============================================================================
+
+/// Precision test 1 — EXACT HALF (odd amount, rounds to nearest):
+/// 101 split at exactly 1/2 elapsed must give first=51, second=50.
+/// Verifies round-nearest rather than floor: 101 * 1 / 2 = 50.5 → 51.
+/// first + second must equal 101 exactly (no value lost).
+#[test]
+fn test_milestone_time_extensions_half_rounds_nearest() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.milestone_time_extensions(&101_i128, &1_i128, &2_i128);
+    assert_eq!(split.first, 51);
+    assert_eq!(split.second, 50);
+    assert_eq!(split.first + split.second, 101);
+}
+
+/// Precision test 2 — FULL ELAPSED (numerator == denominator):
+/// When elapsed == total the freelancer receives the full amount.
+/// first=amount, second=0, total preserved.
+#[test]
+fn test_milestone_time_extensions_full_elapsed_gives_full_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.milestone_time_extensions(&10_000_i128, &500_i128, &500_i128);
+    assert_eq!(split.first, 10_000);
+    assert_eq!(split.second, 0);
+    assert_eq!(split.first + split.second, 10_000);
+}
+
+/// Precision test 3 — ZERO ELAPSED (numerator == 0):
+/// When no time has elapsed the freelancer receives nothing.
+/// first=0, second=amount, total preserved.
+#[test]
+fn test_milestone_time_extensions_zero_elapsed_gives_nothing_to_freelancer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.milestone_time_extensions(&10_000_i128, &0_i128, &500_i128);
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 10_000);
+    assert_eq!(split.first + split.second, 10_000);
+}
+
+/// Precision test 4 — ZERO AMOUNT:
+/// A zero escrow balance splits to two zeros; no error, no value invented.
+#[test]
+fn test_milestone_time_extensions_zero_amount_splits_to_zeros() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.milestone_time_extensions(&0_i128, &1_i128, &3_i128);
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 0);
+}
+
+/// Precision test 5 — LARGE PRIME AMOUNT, ARBITRARY RATIO:
+/// 999_983 (prime) split 3/7 — verifies no value is created or destroyed.
+/// first = round_nearest(999_983 × 3 / 7) = round(428_564.14…) = 428_564
+/// second = 999_983 − 428_564 = 571_419
+#[test]
+fn test_milestone_time_extensions_large_prime_total_preserved() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amount = 999_983_i128;
+    let split = client.milestone_time_extensions(&amount, &3_i128, &7_i128);
+    assert_eq!(
+        split.first + split.second,
+        amount,
+        "total must be preserved"
+    );
+    // round_nearest(999983 * 3 / 7) = (2999949 + 3) / 7 = 2999952 / 7 = 428564
+    assert_eq!(split.first, 428_564);
+    assert_eq!(split.second, 571_419);
+}
+
+/// Precision test 6 — SINGLE STROOP AMOUNT:
+/// 1 stroop split at 1/3 elapsed: round_nearest(1 × 1 / 3) = (1 + 1) / 3 = 0
+/// → first=0, second=1. Verifies single-unit floor behaviour is correct.
+#[test]
+fn test_milestone_time_extensions_one_stroop_rounds_down() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.milestone_time_extensions(&1_i128, &1_i128, &3_i128);
+    assert_eq!(split.first + split.second, 1);
+    // round_nearest(1 * 1 / 3) = (1 + 1) / 3 = 0  (integer floor of 0.666)
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 1);
+}
+
+/// Precision test 7 — MANY SMALL SPLITS PRESERVE TOTAL:
+/// Split 1_000_000 into 7 equal parts using the ratio n/7 for n=1..7.
+/// Each consecutive split must share a boundary with the previous one so
+/// that the union covers exactly 1_000_000 with no gaps.
+#[test]
+fn test_milestone_time_extensions_sequential_splits_cover_total() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amount = 1_000_000_i128;
+    let parts: u32 = 7;
+    let mut prev_first = 0_i128;
+
+    for n in 1..=parts {
+        let split = client.milestone_time_extensions(&amount, &(n as i128), &(parts as i128));
+        // Each split must sum to the original amount.
+        assert_eq!(split.first + split.second, amount, "n={} total mismatch", n);
+        // first is monotonically non-decreasing as n increases.
+        assert!(
+            split.first >= prev_first,
+            "n={} first={} not >= prev={}",
+            n,
+            split.first,
+            prev_first
+        );
+        prev_first = split.first;
+    }
+
+    // At n == parts the freelancer receives the full amount.
+    assert_eq!(prev_first, amount);
+}
+
+/// Boundary guard — NEGATIVE AMOUNT:
+/// A negative escrow amount is invalid and must return Error::InvalidAmount.
+#[test]
+fn test_milestone_time_extensions_negative_amount_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(&-1_i128, &1_i128, &10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Boundary guard — ZERO TOTAL SECONDS:
+/// A total window of 0 seconds is division-by-zero; must return Error::InvalidRatio.
+#[test]
+fn test_milestone_time_extensions_zero_total_seconds_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(&1_000_i128, &0_i128, &0_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+/// Boundary guard — ELAPSED > TOTAL:
+/// Elapsed time cannot exceed the total window; must return Error::InvalidRatio.
+#[test]
+fn test_milestone_time_extensions_elapsed_exceeds_total_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(&1_000_i128, &11_i128, &10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+/// Boundary guard — NEGATIVE ELAPSED:
+/// Negative elapsed seconds are nonsensical; must return Error::InvalidRatio.
+#[test]
+fn test_milestone_time_extensions_negative_elapsed_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(&1_000_i128, &-1_i128, &10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+/// Boundary guard — NEGATIVE TOTAL SECONDS:
+/// A negative total window is invalid; must return Error::InvalidRatio.
+#[test]
+fn test_milestone_time_extensions_negative_total_seconds_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(&1_000_i128, &5_i128, &-10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+/// Overflow guard — AMOUNT * ELAPSED overflows i128:
+/// i128::MAX × i128::MAX overflows in checked_mul; must return Error::InvalidAmount.
+#[test]
+fn test_milestone_time_extensions_overflow_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(&i128::MAX, &i128::MAX, &i128::MAX);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+// ============================================================================
+// resolve_dispute — strict state machine transition matrix (Issue #201)
+// ============================================================================
+//
+// Permitted source status: Disputed only.
+// Valid transitions:
+//   Disputed → Released  (release_to_freelancer = true)
+//   Disputed → Refunded  (release_to_freelancer = false)
+// Every other source status must revert with Error::InvalidStatus and must
+// not mutate milestone status or transfer funds.
+
+/// Full transition matrix covering every MilestoneStatus as a source state.
+#[test]
+fn test_resolve_dispute_state_transition_matrix() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token = token::Client::new(&env, &token_contract_id);
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+    // Seven milestones: five invalid sources + two valid Disputed paths.
+    token_admin.mint(&client_addr, &7_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![
+        &env, 1_000_i128, 1_000_i128, 1_000_i128, 1_000_i128, 1_000_i128, 1_000_i128, 1_000_i128,
+    ];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+    client.fund(&client_addr);
+
+    // --- Invalid sources (must fail with InvalidStatus, status unchanged) ---
+
+    // 0: Pending → reject
+    let result = client.try_resolve_dispute(&arbiter_addr, &0u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Pending
+    );
+
+    // 1: Delivered → reject
+    client.mark_delivered(&freelancer_addr, &1u32);
+    let result = client.try_resolve_dispute(&arbiter_addr, &1u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(1).unwrap().status,
+        MilestoneStatus::Delivered
+    );
+
+    // 2: PartiallyReleased → reject
+    client.mark_delivered(&freelancer_addr, &2u32);
+    client.approve_partial(&client_addr, &2u32, &400_i128);
+    let result = client.try_resolve_dispute(&arbiter_addr, &2u32, &false);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(2).unwrap().status,
+        MilestoneStatus::PartiallyReleased
+    );
+
+    // 3: Released → reject
+    client.mark_delivered(&freelancer_addr, &3u32);
+    client.approve_milestone(&client_addr, &3u32);
+    let result = client.try_resolve_dispute(&arbiter_addr, &3u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(3).unwrap().status,
+        MilestoneStatus::Released
+    );
+
+    // 4: Refunded → reject (settled via prior dispute resolution)
+    client.mark_delivered(&freelancer_addr, &4u32);
+    client.raise_dispute(&client_addr, &4u32);
+    client.resolve_dispute(&arbiter_addr, &4u32, &false);
+    assert_eq!(
+        client.get_job().milestones.get(4).unwrap().status,
+        MilestoneStatus::Refunded
+    );
+    let result = client.try_resolve_dispute(&arbiter_addr, &4u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(4).unwrap().status,
+        MilestoneStatus::Refunded
+    );
+
+    // --- Valid sources ---
+
+    // 5: Disputed → Released
+    client.mark_delivered(&freelancer_addr, &5u32);
+    client.raise_dispute(&client_addr, &5u32);
+    client.resolve_dispute(&arbiter_addr, &5u32, &true);
+    assert_eq!(
+        client.get_job().milestones.get(5).unwrap().status,
+        MilestoneStatus::Released
+    );
+
+    // Re-resolve after Released must also fail (terminal status).
+    let result = client.try_resolve_dispute(&arbiter_addr, &5u32, &false);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(5).unwrap().status,
+        MilestoneStatus::Released
+    );
+
+    // 6: Disputed → Refunded
+    client.mark_delivered(&freelancer_addr, &6u32);
+    client.raise_dispute(&freelancer_addr, &6u32);
+    client.resolve_dispute(&arbiter_addr, &6u32, &false);
+    assert_eq!(
+        client.get_job().milestones.get(6).unwrap().status,
+        MilestoneStatus::Refunded
+    );
+
+    // Invalid transitions must not have paid out milestones 0–1.
+    // Milestone 2 paid 400 partial; 3 released 1000; 4 refunded 1000;
+    // 5 released 1000; 6 refunded 1000.
+    assert_eq!(token.balance(&freelancer_addr), 400 + 1_000 + 1_000);
+    assert_eq!(
+        client.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Pending
+    );
+    assert_eq!(
+        client.get_job().milestones.get(1).unwrap().status,
+        MilestoneStatus::Delivered
+    );
+}
+
+/// Invalid transition from Pending leaves balances and status untouched.
+#[test]
+fn test_resolve_dispute_from_pending_fails_without_side_effects() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, _, arbiter_addr, _, token_contract_id, contract_id, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let token = token::Client::new(&env, &token_contract_id);
+
+    let client_before = token.balance(&client_addr);
+    let contract_before = token.balance(&contract_id);
+
+    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        escrow.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Pending
+    );
+    assert_eq!(token.balance(&client_addr), client_before);
+    assert_eq!(token.balance(&contract_id), contract_before);
+}
+
+/// Invalid transition from Delivered returns deterministic InvalidStatus.
+#[test]
+fn test_resolve_dispute_from_delivered_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, freelancer_addr, arbiter_addr, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &false);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        escrow.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Delivered
+    );
+}
+
+/// Invalid transition from PartiallyReleased returns deterministic InvalidStatus.
+#[test]
+fn test_resolve_dispute_from_partially_released_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 2_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.approve_partial(&client_addr, &0u32, &500_i128);
+
+    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        escrow.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::PartiallyReleased
+    );
+}
+
+/// Invalid transition from Released returns deterministic InvalidStatus.
+#[test]
+fn test_resolve_dispute_from_released_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.approve_milestone(&client_addr, &0u32);
+
+    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        escrow.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Released
+    );
+}
+
+/// Invalid transition from Refunded returns deterministic InvalidStatus.
+#[test]
+fn test_resolve_dispute_from_refunded_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.resolve_dispute(&arbiter_addr, &0u32, &false);
+
+    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        escrow.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Refunded
+    );
+}
+
+/// Valid: Disputed → Released preserves payout and authorization rules.
+#[test]
+fn test_resolve_dispute_from_disputed_to_released_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, arbiter_addr, _, token_contract_id, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let token = token::Client::new(&env, &token_contract_id);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.resolve_dispute(&arbiter_addr, &0u32, &true);
+
+    let job = escrow.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Released
+    );
+    assert_eq!(job.milestones.get(0).unwrap().released_amount, 1_000);
+    assert_eq!(token.balance(&freelancer_addr), 1_000);
+}
+
+/// Valid: Disputed → Refunded preserves refund payment logic.
+#[test]
+fn test_resolve_dispute_from_disputed_to_refunded_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, arbiter_addr, _, token_contract_id, contract_id, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let token = token::Client::new(&env, &token_contract_id);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.resolve_dispute(&arbiter_addr, &0u32, &false);
+
+    let job = escrow.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Refunded
+    );
+    assert_eq!(token.balance(&client_addr), 1_000);
+    assert_eq!(token.balance(&contract_id), 0);
+    assert_eq!(token.balance(&freelancer_addr), 0);
+}
+
+/// Authorization is preserved: non-arbiter callers are still rejected.
+#[test]
+fn test_resolve_dispute_unauthorized_still_fails_after_state_machine() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+
+    let result = escrow.try_resolve_dispute(&client_addr, &0u32, &true);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(
+        escrow.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Disputed
+    );
 }
