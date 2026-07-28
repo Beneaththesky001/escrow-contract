@@ -2329,7 +2329,7 @@ fn test_extend_milestone_deadline_succeeds() {
     escrow.mark_delivered(&freelancer_addr, &0u32);
 
     let initial_time = escrow.time_until_auto_release(&0u32);
-    
+
     // Extend by 1000 seconds
     escrow.extend_milestone_deadline(&client_addr, &0u32, &1000u64);
 
@@ -6031,7 +6031,7 @@ fn test_multisig_transfer_admin_ratio_split_preserves_total() {
     assert_eq!(allocations.get(1).unwrap(), 33);
     assert_eq!(allocations.get(2).unwrap(), 33);
 
-    let total = allocations.iter().fold(0_i128, |acc, v| acc + v);
+    let total: i128 = allocations.iter().sum();
     assert_eq!(total, 100);
 }
 
@@ -6214,8 +6214,7 @@ fn test_raise_dispute_no_auth_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (client_addr, _, _, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let (client_addr, _, _, _, _, _, escrow) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
     env.set_auths(&[]);
 
@@ -6257,10 +6256,7 @@ fn setup_escrow_for_multisig(env: &Env) -> (MilestoneEscrowClient<'_>, Address) 
 
 /// Helper: register a fresh contract and initialise multisig with three
 /// signers and a threshold of 2.
-fn setup_multisig(
-    env: &Env,
-    threshold: u32,
-) -> (MilestoneEscrowClient<'_>, Address, Vec<Address>) {
+fn setup_multisig(env: &Env, threshold: u32) -> (MilestoneEscrowClient<'_>, Address, Vec<Address>) {
     let (client, admin) = setup_escrow_for_multisig(env);
     let signer1 = Address::generate(env);
     let signer2 = Address::generate(env);
@@ -6383,7 +6379,10 @@ fn test_multisig_approval_partial_approval() {
     let (client, _admin, signers) = setup_multisig(&env, 2);
 
     let signer1 = signers.get(0).unwrap();
-    let state = client.try_multisig_approve(&signer1, &1u32).unwrap().unwrap();
+    let state = client
+        .try_multisig_approve(&signer1, &1u32)
+        .unwrap()
+        .unwrap();
 
     assert!(!state.approved);
     assert_eq!(state.approvals, 1);
@@ -6402,7 +6401,10 @@ fn test_multisig_approval_reaches_threshold() {
     let signer2 = signers.get(1).unwrap();
 
     let _ = client.multisig_approve(&signer1, &2u32);
-    let state = client.try_multisig_approve(&signer2, &2u32).unwrap().unwrap();
+    let state = client
+        .try_multisig_approve(&signer2, &2u32)
+        .unwrap()
+        .unwrap();
 
     assert!(state.approved);
     assert_eq!(state.approvals, 2);
@@ -6423,7 +6425,10 @@ fn test_multisig_approval_exceeds_threshold() {
 
     let _ = client.multisig_approve(&signer1, &3u32);
     let _ = client.multisig_approve(&signer2, &3u32);
-    let state = client.try_multisig_approve(&signer3, &3u32).unwrap().unwrap();
+    let state = client
+        .try_multisig_approve(&signer3, &3u32)
+        .unwrap()
+        .unwrap();
 
     assert!(state.approved);
     assert_eq!(state.approvals, 3);
@@ -6440,7 +6445,10 @@ fn test_multisig_approval_idempotent() {
 
     let signer1 = signers.get(0).unwrap();
     let _ = client.multisig_approve(&signer1, &4u32);
-    let state = client.try_multisig_approve(&signer1, &4u32).unwrap().unwrap();
+    let state = client
+        .try_multisig_approve(&signer1, &4u32)
+        .unwrap()
+        .unwrap();
 
     assert!(!state.approved);
     assert_eq!(state.approvals, 1);
@@ -6617,7 +6625,11 @@ fn test_milestone_time_extensions_large_prime_total_preserved() {
 
     let amount = 999_983_i128;
     let split = client.milestone_time_extensions(&amount, &3_i128, &7_i128);
-    assert_eq!(split.first + split.second, amount, "total must be preserved");
+    assert_eq!(
+        split.first + split.second,
+        amount,
+        "total must be preserved"
+    );
     // round_nearest(999983 * 3 / 7) = (2999949 + 3) / 7 = 2999952 / 7 = 428564
     assert_eq!(split.first, 428_564);
     assert_eq!(split.second, 571_419);
@@ -6658,11 +6670,7 @@ fn test_milestone_time_extensions_sequential_splits_cover_total() {
     let mut prev_first = 0_i128;
 
     for n in 1..=parts {
-        let split = client.milestone_time_extensions(
-            &amount,
-            &(n as i128),
-            &(parts as i128),
-        );
+        let split = client.milestone_time_extensions(&amount, &(n as i128), &(parts as i128));
         // Each split must sum to the original amount.
         assert_eq!(split.first + split.second, amount, "n={} total mismatch", n);
         // first is monotonically non-decreasing as n increases.
@@ -6760,10 +6768,428 @@ fn test_milestone_time_extensions_overflow_fails() {
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let result = client.try_milestone_time_extensions(
-        &i128::MAX,
-        &i128::MAX,
-        &i128::MAX,
-    );
+    let result = client.try_milestone_time_extensions(&i128::MAX, &i128::MAX, &i128::MAX);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+// ── dispute_arbitration_split: allocation + storage-key footprint ─────────
+
+#[test]
+fn test_dispute_arbitration_split_full_client_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let allocation = client.dispute_arbitration_split(&10_000_i128, &10_000_u32);
+    assert_eq!(allocation.client_refund, 10_000);
+    assert_eq!(allocation.freelancer_payout, 0);
+    assert_eq!(allocation.client_refund_bps, 10_000);
+    assert_eq!(allocation.freelancer_payout_bps, 0);
+    assert_eq!(
+        allocation.client_refund + allocation.freelancer_payout,
+        10_000
+    );
+}
+
+#[test]
+fn test_dispute_arbitration_split_full_freelancer_payout() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let allocation = client.dispute_arbitration_split(&10_000_i128, &0_u32);
+    assert_eq!(allocation.client_refund, 0);
+    assert_eq!(allocation.freelancer_payout, 10_000);
+    assert_eq!(allocation.client_refund_bps, 0);
+    assert_eq!(allocation.freelancer_payout_bps, 10_000);
+}
+
+#[test]
+fn test_dispute_arbitration_split_50_50_preserves_total() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let allocation = client.dispute_arbitration_split(&101_i128, &5_000_u32);
+    assert_eq!(allocation.client_refund, 50);
+    assert_eq!(allocation.freelancer_payout, 51);
+    assert_eq!(allocation.client_refund + allocation.freelancer_payout, 101);
+}
+
+#[test]
+fn test_dispute_arbitration_split_rejects_bps_over_scale() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_dispute_arbitration_split(&1_000_i128, &10_001_u32);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+#[test]
+fn test_dispute_arbitration_split_rejects_negative_total() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_dispute_arbitration_split(&-1_i128, &5_000_u32);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_apply_dispute_arbitration_split_transfers_percentages() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 10_000_i128];
+    let (client_addr, freelancer_addr, arbiter_addr, _admin, token_id, escrow_addr, client) =
+        setup_funded_escrow(&env, amounts);
+
+    let token = token::Client::new(&env, &token_id);
+    assert_eq!(token.balance(&escrow_addr), 10_000);
+
+    client.mark_delivered(&freelancer_addr, &0u32);
+    client.raise_dispute(&client_addr, &0u32);
+
+    let client_before = token.balance(&client_addr);
+    let freelancer_before = token.balance(&freelancer_addr);
+
+    // 30% refund to client, 70% to freelancer
+    let allocation = client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &3_000_u32);
+
+    assert_eq!(allocation.client_refund, 3_000);
+    assert_eq!(allocation.freelancer_payout, 7_000);
+    assert_eq!(token.balance(&client_addr), client_before + 3_000);
+    assert_eq!(token.balance(&freelancer_addr), freelancer_before + 7_000);
+    assert_eq!(token.balance(&escrow_addr), 0);
+
+    let job = client.get_job();
+    let milestone = job.milestones.get(0).unwrap();
+    assert_eq!(milestone.status, MilestoneStatus::Released);
+    assert_eq!(milestone.released_amount, 7_000);
+}
+
+#[test]
+fn test_apply_dispute_arbitration_split_full_refund_status() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (client_addr, freelancer_addr, arbiter_addr, _admin, token_id, escrow_addr, client) =
+        setup_funded_escrow(&env, amounts);
+
+    let token = token::Client::new(&env, &token_id);
+
+    client.mark_delivered(&freelancer_addr, &0u32);
+    client.raise_dispute(&client_addr, &0u32);
+
+    let allocation = client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &10_000_u32);
+
+    assert_eq!(allocation.client_refund, 5_000);
+    assert_eq!(allocation.freelancer_payout, 0);
+    assert_eq!(token.balance(&client_addr), 5_000);
+    assert_eq!(token.balance(&freelancer_addr), 0);
+    assert_eq!(token.balance(&escrow_addr), 0);
+
+    let job = client.get_job();
+    let milestone = job.milestones.get(0).unwrap();
+    assert_eq!(milestone.status, MilestoneStatus::Refunded);
+}
+
+#[test]
+fn test_apply_dispute_arbitration_split_wrong_status_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (_client_addr, _freelancer, arbiter_addr, _admin, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    let result = client.try_apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5_000_u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+#[test]
+fn test_apply_dispute_arbitration_split_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (client_addr, freelancer_addr, _arbiter, _admin, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    client.mark_delivered(&freelancer_addr, &0u32);
+    client.raise_dispute(&client_addr, &0u32);
+
+    let result = client.try_apply_dispute_arbitration_split(&client_addr, &0u32, &5_000_u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+/// Storage-key footprint optimisation for `dispute_arbitration_split`:
+///
+/// After a successful apply, only the compact temporary key
+/// `ArbitrationSplitBps(milestone_index) → u32` is written.
+///
+/// Verifies (before vs after):
+/// - Key is keyed solely by `u32` milestone index (no Address payload)
+/// - Value is a single `u32` BPS (not a full `RefundAllocation`)
+/// - Entry lives in **temporary** storage (not persistent / instance)
+/// - Freelancer BPS is derived (`BPS_SCALE - stored`), not stored separately
+/// - Sibling milestones are not polluted (deterministic per-index access)
+#[test]
+fn test_dispute_arbitration_split_compact_temporary_storage_key() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 10_000_i128, 4_000_i128];
+    let (client_addr, freelancer_addr, arbiter_addr, _admin, _token, contract_id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    client.mark_delivered(&freelancer_addr, &0u32);
+    client.raise_dispute(&client_addr, &0u32);
+
+    // ── BEFORE: no arbitration-split footprint on any storage tier ─────────
+    let before = env.as_contract(&contract_id, || {
+        let temp: Option<u32> = env
+            .storage()
+            .temporary()
+            .get(&DataKey::ArbitrationSplitBps(0u32));
+        let persistent: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitrationSplitBps(0u32));
+        let instance: Option<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArbitrationSplitBps(0u32));
+        (temp, persistent, instance)
+    });
+    assert_eq!(before, (None, None, None));
+
+    let allocation = client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &3_000_u32);
+    assert_eq!(allocation.client_refund_bps, 3_000);
+    assert_eq!(allocation.freelancer_payout_bps, 7_000);
+
+    // ── AFTER: compact u32 lives only in temporary storage ─────────────────
+    let after = env.as_contract(&contract_id, || {
+        let temp: Option<u32> = env
+            .storage()
+            .temporary()
+            .get(&DataKey::ArbitrationSplitBps(0u32));
+        let persistent: Option<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitrationSplitBps(0u32));
+        let instance: Option<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArbitrationSplitBps(0u32));
+        let sibling: Option<u32> = env
+            .storage()
+            .temporary()
+            .get(&DataKey::ArbitrationSplitBps(1u32));
+        (temp, persistent, instance, sibling)
+    });
+    assert_eq!(after.0, Some(3_000)); // single u32 BPS value
+    assert_eq!(after.1, None); // not persistent
+    assert_eq!(after.2, None); // not instance
+    assert_eq!(after.3, None); // sibling milestone untouched
+
+    // Footprint comparison vs naïve layout (documented for reviewers):
+    //   naïve key:   (Address ≈ 32 B) + u32 index
+    //   naïve value: RefundAllocation = 2×i128 + 2×u32 ≈ 40 B
+    //   optimised:   key = u32 only; value = 1×u32 (4 B); temporary tier
+    // Stored value bytes after optimisation are exactly size_of::<u32>().
+    let stored_value_bytes = core::mem::size_of::<u32>();
+    let naive_value_bytes = core::mem::size_of::<i128>() * 2 + core::mem::size_of::<u32>() * 2;
+    assert_eq!(stored_value_bytes, 4);
+    assert!(stored_value_bytes < naive_value_bytes);
+    assert_eq!(naive_value_bytes / stored_value_bytes, 10);
+
+    // Functional outcome still holds alongside the compact signal.
+    let job = client.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Released
+    );
+    assert_eq!(
+        job.milestones.get(1).unwrap().status,
+        MilestoneStatus::Pending
+    );
+}
+
+/// Pure `dispute_arbitration_split` must not touch ledger storage at all.
+#[test]
+fn test_dispute_arbitration_split_pure_fn_writes_no_storage() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let _ = client.dispute_arbitration_split(&1_000_i128, &2_500_u32);
+
+    let written = env.as_contract(&contract_id, || {
+        env.storage()
+            .temporary()
+            .has(&DataKey::ArbitrationSplitBps(0u32))
+            || env
+                .storage()
+                .persistent()
+                .has(&DataKey::ArbitrationSplitBps(0u32))
+            || env
+                .storage()
+                .instance()
+                .has(&DataKey::ArbitrationSplitBps(0u32))
+    });
+    assert!(!written);
+}
+
+#[test]
+fn test_dispute_arbitration_split_workflow_matrix_bps_table() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let cases: [(i128, u32, i128, i128); 8] = [
+        (0, 0, 0, 0),
+        (0, 10_000, 0, 0),
+        (1, 0, 0, 1),
+        (1, 10_000, 1, 0),
+        (100, 2_500, 25, 75),
+        (100, 7_500, 75, 25),
+        (999, 3_333, 332, 667),
+        (1_000_000, 1, 100, 999_900),
+    ];
+
+    for (total, bps, expect_client, expect_freelancer) in cases {
+        let allocation = client.dispute_arbitration_split(&total, &bps);
+        assert_eq!(allocation.client_refund, expect_client);
+        assert_eq!(allocation.freelancer_payout, expect_freelancer);
+        assert_eq!(
+            allocation.client_refund + allocation.freelancer_payout,
+            total
+        );
+        assert_eq!(allocation.client_refund_bps, bps);
+        assert_eq!(allocation.freelancer_payout_bps, 10_000 - bps);
+    }
+}
+
+#[test]
+fn test_dispute_arbitration_split_workflow_matrix_apply_isolation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 4_000_i128, 6_000_i128];
+    let (client_addr, freelancer_addr, arbiter_addr, _admin, token_id, escrow_addr, client) =
+        setup_funded_escrow(&env, amounts);
+    let token = token::Client::new(&env, &token_id);
+
+    client.mark_delivered(&freelancer_addr, &0u32);
+    client.raise_dispute(&client_addr, &0u32);
+
+    let allocation = client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &2_500_u32);
+    assert_eq!(allocation.client_refund, 1_000);
+    assert_eq!(allocation.freelancer_payout, 3_000);
+    assert_eq!(token.balance(&client_addr), 1_000);
+    assert_eq!(token.balance(&freelancer_addr), 3_000);
+    assert_eq!(token.balance(&escrow_addr), 6_000);
+
+    let job = client.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Released
+    );
+    assert_eq!(
+        job.milestones.get(1).unwrap().status,
+        MilestoneStatus::Pending
+    );
+}
+
+#[test]
+fn test_dispute_arbitration_split_workflow_matrix_status_gates() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 2_000_i128];
+    let (client_addr, freelancer_addr, arbiter_addr, _admin, _token, _escrow, client) =
+        setup_funded_escrow(&env, amounts);
+
+    assert_eq!(
+        client.try_apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5_000_u32),
+        Err(Ok(Error::InvalidStatus))
+    );
+
+    client.mark_delivered(&freelancer_addr, &0u32);
+    assert_eq!(
+        client.try_apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5_000_u32),
+        Err(Ok(Error::InvalidStatus))
+    );
+
+    client.raise_dispute(&client_addr, &0u32);
+    let allocation = client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5_000_u32);
+    assert_eq!(allocation.client_refund, 1_000);
+    assert_eq!(allocation.freelancer_payout, 1_000);
+
+    assert_eq!(
+        client.try_apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5_000_u32),
+        Err(Ok(Error::InvalidStatus))
+    );
+}
+
+#[test]
+fn test_dispute_arbitration_split_workflow_matrix_auth_roles() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (client_addr, freelancer_addr, arbiter_addr, admin_addr, _token, _escrow, client) =
+        setup_funded_escrow(&env, amounts);
+
+    client.mark_delivered(&freelancer_addr, &0u32);
+    client.raise_dispute(&client_addr, &0u32);
+
+    for caller in [&client_addr, &freelancer_addr, &admin_addr] {
+        assert_eq!(
+            client.try_apply_dispute_arbitration_split(caller, &0u32, &5_000_u32),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    let allocation = client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &4_000_u32);
+    assert_eq!(allocation.client_refund, 400);
+    assert_eq!(allocation.freelancer_payout, 600);
+}
+
+#[test]
+fn test_dispute_arbitration_split_workflow_matrix_odd_amounts() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 7_i128];
+    let (client_addr, freelancer_addr, arbiter_addr, _admin, token_id, escrow_addr, client) =
+        setup_funded_escrow(&env, amounts);
+    let token = token::Client::new(&env, &token_id);
+
+    client.mark_delivered(&freelancer_addr, &0u32);
+    client.raise_dispute(&client_addr, &0u32);
+
+    let allocation = client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &3_333_u32);
+    assert_eq!(allocation.client_refund + allocation.freelancer_payout, 7);
+    assert_eq!(
+        token.balance(&client_addr) + token.balance(&freelancer_addr),
+        7
+    );
+    assert_eq!(token.balance(&escrow_addr), 0);
 }
