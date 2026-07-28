@@ -1873,16 +1873,64 @@ impl MilestoneEscrow {
 
     /// Pure refund-allocation algorithm for split-refund dispute claims.
     ///
-    /// Returns the exact amounts that should be transferred to the client
-    /// (refund) and freelancer (payout) for the given BPS split.  No storage
-    /// is touched — callers that need an on-ledger signal should use
-    /// [`Self::apply_dispute_arbitration_split`].
+    /// Split a disputed milestone amount between client and freelancer using
+    /// arbiter-specified basis points.
+    ///
+    /// The arbiter decides how much of the escrowed `total_amount` the
+    /// freelancer receives, expressed in basis points (1 bp = 0.01 %).
+    /// The client receives the remainder.  Both values are guaranteed to sum
+    /// exactly to `total_amount` because the client share is computed as
+    /// `total_amount - freelancer_share` rather than independently.
+    ///
+    /// # Parameters
+    /// * `total_amount`         – Total escrowed balance to distribute. Must be ≥ 0.
+    /// * `freelancer_bps`       – Basis points awarded to the freelancer. Range: 0 – 10_000.
+    ///                            0 → full refund to client, 10_000 → full release to freelancer.
+    ///
+    /// # Returns
+    /// A [`RefundAllocation`] with:
+    /// * `freelancer_payout`      = round_nearest(`total_amount` × `freelancer_bps` / 10_000)
+    /// * `client_refund`          = `total_amount` − `freelancer_payout`
+    /// * `freelancer_payout_bps`  = `freelancer_bps` (echoed for auditability)
+    /// * `client_refund_bps`      = 10_000 − `freelancer_bps`
+    ///
+    /// # Errors
+    /// * `InvalidAmount` – `total_amount` is negative, or an intermediate
+    ///                     multiplication overflows `i128`.
+    /// * `InvalidRatio`  – `freelancer_bps` exceeds 10_000.
     pub fn dispute_arbitration_split(
         _env: Env,
         total_amount: i128,
-        client_refund_bps: u32,
+        freelancer_bps: u32,
     ) -> Result<RefundAllocation, Error> {
-        Self::allocate_refund_by_bps(total_amount, client_refund_bps)
+        // Guard: total must be non-negative.
+        if total_amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        // Guard: basis points must be within [0, 10_000].
+        if freelancer_bps > BPS_SCALE {
+            return Err(Error::InvalidRatio);
+        }
+
+        // Use the shared split_round_nearest primitive for consistent rounding.
+        // numerator   = freelancer_bps
+        // denominator = BPS_SCALE (10_000)
+        let split = Self::split_round_nearest(
+            total_amount,
+            freelancer_bps as i128,
+            BPS_SCALE as i128,
+        )?;
+
+        let freelancer_payout = split.first;
+        let client_refund = split.second;
+        let client_refund_bps = BPS_SCALE - freelancer_bps;
+
+        Ok(RefundAllocation {
+            client_refund,
+            freelancer_payout,
+            client_refund_bps,
+            freelancer_payout_bps: freelancer_bps,
+        })
     }
 
     /// Apply a BPS split-refund to a disputed milestone and transfer funds.
