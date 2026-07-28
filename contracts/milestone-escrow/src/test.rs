@@ -2329,7 +2329,7 @@ fn test_extend_milestone_deadline_succeeds() {
     escrow.mark_delivered(&freelancer_addr, &0u32);
 
     let initial_time = escrow.time_until_auto_release(&0u32);
-    
+
     // Extend by 1000 seconds
     escrow.extend_milestone_deadline(&client_addr, &0u32, &1000u64);
 
@@ -6031,7 +6031,7 @@ fn test_multisig_transfer_admin_ratio_split_preserves_total() {
     assert_eq!(allocations.get(1).unwrap(), 33);
     assert_eq!(allocations.get(2).unwrap(), 33);
 
-    let total = allocations.iter().fold(0_i128, |acc, v| acc + v);
+    let total: i128 = allocations.iter().sum();
     assert_eq!(total, 100);
 }
 
@@ -6214,8 +6214,7 @@ fn test_raise_dispute_no_auth_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (client_addr, _, _, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let (client_addr, _, _, _, _, _, escrow) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
     env.set_auths(&[]);
 
@@ -6257,10 +6256,7 @@ fn setup_escrow_for_multisig(env: &Env) -> (MilestoneEscrowClient<'_>, Address) 
 
 /// Helper: register a fresh contract and initialise multisig with three
 /// signers and a threshold of 2.
-fn setup_multisig(
-    env: &Env,
-    threshold: u32,
-) -> (MilestoneEscrowClient<'_>, Address, Vec<Address>) {
+fn setup_multisig(env: &Env, threshold: u32) -> (MilestoneEscrowClient<'_>, Address, Vec<Address>) {
     let (client, admin) = setup_escrow_for_multisig(env);
     let signer1 = Address::generate(env);
     let signer2 = Address::generate(env);
@@ -6383,7 +6379,10 @@ fn test_multisig_approval_partial_approval() {
     let (client, _admin, signers) = setup_multisig(&env, 2);
 
     let signer1 = signers.get(0).unwrap();
-    let state = client.try_multisig_approve(&signer1, &1u32).unwrap().unwrap();
+    let state = client
+        .try_multisig_approve(&signer1, &1u32)
+        .unwrap()
+        .unwrap();
 
     assert!(!state.approved);
     assert_eq!(state.approvals, 1);
@@ -6402,7 +6401,10 @@ fn test_multisig_approval_reaches_threshold() {
     let signer2 = signers.get(1).unwrap();
 
     let _ = client.multisig_approve(&signer1, &2u32);
-    let state = client.try_multisig_approve(&signer2, &2u32).unwrap().unwrap();
+    let state = client
+        .try_multisig_approve(&signer2, &2u32)
+        .unwrap()
+        .unwrap();
 
     assert!(state.approved);
     assert_eq!(state.approvals, 2);
@@ -6423,7 +6425,10 @@ fn test_multisig_approval_exceeds_threshold() {
 
     let _ = client.multisig_approve(&signer1, &3u32);
     let _ = client.multisig_approve(&signer2, &3u32);
-    let state = client.try_multisig_approve(&signer3, &3u32).unwrap().unwrap();
+    let state = client
+        .try_multisig_approve(&signer3, &3u32)
+        .unwrap()
+        .unwrap();
 
     assert!(state.approved);
     assert_eq!(state.approvals, 3);
@@ -6440,7 +6445,10 @@ fn test_multisig_approval_idempotent() {
 
     let signer1 = signers.get(0).unwrap();
     let _ = client.multisig_approve(&signer1, &4u32);
-    let state = client.try_multisig_approve(&signer1, &4u32).unwrap().unwrap();
+    let state = client
+        .try_multisig_approve(&signer1, &4u32)
+        .unwrap()
+        .unwrap();
 
     assert!(!state.approved);
     assert_eq!(state.approvals, 1);
@@ -6617,7 +6625,11 @@ fn test_milestone_time_extensions_large_prime_total_preserved() {
 
     let amount = 999_983_i128;
     let split = client.milestone_time_extensions(&amount, &3_i128, &7_i128);
-    assert_eq!(split.first + split.second, amount, "total must be preserved");
+    assert_eq!(
+        split.first + split.second,
+        amount,
+        "total must be preserved"
+    );
     // round_nearest(999983 * 3 / 7) = (2999949 + 3) / 7 = 2999952 / 7 = 428564
     assert_eq!(split.first, 428_564);
     assert_eq!(split.second, 571_419);
@@ -6658,11 +6670,7 @@ fn test_milestone_time_extensions_sequential_splits_cover_total() {
     let mut prev_first = 0_i128;
 
     for n in 1..=parts {
-        let split = client.milestone_time_extensions(
-            &amount,
-            &(n as i128),
-            &(parts as i128),
-        );
+        let split = client.milestone_time_extensions(&amount, &(n as i128), &(parts as i128));
         // Each split must sum to the original amount.
         assert_eq!(split.first + split.second, amount, "n={} total mismatch", n);
         // first is monotonically non-decreasing as n increases.
@@ -6760,10 +6768,390 @@ fn test_milestone_time_extensions_overflow_fails() {
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let result = client.try_milestone_time_extensions(
-        &i128::MAX,
-        &i128::MAX,
-        &i128::MAX,
-    );
+    let result = client.try_milestone_time_extensions(&i128::MAX, &i128::MAX, &i128::MAX);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+// ============================================================================
+// escrow_interest_yield — validation requirements (#205)
+// ============================================================================
+
+/// Invalid configuration — RATE ABOVE 100 %:
+/// Rates greater than 10_000 bps are an unsupported configuration and must be
+/// rejected immediately with `Error::InvalidRatio` before any arithmetic runs.
+#[test]
+fn test_escrow_interest_yield_rate_above_max_bps_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&1_000_000_i128, &10_001_i128, &86_400_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+/// Boundary value — RATE EXACTLY 100 %:
+/// 10_000 bps is the inclusive upper bound and must succeed.
+#[test]
+fn test_escrow_interest_yield_rate_at_max_bps_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    // principal=1_000_000, rate=100%, duration=1 year → yield=1_000_000
+    let yield_amount =
+        client.escrow_interest_yield(&1_000_000_i128, &10_000_i128, &31_536_000_i128);
+    assert_eq!(yield_amount, 1_000_000_i128);
+}
+
+/// Boundary value — RATE OF 1 BPS:
+/// The smallest positive rate must be accepted (successful path).
+#[test]
+fn test_escrow_interest_yield_rate_one_bps_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let yield_amount =
+        client.escrow_interest_yield(&315_360_000_000_i128, &1_i128, &31_536_000_i128);
+    assert_eq!(yield_amount, 31_536_000_i128);
+}
+
+/// Zero-balance guard — ZERO PRINCIPAL:
+/// A principal of exactly 0 must be rejected with `Error::InvalidAmount`.
+#[test]
+fn test_escrow_interest_yield_zero_principal_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&0_i128, &500_i128, &86400_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Zero-balance guard — NEGATIVE PRINCIPAL.
+#[test]
+fn test_escrow_interest_yield_negative_principal_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&-1_000_i128, &500_i128, &86400_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Invalid range — ZERO ANNUAL RATE.
+#[test]
+fn test_escrow_interest_yield_zero_rate_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&10_000_i128, &0_i128, &86400_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Invalid range — NEGATIVE ANNUAL RATE.
+#[test]
+fn test_escrow_interest_yield_negative_rate_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&10_000_i128, &-500_i128, &86400_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Invalid range — ZERO DURATION.
+#[test]
+fn test_escrow_interest_yield_zero_duration_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&10_000_i128, &500_i128, &0_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Invalid range — NEGATIVE DURATION.
+#[test]
+fn test_escrow_interest_yield_negative_duration_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&10_000_i128, &500_i128, &-86400_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Overflow guard — PRINCIPAL * RATE overflows i128.
+#[test]
+fn test_escrow_interest_yield_overflow_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    // rate must pass the ≤ 10_000 check; overflow via principal * duration instead
+    let result = client.try_escrow_interest_yield(&i128::MAX, &1_i128, &i128::MAX);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Successful execution — one year at 5 %.
+#[test]
+fn test_escrow_interest_yield_one_year_five_percent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let yield_amount = client.escrow_interest_yield(&1_000_000_i128, &500_i128, &31_536_000_i128);
+    assert_eq!(yield_amount, 50_000_i128);
+}
+
+/// Successful execution — one day at 10 %.
+#[test]
+fn test_escrow_interest_yield_one_day_ten_percent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let yield_amount = client.escrow_interest_yield(&10_000_000_i128, &1000_i128, &86_400_i128);
+    assert_eq!(yield_amount, 2739_i128);
+}
+
+/// All-zero inputs — principal guard fires first with InvalidAmount.
+#[test]
+fn test_escrow_interest_yield_all_zeros_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_escrow_interest_yield(&0_i128, &0_i128, &0_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Error type verification — distinct error codes for amount vs ratio failures.
+#[test]
+fn test_escrow_interest_yield_error_types_are_descriptive() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.try_escrow_interest_yield(&0_i128, &500_i128, &86400_i128),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        client.try_escrow_interest_yield(&1_000_i128, &10_001_i128, &86400_i128),
+        Err(Ok(Error::InvalidRatio))
+    );
+    assert_eq!(
+        client.try_escrow_interest_yield(&1_000_i128, &-1_i128, &86400_i128),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+/// Missing configuration — get/lock before set returns NotInitialized.
+#[test]
+fn test_escrow_interest_yield_get_before_set_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    assert_eq!(
+        client.try_get_escrow_interest_yield(),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        client.try_lock_escrow_interest_yield(&admin_addr),
+        Err(Ok(Error::NotInitialized))
+    );
+    assert_eq!(
+        client.try_is_escrow_interest_yield_locked(),
+        Err(Ok(Error::NotInitialized))
+    );
+}
+
+/// Invalid configuration — share BPS that do not sum to 10_000.
+#[test]
+fn test_escrow_interest_yield_set_rejects_invalid_bps() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    assert_eq!(
+        client.try_set_escrow_interest_yield(&admin_addr, &4_000_u32, &5_000_u32),
+        Err(Ok(Error::InvalidRatio))
+    );
+    assert_eq!(
+        client.try_set_escrow_interest_yield(&admin_addr, &0_u32, &0_u32),
+        Err(Ok(Error::InvalidRatio))
+    );
+    assert_eq!(
+        client.try_set_escrow_interest_yield(&admin_addr, &10_001_u32, &0_u32),
+        Err(Ok(Error::InvalidRatio))
+    );
+}
+
+/// Successful configuration — valid equal shares persist and can be read back.
+#[test]
+fn test_escrow_interest_yield_set_valid_config_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    client.set_escrow_interest_yield(&admin_addr, &4_000_u32, &6_000_u32);
+    let state = client.get_escrow_interest_yield();
+    assert_eq!(state.client_share_bps, 4_000);
+    assert_eq!(state.freelancer_share_bps, 6_000);
+    assert!(!state.locked);
+    assert!(!client.is_escrow_interest_yield_locked());
+}
+
+/// Boundary configuration — 0 / 10_000 and 10_000 / 0 are valid extremes.
+#[test]
+fn test_escrow_interest_yield_set_boundary_shares_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    client.set_escrow_interest_yield(&admin_addr, &0_u32, &10_000_u32);
+    let state = client.get_escrow_interest_yield();
+    assert_eq!(state.client_share_bps, 0);
+    assert_eq!(state.freelancer_share_bps, 10_000);
+
+    client.set_escrow_interest_yield(&admin_addr, &10_000_u32, &0_u32);
+    let state = client.get_escrow_interest_yield();
+    assert_eq!(state.client_share_bps, 10_000);
+    assert_eq!(state.freelancer_share_bps, 0);
+}
+
+/// Lock blocks modifications with EscrowLocked.
+#[test]
+fn test_escrow_interest_yield_lock_blocks_modifications() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    client.set_escrow_interest_yield(&admin_addr, &4_000_u32, &6_000_u32);
+    client.lock_escrow_interest_yield(&admin_addr);
+    assert!(client.is_escrow_interest_yield_locked());
+
+    let blocked = client.try_set_escrow_interest_yield(&admin_addr, &5_000_u32, &5_000_u32);
+    assert_eq!(blocked, Err(Ok(Error::EscrowLocked)));
+
+    let state = client.get_escrow_interest_yield();
+    assert_eq!(state.client_share_bps, 4_000);
+    assert_eq!(state.freelancer_share_bps, 6_000);
+    assert!(state.locked);
+}
+
+/// Unlock restores the successful modification path.
+#[test]
+fn test_escrow_interest_yield_unlock_allows_modifications() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    client.set_escrow_interest_yield(&admin_addr, &3_000_u32, &7_000_u32);
+    client.lock_escrow_interest_yield(&admin_addr);
+    client.unlock_escrow_interest_yield(&admin_addr);
+    assert!(!client.is_escrow_interest_yield_locked());
+
+    client.set_escrow_interest_yield(&admin_addr, &5_000_u32, &5_000_u32);
+    let state = client.get_escrow_interest_yield();
+    assert_eq!(state.client_share_bps, 5_000);
+    assert_eq!(state.freelancer_share_bps, 5_000);
+    assert!(!state.locked);
+}
+
+/// Auth — lock/unlock/set require the stored admin.
+#[test]
+fn test_escrow_interest_yield_lock_requires_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (client_addr, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    client.set_escrow_interest_yield(&admin_addr, &5_000_u32, &5_000_u32);
+    assert_eq!(
+        client.try_lock_escrow_interest_yield(&client_addr),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_unlock_escrow_interest_yield(&client_addr),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_set_escrow_interest_yield(&client_addr, &6_000_u32, &4_000_u32),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+/// admin_set_yield_rate — invalid range rejected with InvalidRatio.
+#[test]
+fn test_escrow_interest_yield_admin_rate_rejects_invalid_bps() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_000_i128];
+    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    assert_eq!(
+        client.try_admin_set_yield_rate(&admin_addr, &10_001_u32),
+        Err(Ok(Error::InvalidRatio))
+    );
+
+    // Boundary: 10_000 succeeds; 0 (disable) succeeds.
+    client.admin_set_yield_rate(&admin_addr, &10_000_u32);
+    client.admin_set_yield_rate(&admin_addr, &0_u32);
+    let (rate, _accrued, _paused) = client.get_yield_info();
+    assert_eq!(rate, 0);
 }

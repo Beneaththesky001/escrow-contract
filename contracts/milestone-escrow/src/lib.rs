@@ -37,6 +37,13 @@ pub enum Error {
 
 const BPS_SCALE: u32 = 10_000;
 
+/// Seconds in a standard Gregorian year (365 days). Used by the simple-interest
+/// estimator in `escrow_interest_yield`.
+const SECONDS_PER_YEAR: i128 = 31_536_000;
+
+/// Basis-point denominator for interest math (`1 bp = 1 / 10_000`).
+const BPS_DENOMINATOR: i128 = 10_000;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MilestoneStatus {
@@ -116,6 +123,10 @@ pub enum DataKey {
     /// flag has no further use.
     MilestoneReleased(u32),
     Reputation(Address),
+    /// Instance: client/freelancer yield-share configuration and execution lock
+    /// for the `escrow_interest_yield` module. Written by
+    /// `set_escrow_interest_yield`; read by getters and lock/unlock helpers.
+    InterestYieldState,
     // ── escrow_interest_yield admin-override keys ────────────────────────────
     /// Persistent: annual yield rate expressed in basis points (1 bp = 0.01 %).
     /// Range 0–10 000 (0 %–100 %).  Written by `admin_set_yield_rate`, read by
@@ -284,6 +295,20 @@ pub struct TokenRemovedEvent {
 pub struct RatioSplit {
     pub first: i128,
     pub second: i128,
+}
+
+/// Escrow interest/yield share configuration with an execution lock.
+///
+/// `client_share_bps + freelancer_share_bps` must equal `BPS_SCALE` (10_000).
+/// When `locked` is true, share modifications via `set_escrow_interest_yield`
+/// are rejected until an admin unlocks the state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowInterestYieldState {
+    pub client_share_bps: u32,
+    pub freelancer_share_bps: u32,
+    /// When true, share modifications are blocked until unlocked.
+    pub locked: bool,
 }
 
 #[contracttype]
@@ -487,6 +512,75 @@ impl MilestoneEscrow {
         Ok(())
     }
 
+    /// Validate estimator inputs for `escrow_interest_yield`.
+    ///
+    /// Rejects zero/negative principal, rate, or duration immediately, and
+    /// rejects rates above 100 % (`BPS_SCALE`) as an unsupported configuration.
+    fn validate_interest_yield_params(
+        principal: i128,
+        annual_rate_bps: i128,
+        duration_seconds: i128,
+    ) -> Result<(), Error> {
+        if principal <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if annual_rate_bps <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if annual_rate_bps > BPS_DENOMINATOR {
+            return Err(Error::InvalidRatio);
+        }
+        if duration_seconds <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        Ok(())
+    }
+
+    /// Validate stored yield-share configuration: both shares must be finite and
+    /// sum exactly to `BPS_SCALE` (10_000).
+    fn validate_interest_yield_share_config(
+        client_share_bps: u32,
+        freelancer_share_bps: u32,
+    ) -> Result<(), Error> {
+        let total = client_share_bps
+            .checked_add(freelancer_share_bps)
+            .ok_or(Error::InvalidRatio)?;
+        if total != BPS_SCALE {
+            return Err(Error::InvalidRatio);
+        }
+        Ok(())
+    }
+
+    /// Validate an admin-configured annual yield rate in basis points.
+    /// `0` is allowed (disables accrual); values above `BPS_SCALE` are rejected.
+    fn validate_yield_rate_bps(rate_bps: u32) -> Result<(), Error> {
+        if rate_bps > BPS_SCALE {
+            return Err(Error::InvalidRatio);
+        }
+        Ok(())
+    }
+
+    fn load_interest_yield_state(env: &Env) -> Result<EscrowInterestYieldState, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::InterestYieldState)
+            .ok_or(Error::NotInitialized)
+    }
+
+    fn store_interest_yield_state(env: &Env, state: &EscrowInterestYieldState) {
+        env.storage()
+            .instance()
+            .set(&DataKey::InterestYieldState, state);
+    }
+
+    fn ensure_interest_yield_unlocked(env: &Env) -> Result<(), Error> {
+        let state = Self::load_interest_yield_state(env)?;
+        if state.locked {
+            return Err(Error::EscrowLocked);
+        }
+        Ok(())
+    }
+
     fn split_round_nearest(
         total: i128,
         numerator: i128,
@@ -569,8 +663,6 @@ impl MilestoneEscrow {
             .unwrap_or(0)
     }
 
-
-
     /// Check whether `approve_milestone` has marked the given milestone index
     /// as fully released via the temporary completion flag.  Returns `false`
     /// if the flag was never written or has been evicted.
@@ -613,7 +705,7 @@ impl MilestoneEscrow {
     }
 
     fn checked_initialize_total(milestone_amounts: &Vec<i128>) -> Result<i128, Error> {
-        if milestone_amounts.len() == 0 {
+        if milestone_amounts.is_empty() {
             return Err(Error::InvalidAmount);
         }
 
@@ -717,9 +809,7 @@ impl MilestoneEscrow {
         Self::validate_address(&env, &token)?;
 
         let milestone_count = milestone_amounts.len();
-        if milestone_count == 0 {
-            return Err(Error::InvalidAmount);
-        }
+        let total_amount = Self::checked_initialize_total(&milestone_amounts)?;
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -744,12 +834,10 @@ impl MilestoneEscrow {
             return Err(Error::InvalidAmount);
         }
 
-        let mut total_amount: i128 = 0;
         for index in 0..milestone_count {
             let amount = milestone_amounts
                 .get(index)
                 .ok_or(Error::InvalidMilestone)?;
-            total_amount = Self::checked_add_amount(total_amount, amount)?;
             Self::store_milestone(
                 &env,
                 index,
@@ -1117,7 +1205,9 @@ impl MilestoneEscrow {
         }
 
         let milestone = Self::load_milestone(&env, milestone_index)?;
-        if milestone.status != MilestoneStatus::Delivered && milestone.status != MilestoneStatus::PartiallyReleased {
+        if milestone.status != MilestoneStatus::Delivered
+            && milestone.status != MilestoneStatus::PartiallyReleased
+        {
             return Err(Error::InvalidStatus);
         }
 
@@ -1126,11 +1216,14 @@ impl MilestoneEscrow {
         }
 
         let current_extension = Self::load_time_extension(&env, milestone_index);
-        let new_extension = current_extension.checked_add(extra_seconds).ok_or(Error::InvalidExtension)?;
+        let new_extension = current_extension
+            .checked_add(extra_seconds)
+            .ok_or(Error::InvalidExtension)?;
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::MilestoneTimeExtension(milestone_index), &new_extension);
+        env.storage().persistent().set(
+            &DataKey::MilestoneTimeExtension(milestone_index),
+            &new_extension,
+        );
 
         env.events().publish(
             (symbol_short!("extend"),),
@@ -2254,7 +2347,10 @@ impl MilestoneEscrow {
 
     /// Query whether a proposal has reached the required approval threshold.
     /// Pure read — does not require auth and does not mutate state.
-    pub fn is_multisig_approved(env: Env, proposal_id: u32) -> Result<MultiSigApprovalState, Error> {
+    pub fn is_multisig_approved(
+        env: Env,
+        proposal_id: u32,
+    ) -> Result<MultiSigApprovalState, Error> {
         let threshold: u32 = env
             .storage()
             .instance()
@@ -2291,6 +2387,116 @@ impl MilestoneEscrow {
             .persistent()
             .get(&DataKey::Reputation(address))
             .unwrap_or(0)
+    }
+
+    // ── escrow_interest_yield: estimator + share-config validation ────────────
+
+    /// Estimate the interest yield that would accrue on an escrowed balance
+    /// over a given duration, using a simple-interest model.
+    ///
+    /// # Parameters
+    /// * `principal`         – Balance (token stroops) on which interest is
+    ///                         calculated. Must be > 0.
+    /// * `annual_rate_bps`   – Annual interest rate in basis points
+    ///                         (1 bp = 0.01 %). Must satisfy
+    ///                         `0 < annual_rate_bps ≤ 10_000`.
+    /// * `duration_seconds`  – Accrual window in seconds. Must be > 0.
+    ///
+    /// # Formula
+    /// ```text
+    /// yield = principal * annual_rate_bps * duration_seconds
+    ///         / (10_000 * SECONDS_PER_YEAR)
+    /// ```
+    ///
+    /// # Errors
+    /// * `InvalidAmount` – Zero/negative principal, rate, or duration, or an
+    ///                     intermediate checked multiplication overflows.
+    /// * `InvalidRatio`  – `annual_rate_bps` exceeds 10_000 (unsupported).
+    pub fn escrow_interest_yield(
+        _env: Env,
+        principal: i128,
+        annual_rate_bps: i128,
+        duration_seconds: i128,
+    ) -> Result<i128, Error> {
+        Self::validate_interest_yield_params(principal, annual_rate_bps, duration_seconds)?;
+
+        let numerator = principal
+            .checked_mul(annual_rate_bps)
+            .ok_or(Error::InvalidAmount)?
+            .checked_mul(duration_seconds)
+            .ok_or(Error::InvalidAmount)?;
+
+        let denominator = BPS_DENOMINATOR
+            .checked_mul(SECONDS_PER_YEAR)
+            .ok_or(Error::InvalidAmount)?;
+
+        numerator
+            .checked_div(denominator)
+            .ok_or(Error::InvalidAmount)
+    }
+
+    /// Initialize or update interest/yield share configuration (unlocked by
+    /// default on first write). Rejects invalid share totals and modifications
+    /// while an execution lock is held.
+    ///
+    /// # Errors
+    /// * `NotInitialized` – Contract admin key is missing.
+    /// * `Unauthorized`   – Caller is not the stored admin.
+    /// * `InvalidRatio`   – Shares do not sum to exactly 10_000 bps.
+    /// * `EscrowLocked`   – Configuration is locked for execution.
+    pub fn set_escrow_interest_yield(
+        env: Env,
+        admin: Address,
+        client_share_bps: u32,
+        freelancer_share_bps: u32,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        Self::validate_interest_yield_share_config(client_share_bps, freelancer_share_bps)?;
+
+        if env.storage().instance().has(&DataKey::InterestYieldState) {
+            Self::ensure_interest_yield_unlocked(&env)?;
+        }
+
+        Self::store_interest_yield_state(
+            &env,
+            &EscrowInterestYieldState {
+                client_share_bps,
+                freelancer_share_bps,
+                locked: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Lock interest/yield share state during pending execution.
+    pub fn lock_escrow_interest_yield(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        let mut state = Self::load_interest_yield_state(&env)?;
+        state.locked = true;
+        Self::store_interest_yield_state(&env, &state);
+        Ok(())
+    }
+
+    /// Clear the execution lock so share configuration can be modified again.
+    pub fn unlock_escrow_interest_yield(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        let mut state = Self::load_interest_yield_state(&env)?;
+        state.locked = false;
+        Self::store_interest_yield_state(&env, &state);
+        Ok(())
+    }
+
+    /// Return whether the interest/yield share configuration is locked.
+    pub fn is_escrow_interest_yield_locked(env: Env) -> Result<bool, Error> {
+        Ok(Self::load_interest_yield_state(&env)?.locked)
+    }
+
+    /// Return the stored interest/yield share configuration.
+    ///
+    /// # Errors
+    /// * `NotInitialized` – Configuration has never been set.
+    pub fn get_escrow_interest_yield(env: Env) -> Result<EscrowInterestYieldState, Error> {
+        Self::load_interest_yield_state(&env)
     }
 }
 
@@ -2336,12 +2542,9 @@ impl MilestoneEscrow {
     /// * `Unauthorized`     – `admin` does not match the stored admin key.
     /// * `YieldRateInvalid` – `rate_bps` exceeds 10 000.
     pub fn admin_set_yield_rate(env: Env, admin: Address, rate_bps: u32) -> Result<(), Error> {
-        admin.require_auth();
+        // `require_admin` performs `admin.require_auth()` + stored-key check.
         Self::require_admin(&env, &admin)?;
-
-        if rate_bps > 10_000 {
-            return Err(Error::InvalidRatio);
-        }
+        Self::validate_yield_rate_bps(rate_bps)?;
 
         let old_rate_bps: u32 = env
             .storage()
@@ -2390,7 +2593,6 @@ impl MilestoneEscrow {
         milestone_index: u32,
         accrued_amount: i128,
     ) -> Result<(), Error> {
-        admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
         let meta = Self::load_job_meta(&env)?;
@@ -2459,7 +2661,6 @@ impl MilestoneEscrow {
         admin: Address,
         milestone_index: u32,
     ) -> Result<(), Error> {
-        admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
         let meta = Self::load_job_meta(&env)?;
@@ -2546,7 +2747,6 @@ impl MilestoneEscrow {
         admin: Address,
         milestone_index: u32,
     ) -> Result<(), Error> {
-        admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
         let meta = Self::load_job_meta(&env)?;
@@ -2621,7 +2821,6 @@ impl MilestoneEscrow {
     /// * `NotInitialized` – Contract has not been initialised.
     /// * `Unauthorized`   – `admin` is not the stored admin.
     pub fn admin_pause_escrow(env: Env, admin: Address) -> Result<(), Error> {
-        admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
         let already_paused: bool = env
@@ -2659,7 +2858,6 @@ impl MilestoneEscrow {
     /// * `NotInitialized` – Contract has not been initialised.
     /// * `Unauthorized`   – `admin` is not the stored admin.
     pub fn admin_resume_escrow(env: Env, admin: Address) -> Result<(), Error> {
-        admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
         let currently_paused: bool = env
