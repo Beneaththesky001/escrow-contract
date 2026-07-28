@@ -150,6 +150,21 @@ pub enum DataKey {
     /// Key type: `u32` (the proposal index) — significantly smaller than a
     /// composite `(Address, u32)` alternative.
     MultiSigApproval(u32),
+    // ── dispute_arbitration_split compact storage keys ─────────────────────
+    /// Temporary: records the client-refund BPS applied by
+    /// `apply_dispute_arbitration_split` for a given milestone.
+    ///
+    /// Key type is only `u32` (the milestone index) — no `Address` payload —
+    /// so the ledger key footprint stays minimal compared to a composite
+    /// `(Address, u32)` alternative.  Presence of the entry signals that a
+    /// split was applied; the value is a single `u32` BPS rather than a full
+    /// `RefundAllocation` (2×i128 + 2×u32).  Freelancer BPS is derived as
+    /// `BPS_SCALE - value`, removing redundant stored bytes.  Uses temporary
+    /// storage so the footprint is auto-evicted after the dispute workflow.
+    ///
+    /// Appended at the end of `DataKey` so existing variant discriminants stay
+    /// stable (serialization compatibility for already-written ledger entries).
+    ArbitrationSplitBps(u32),
 }
 
 #[contracttype]
@@ -578,6 +593,31 @@ impl MilestoneEscrow {
             .temporary()
             .get::<_, bool>(&DataKey::MilestoneReleased(index))
             .unwrap_or(false)
+    }
+
+    /// Persist the applied client-refund BPS under the compact temporary key
+    /// `ArbitrationSplitBps(index)`.  Only a single `u32` is written — the
+    /// freelancer share is always `BPS_SCALE - client_refund_bps` and is never
+    /// stored separately.
+    fn store_arbitration_split_bps(env: &Env, index: u32, client_refund_bps: u32) {
+        env.storage()
+            .temporary()
+            .set(&DataKey::ArbitrationSplitBps(index), &client_refund_bps);
+    }
+
+    /// Read the compact arbitration-split BPS for `index` from temporary
+    /// storage.  Returns `None` if the entry was never written or was evicted.
+    fn load_arbitration_split_bps(env: &Env, index: u32) -> Option<u32> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::ArbitrationSplitBps(index))
+    }
+
+    /// Cheap presence check for whether an arbitration split has been applied
+    /// to `index`, without loading the full persistent `Milestone` entry.
+    #[allow(dead_code)]
+    fn is_arbitration_split_applied(env: &Env, index: u32) -> bool {
+        Self::load_arbitration_split_bps(env, index).is_some()
     }
 
     // ── pause guard ──────────────────────────────────────────────────────────
@@ -1617,6 +1657,202 @@ impl MilestoneEscrow {
         );
 
         Ok(())
+    }
+
+    // ── dispute_arbitration_split: storage-optimised key design ────────────
+    //
+    // Design rationale
+    // ─────────────────
+    // A naïve split-state layout would persist a full `RefundAllocation`
+    // (2×i128 + 2×u32) under Address-bearing keys such as
+    // `(arbiter: Address, milestone_index: u32)`.  On Soroban each Address
+    // contributes ~32 bytes to the ledger key footprint.
+    //
+    // This implementation uses three optimisations to minimise bytes stored:
+    //
+    // 1. **Key is only `u32`** (`ArbitrationSplitBps(milestone_index)`) —
+    //    no Address payload in the key.
+    //
+    // 2. **Value is a single `u32` BPS** — freelancer BPS is derived as
+    //    `BPS_SCALE - client_refund_bps`, so the second BPS field and both
+    //    i128 payout amounts are never written to storage (amounts live in
+    //    the persistent `Milestone` entry already required for settlement).
+    //
+    // 3. **Temporary storage tier** — the compact BPS signal is auto-evicted
+    //    after the dispute workflow ends rather than accruing persistent rent.
+    //
+    // Deterministic access: the same milestone index always maps to the same
+    // key; reads never require scanning Address-keyed maps.
+
+    /// Allocate a disputed amount into client refund vs freelancer payout by BPS.
+    ///
+    /// Uses floor division for the client share and assigns the remainder to the
+    /// freelancer so the two legs always sum exactly to `total_amount` (no value
+    /// is lost to rounding).
+    fn allocate_refund_by_bps(
+        total_amount: i128,
+        client_refund_bps: u32,
+    ) -> Result<RefundAllocation, Error> {
+        if total_amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if client_refund_bps > BPS_SCALE {
+            return Err(Error::InvalidRatio);
+        }
+
+        let scale = BPS_SCALE as i128;
+        let client_refund = total_amount
+            .checked_mul(client_refund_bps as i128)
+            .ok_or(Error::InvalidAmount)?
+            / scale;
+        let freelancer_payout = total_amount
+            .checked_sub(client_refund)
+            .ok_or(Error::InvalidAmount)?;
+
+        Ok(RefundAllocation {
+            client_refund,
+            freelancer_payout,
+            client_refund_bps,
+            freelancer_payout_bps: BPS_SCALE - client_refund_bps,
+        })
+    }
+
+    /// Pure refund-allocation algorithm for split-refund dispute claims.
+    ///
+    /// Returns the exact amounts that should be transferred to the client
+    /// (refund) and freelancer (payout) for the given BPS split.  No storage
+    /// is touched — callers that need an on-ledger signal should use
+    /// [`Self::apply_dispute_arbitration_split`].
+    pub fn dispute_arbitration_split(
+        _env: Env,
+        total_amount: i128,
+        client_refund_bps: u32,
+    ) -> Result<RefundAllocation, Error> {
+        Self::allocate_refund_by_bps(total_amount, client_refund_bps)
+    }
+
+    /// Apply a BPS split-refund to a disputed milestone and transfer funds.
+    ///
+    /// Client receives `client_refund_bps` of the remaining balance; freelancer
+    /// receives the remainder. Milestone ends `Refunded` when the freelancer
+    /// share is zero, otherwise `Released`.
+    ///
+    /// After a successful apply, a compact temporary entry
+    /// `ArbitrationSplitBps(milestone_index) → client_refund_bps` is written so
+    /// downstream readers can confirm the applied split without loading a full
+    /// `RefundAllocation` or an Address-keyed map.
+    pub fn apply_dispute_arbitration_split(
+        env: Env,
+        arbiter: Address,
+        milestone_index: u32,
+        client_refund_bps: u32,
+    ) -> Result<RefundAllocation, Error> {
+        Self::ensure_not_paused(&env)?;
+        let zero_account = Address::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        );
+        let zero_contract = Address::from_str(
+            &env,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        );
+
+        if arbiter == zero_account
+            || arbiter == zero_contract
+            || arbiter == env.current_contract_address()
+        {
+            return Err(Error::InvalidAddress);
+        }
+        arbiter.require_auth();
+
+        let meta = Self::load_job_meta(&env)?;
+        if meta.arbiter != arbiter {
+            return Err(Error::Unauthorized);
+        }
+        if !meta.funded {
+            return Err(Error::NotFunded);
+        }
+
+        let mut milestone = Self::load_milestone(&env, milestone_index)?;
+        if milestone.status != MilestoneStatus::Disputed {
+            return Err(Error::InvalidStatus);
+        }
+
+        let remaining = milestone
+            .amount
+            .checked_sub(milestone.released_amount)
+            .ok_or(Error::InvalidAmount)?;
+        if remaining <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let allocation = Self::allocate_refund_by_bps(remaining, client_refund_bps)?;
+
+        let token_client = token::Client::new(&env, &meta.token);
+        let contract_addr = env.current_contract_address();
+        let contract_balance = token_client.balance(&contract_addr);
+        if contract_balance <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Cap transfers to available contract balance while preserving the
+        // proportional split intent (client first, then freelancer remainder).
+        let client_refund = allocation.client_refund.min(contract_balance);
+        let freelancer_cap = contract_balance
+            .checked_sub(client_refund)
+            .ok_or(Error::InvalidAmount)?;
+        let freelancer_payout = allocation.freelancer_payout.min(freelancer_cap);
+
+        if client_refund > 0 {
+            token_client.transfer(&contract_addr, &meta.client, &client_refund);
+        }
+        if freelancer_payout > 0 {
+            token_client.transfer(&contract_addr, &meta.freelancer, &freelancer_payout);
+        }
+
+        milestone.released_amount = milestone
+            .released_amount
+            .checked_add(freelancer_payout)
+            .ok_or(Error::InvalidAmount)?;
+
+        if freelancer_payout == 0 {
+            milestone.status = MilestoneStatus::Refunded;
+        } else {
+            milestone.status = MilestoneStatus::Released;
+            Self::store_milestone_released(&env, milestone_index);
+            Self::increment_reputation(&env, &meta.client);
+            Self::increment_reputation(&env, &meta.freelancer);
+        }
+
+        Self::store_milestone(&env, milestone_index, &milestone);
+
+        // Compact temporary signal: one u32 key + one u32 value (not a full
+        // RefundAllocation, and not an Address-bearing composite key).
+        Self::store_arbitration_split_bps(&env, milestone_index, client_refund_bps);
+
+        let resolved = RefundAllocation {
+            client_refund,
+            freelancer_payout,
+            client_refund_bps: allocation.client_refund_bps,
+            freelancer_payout_bps: allocation.freelancer_payout_bps,
+        };
+
+        env.events().publish(
+            (symbol_short!("resolve"),),
+            DisputeResolvedEvent {
+                contract_id: env.current_contract_address(),
+                milestone_index,
+                arbiter: meta.arbiter.clone(),
+                client: meta.client.clone(),
+                freelancer: meta.freelancer.clone(),
+                token: meta.token.clone(),
+                amount: remaining,
+                released_to_freelancer: freelancer_payout > 0,
+                status: milestone.status.clone(),
+            },
+        );
+
+        Ok(resolved)
     }
 
     pub fn cancel_escrow(env: Env, caller: Address) -> Result<(), Error> {
