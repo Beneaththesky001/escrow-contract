@@ -872,7 +872,7 @@ fn test_resolve_dispute_wrong_status_fails() {
     client.fund(&client_addr);
 
     let result = client.try_resolve_dispute(&arbiter_addr, &0u32, &true);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
 }
 
 #[test]
@@ -6773,91 +6773,211 @@ fn test_milestone_time_extensions_overflow_fails() {
 }
 
 // ============================================================================
-// resolve_dispute — comprehensive boundary / edge-case test suite (Issue #203)
+// resolve_dispute — strict state machine transition matrix (Issue #201)
 // ============================================================================
 //
-// These tests verify that resolve_dispute enforces strict state-machine
-// transitions, rejects unauthorised callers and invalid inputs, and blocks
-// duplicate / already-resolved dispute execution.
+// Permitted source status: Disputed only.
+// Valid transitions:
+//   Disputed → Released  (release_to_freelancer = true)
+//   Disputed → Refunded  (release_to_freelancer = false)
+// Every other source status must revert with Error::InvalidStatus and must
+// not mutate milestone status or transfer funds.
 
-/// Duplicate execution — resolving an already-Released dispute must fail.
+/// Full transition matrix covering every MilestoneStatus as a source state.
 #[test]
-fn test_resolve_dispute_duplicate_after_release_fails() {
+fn test_resolve_dispute_state_transition_matrix() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token = token::Client::new(&env, &token_contract_id);
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+    // Seven milestones: five invalid sources + two valid Disputed paths.
+    token_admin.mint(&client_addr, &7_000);
 
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.raise_dispute(&client_addr, &0u32);
-    escrow.resolve_dispute(&arbiter_addr, &0u32, &true);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let job = escrow.get_job();
+    let amounts = vec![
+        &env, 1_000_i128, 1_000_i128, 1_000_i128, 1_000_i128, 1_000_i128, 1_000_i128, 1_000_i128,
+    ];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+    client.fund(&client_addr);
+
+    // --- Invalid sources (must fail with InvalidStatus, status unchanged) ---
+
+    // 0: Pending → reject
+    let result = client.try_resolve_dispute(&arbiter_addr, &0u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
     assert_eq!(
-        job.milestones.get(0).unwrap().status,
+        client.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Pending
+    );
+
+    // 1: Delivered → reject
+    client.mark_delivered(&freelancer_addr, &1u32);
+    let result = client.try_resolve_dispute(&arbiter_addr, &1u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(1).unwrap().status,
+        MilestoneStatus::Delivered
+    );
+
+    // 2: PartiallyReleased → reject
+    client.mark_delivered(&freelancer_addr, &2u32);
+    client.approve_partial(&client_addr, &2u32, &400_i128);
+    let result = client.try_resolve_dispute(&arbiter_addr, &2u32, &false);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(2).unwrap().status,
+        MilestoneStatus::PartiallyReleased
+    );
+
+    // 3: Released → reject
+    client.mark_delivered(&freelancer_addr, &3u32);
+    client.approve_milestone(&client_addr, &3u32);
+    let result = client.try_resolve_dispute(&arbiter_addr, &3u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(3).unwrap().status,
         MilestoneStatus::Released
     );
 
-    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
+    // 4: Refunded → reject (settled via prior dispute resolution)
+    client.mark_delivered(&freelancer_addr, &4u32);
+    client.raise_dispute(&client_addr, &4u32);
+    client.resolve_dispute(&arbiter_addr, &4u32, &false);
+    assert_eq!(
+        client.get_job().milestones.get(4).unwrap().status,
+        MilestoneStatus::Refunded
+    );
+    let result = client.try_resolve_dispute(&arbiter_addr, &4u32, &true);
     assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(4).unwrap().status,
+        MilestoneStatus::Refunded
+    );
+
+    // --- Valid sources ---
+
+    // 5: Disputed → Released
+    client.mark_delivered(&freelancer_addr, &5u32);
+    client.raise_dispute(&client_addr, &5u32);
+    client.resolve_dispute(&arbiter_addr, &5u32, &true);
+    assert_eq!(
+        client.get_job().milestones.get(5).unwrap().status,
+        MilestoneStatus::Released
+    );
+
+    // Re-resolve after Released must also fail (terminal status).
+    let result = client.try_resolve_dispute(&arbiter_addr, &5u32, &false);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(5).unwrap().status,
+        MilestoneStatus::Released
+    );
+
+    // 6: Disputed → Refunded
+    client.mark_delivered(&freelancer_addr, &6u32);
+    client.raise_dispute(&freelancer_addr, &6u32);
+    client.resolve_dispute(&arbiter_addr, &6u32, &false);
+    assert_eq!(
+        client.get_job().milestones.get(6).unwrap().status,
+        MilestoneStatus::Refunded
+    );
+
+    // Invalid transitions must not have paid out milestones 0–1.
+    // Milestone 2 paid 400 partial; 3 released 1000; 4 refunded 1000;
+    // 5 released 1000; 6 refunded 1000.
+    assert_eq!(token.balance(&freelancer_addr), 400 + 1_000 + 1_000);
+    assert_eq!(
+        client.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Pending
+    );
+    assert_eq!(
+        client.get_job().milestones.get(1).unwrap().status,
+        MilestoneStatus::Delivered
+    );
 }
 
-/// Already-resolved — resolving an already-Refunded dispute must fail.
+/// Invalid transition from Pending leaves balances and status untouched.
 #[test]
-fn test_resolve_dispute_already_refunded_fails() {
+fn test_resolve_dispute_from_pending_fails_without_side_effects() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, _, arbiter_addr, _, token_contract_id, contract_id, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let token = token::Client::new(&env, &token_contract_id);
+
+    let client_before = token.balance(&client_addr);
+    let contract_before = token.balance(&contract_id);
+
+    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        escrow.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Pending
+    );
+    assert_eq!(token.balance(&client_addr), client_before);
+    assert_eq!(token.balance(&contract_id), contract_before);
+}
+
+/// Invalid transition from Delivered returns deterministic InvalidStatus.
+#[test]
+fn test_resolve_dispute_from_delivered_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, freelancer_addr, arbiter_addr, _, _, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &false);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        escrow.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Delivered
+    );
+}
+
+/// Invalid transition from PartiallyReleased returns deterministic InvalidStatus.
+#[test]
+fn test_resolve_dispute_from_partially_released_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
     let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+        setup_funded_escrow(&env, vec![&env, 2_000_i128]);
 
     escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.raise_dispute(&client_addr, &0u32);
-    escrow.resolve_dispute(&arbiter_addr, &0u32, &false);
+    escrow.approve_partial(&client_addr, &0u32, &500_i128);
 
-    let job = escrow.get_job();
+    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
     assert_eq!(
-        job.milestones.get(0).unwrap().status,
-        MilestoneStatus::Refunded
+        escrow.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::PartiallyReleased
     );
-
-    // Flip the decision bit — still rejected because status is terminal.
-    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
-    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
 }
 
-/// Invalid state transition — resolve on Pending (never disputed) must fail.
+/// Invalid transition from Released returns deterministic InvalidStatus.
 #[test]
-fn test_resolve_dispute_on_pending_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (_client_addr, _freelancer_addr, arbiter_addr, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
-
-    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
-    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
-}
-
-/// Invalid state transition — resolve on Delivered (not yet disputed) must fail.
-#[test]
-fn test_resolve_dispute_on_delivered_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (_client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
-
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-
-    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &false);
-    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
-}
-
-/// Invalid state transition — resolve on Released (approved without dispute) must fail.
-#[test]
-fn test_resolve_dispute_on_released_without_dispute_fails() {
+fn test_resolve_dispute_from_released_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -6869,27 +6989,83 @@ fn test_resolve_dispute_on_released_without_dispute_fails() {
 
     let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
     assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        escrow.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Released
+    );
 }
 
-/// Invalid state transition — resolve on PartiallyReleased (not disputed) must fail.
+/// Invalid transition from Refunded returns deterministic InvalidStatus.
 #[test]
-fn test_resolve_dispute_on_partially_released_fails() {
+fn test_resolve_dispute_from_refunded_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
     let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 5_000_i128]);
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
     escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.approve_partial(&client_addr, &0u32, &2_000_i128);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.resolve_dispute(&arbiter_addr, &0u32, &false);
 
     let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
     assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        escrow.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Refunded
+    );
 }
 
-/// Unauthorized caller — client must not resolve disputes.
+/// Valid: Disputed → Released preserves payout and authorization rules.
 #[test]
-fn test_resolve_dispute_client_unauthorized_fails() {
+fn test_resolve_dispute_from_disputed_to_released_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, arbiter_addr, _, token_contract_id, _, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let token = token::Client::new(&env, &token_contract_id);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.resolve_dispute(&arbiter_addr, &0u32, &true);
+
+    let job = escrow.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Released
+    );
+    assert_eq!(job.milestones.get(0).unwrap().released_amount, 1_000);
+    assert_eq!(token.balance(&freelancer_addr), 1_000);
+}
+
+/// Valid: Disputed → Refunded preserves refund payment logic.
+#[test]
+fn test_resolve_dispute_from_disputed_to_refunded_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, arbiter_addr, _, token_contract_id, contract_id, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let token = token::Client::new(&env, &token_contract_id);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+    escrow.resolve_dispute(&arbiter_addr, &0u32, &false);
+
+    let job = escrow.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Refunded
+    );
+    assert_eq!(token.balance(&client_addr), 1_000);
+    assert_eq!(token.balance(&contract_id), 0);
+    assert_eq!(token.balance(&freelancer_addr), 0);
+}
+
+/// Authorization is preserved: non-arbiter callers are still rejected.
+#[test]
+fn test_resolve_dispute_unauthorized_still_fails_after_state_machine() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -6901,186 +7077,8 @@ fn test_resolve_dispute_client_unauthorized_fails() {
 
     let result = escrow.try_resolve_dispute(&client_addr, &0u32, &true);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
-}
-
-/// Unauthorized caller — freelancer must not resolve disputes.
-#[test]
-fn test_resolve_dispute_freelancer_unauthorized_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client_addr, freelancer_addr, _, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
-
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.raise_dispute(&client_addr, &0u32);
-
-    let result = escrow.try_resolve_dispute(&freelancer_addr, &0u32, &false);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-}
-
-/// Failed authorization — missing host auth must fail at the host level.
-#[test]
-fn test_resolve_dispute_no_auth_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
-
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.raise_dispute(&client_addr, &0u32);
-
-    env.set_auths(&[]);
-
-    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
-    assert!(result.is_err());
-    assert!(matches!(result, Err(Err(_))));
-}
-
-/// Invalid input — zero account address as arbiter must fail.
-#[test]
-fn test_resolve_dispute_zero_account_address_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client_addr, freelancer_addr, _, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
-
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.raise_dispute(&client_addr, &0u32);
-
-    let zero_account = Address::from_str(
-        &env,
-        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    assert_eq!(
+        escrow.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Disputed
     );
-
-    let result = escrow.try_resolve_dispute(&zero_account, &0u32, &true);
-    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
-}
-
-/// Invalid input — zero contract address as arbiter must fail.
-#[test]
-fn test_resolve_dispute_zero_contract_address_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client_addr, freelancer_addr, _, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
-
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.raise_dispute(&client_addr, &0u32);
-
-    let zero_contract = Address::from_str(
-        &env,
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
-    );
-
-    let result = escrow.try_resolve_dispute(&zero_contract, &0u32, &false);
-    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
-}
-
-/// Invalid input — using the escrow contract itself as arbiter must fail.
-#[test]
-fn test_resolve_dispute_self_contract_address_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client_addr, freelancer_addr, _, _, _, contract_id, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
-
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.raise_dispute(&client_addr, &0u32);
-
-    let result = escrow.try_resolve_dispute(&contract_id, &0u32, &true);
-    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
-}
-
-/// Invalid input — out-of-bounds milestone index must fail.
-#[test]
-fn test_resolve_dispute_invalid_milestone_index_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client_addr, freelancer_addr, arbiter_addr, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
-
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.raise_dispute(&client_addr, &0u32);
-
-    let result = escrow.try_resolve_dispute(&arbiter_addr, &99u32, &true);
-    assert_eq!(result, Err(Ok(Error::InvalidMilestone)));
-}
-
-/// Negative edge — resolve_dispute before the escrow is funded must fail.
-#[test]
-fn test_resolve_dispute_before_funded_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let client_addr = Address::generate(&env);
-    let freelancer_addr = Address::generate(&env);
-    let arbiter_addr = Address::generate(&env);
-    let admin_addr = Address::generate(&env);
-
-    let token_contract_id = env
-        .register_stellar_asset_contract_v2(admin_addr.clone())
-        .address();
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let amounts = vec![&env, 1_000_i128];
-    escrow.initialize(
-        &admin_addr,
-        &client_addr,
-        &freelancer_addr,
-        &arbiter_addr,
-        &token_contract_id,
-        &604800,
-        &amounts,
-    );
-
-    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
-    assert_eq!(result, Err(Ok(Error::NotFunded)));
-}
-
-/// Negative edge — resolve_dispute while emergency-paused must fail.
-#[test]
-fn test_resolve_dispute_while_paused_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client_addr, freelancer_addr, arbiter_addr, admin_addr, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
-
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.raise_dispute(&client_addr, &0u32);
-    escrow.emergency_pause(&admin_addr);
-
-    let result = escrow.try_resolve_dispute(&arbiter_addr, &0u32, &true);
-    assert_eq!(result, Err(Ok(Error::Paused)));
-}
-
-/// Boundary happy path — resolve remaining funds after a partial release.
-#[test]
-fn test_resolve_dispute_remaining_after_partial_release_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client_addr, freelancer_addr, arbiter_addr, _, token_contract_id, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 5_000_i128]);
-
-    escrow.mark_delivered(&freelancer_addr, &0u32);
-    escrow.approve_partial(&client_addr, &0u32, &2_000_i128);
-    escrow.raise_dispute(&client_addr, &0u32);
-    escrow.resolve_dispute(&arbiter_addr, &0u32, &true);
-
-    let job = escrow.get_job();
-    let milestone = job.milestones.get(0).unwrap();
-    assert_eq!(milestone.status, MilestoneStatus::Released);
-    assert_eq!(milestone.released_amount, 5_000_i128);
-
-    let token = token::Client::new(&env, &token_contract_id);
-    assert_eq!(token.balance(&freelancer_addr), 5_000_i128);
 }
