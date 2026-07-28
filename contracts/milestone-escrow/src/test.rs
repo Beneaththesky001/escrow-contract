@@ -7082,3 +7082,368 @@ fn test_resolve_dispute_unauthorized_still_fails_after_state_machine() {
         MilestoneStatus::Disputed
     );
 }
+
+// ============================================================================
+// Issue #268: milestone_time_extensions event emission test
+// Issue #267: escrow_interest_yield comprehensive unit test suite
+// ============================================================================
+
+#[test]
+fn test_milestone_time_extensions_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amount = 1_000_i128;
+    let elapsed = 300_i128;
+    let total = 600_i128;
+
+    let split = client.milestone_time_extensions(&amount, &elapsed, &total);
+    assert_eq!(split.first, 500);
+    assert_eq!(split.second, 500);
+
+    let events = env.events().all();
+    let m_ext_topic: Symbol = symbol_short!("m_ext");
+    let m_ext_topic_val: Val = m_ext_topic.into_val(&env);
+
+    let mut found_event = false;
+    for e in events.iter() {
+        if let Some(topic) = e.1.get(0) {
+            if topic.get_payload() == m_ext_topic_val.get_payload() {
+                found_event = true;
+                let event_data = MilestoneTimeExtensionEvent::from_val(&env, &e.2);
+                assert_eq!(event_data.amount, amount);
+                assert_eq!(event_data.elapsed_seconds, elapsed);
+                assert_eq!(event_data.total_seconds, total);
+                assert_eq!(event_data.freelancer_share, 500);
+                assert_eq!(event_data.client_refund, 500);
+            }
+        }
+    }
+    assert!(found_event, "Expected m_ext event to be published");
+}
+
+#[test]
+fn test_milestone_time_extensions_zero_elapsed_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amount = 1_000_i128;
+    let elapsed = 0_i128;
+    let total = 600_i128;
+
+    let split = client.milestone_time_extensions(&amount, &elapsed, &total);
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 1_000);
+
+    let events = env.events().all();
+    let m_ext_topic: Symbol = symbol_short!("m_ext");
+    let m_ext_topic_val: Val = m_ext_topic.into_val(&env);
+
+    let mut found_event = false;
+    for e in events.iter() {
+        if let Some(topic) = e.1.get(0) {
+            if topic.get_payload() == m_ext_topic_val.get_payload() {
+                found_event = true;
+                let event_data = MilestoneTimeExtensionEvent::from_val(&env, &e.2);
+                assert_eq!(event_data.amount, amount);
+                assert_eq!(event_data.elapsed_seconds, elapsed);
+                assert_eq!(event_data.total_seconds, total);
+                assert_eq!(event_data.freelancer_share, 0);
+                assert_eq!(event_data.client_refund, 1_000);
+            }
+        }
+    }
+    assert!(found_event, "Expected m_ext event to be published");
+}
+
+#[test]
+fn test_milestone_time_extensions_full_elapsed_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amount = 1_000_i128;
+    let elapsed = 600_i128;
+    let total = 600_i128;
+
+    let split = client.milestone_time_extensions(&amount, &elapsed, &total);
+    assert_eq!(split.first, 1_000);
+    assert_eq!(split.second, 0);
+
+    let events = env.events().all();
+    let m_ext_topic: Symbol = symbol_short!("m_ext");
+    let m_ext_topic_val: Val = m_ext_topic.into_val(&env);
+
+    let mut found_event = false;
+    for e in events.iter() {
+        if let Some(topic) = e.1.get(0) {
+            if topic.get_payload() == m_ext_topic_val.get_payload() {
+                found_event = true;
+                let event_data = MilestoneTimeExtensionEvent::from_val(&env, &e.2);
+                assert_eq!(event_data.amount, amount);
+                assert_eq!(event_data.elapsed_seconds, elapsed);
+                assert_eq!(event_data.total_seconds, total);
+                assert_eq!(event_data.freelancer_share, 1_000);
+                assert_eq!(event_data.client_refund, 0);
+            }
+        }
+    }
+    assert!(found_event, "Expected m_ext event to be published");
+}
+
+// ── escrow_interest_yield Unit Tests (#267) ───────────────────────────────
+
+fn setup_test_env(env: &Env) -> (Address, Address, Address, Address, u64) {
+    let admin = Address::generate(env);
+    let client_addr = Address::generate(env);
+    let freelancer_addr = Address::generate(env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let auto_release = 604800_u64;
+    (admin, client_addr, freelancer_addr, token, auto_release)
+}
+
+#[test]
+fn test_escrow_interest_yield_calculation_basic() {
+    let env = Env::default();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    // 10,000 principal, 500 bps (5%), 1 full year (31,536,000s)
+    let yield_amt = client.escrow_interest_yield(&10_000_i128, &500_i128, &31_536_000_i128);
+    assert_eq!(yield_amt, 500);
+}
+
+#[test]
+fn test_escrow_interest_yield_calculation_half_year() {
+    let env = Env::default();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    // 10,000 principal, 1,000 bps (10%), 6 months (15,768,000s)
+    let yield_amt = client.escrow_interest_yield(&10_000_i128, &1_000_i128, &15_768_000_i128);
+    assert_eq!(yield_amt, 500);
+}
+
+#[test]
+fn test_escrow_interest_yield_zero_principal_fails() {
+    let env = Env::default();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let res = client.try_escrow_interest_yield(&0_i128, &500_i128, &31_536_000_i128);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_escrow_interest_yield_negative_principal_fails() {
+    let env = Env::default();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let res = client.try_escrow_interest_yield(&-100_i128, &500_i128, &31_536_000_i128);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_escrow_interest_yield_zero_rate_fails() {
+    let env = Env::default();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let res = client.try_escrow_interest_yield(&10_000_i128, &0_i128, &31_536_000_i128);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_escrow_interest_yield_negative_rate_fails() {
+    let env = Env::default();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let res = client.try_escrow_interest_yield(&10_000_i128, &-10_i128, &31_536_000_i128);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_escrow_interest_yield_excessive_rate_fails() {
+    let env = Env::default();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let res = client.try_escrow_interest_yield(&10_000_i128, &10_001_i128, &31_536_000_i128);
+    assert_eq!(res, Err(Ok(Error::InvalidRatio)));
+}
+
+#[test]
+fn test_escrow_interest_yield_max_rate_succeeds() {
+    let env = Env::default();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    // 100% rate = 10,000 bps
+    let yield_amt = client.escrow_interest_yield(&10_000_i128, &10_000_i128, &31_536_000_i128);
+    assert_eq!(yield_amt, 10_000);
+}
+
+#[test]
+fn test_escrow_interest_yield_zero_duration_fails() {
+    let env = Env::default();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let res = client.try_escrow_interest_yield(&10_000_i128, &500_i128, &0_i128);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_escrow_interest_yield_negative_duration_fails() {
+    let env = Env::default();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let res = client.try_escrow_interest_yield(&10_000_i128, &500_i128, &-100_i128);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_escrow_interest_yield_overflow_fails() {
+    let env = Env::default();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let res = client.try_escrow_interest_yield(&i128::MAX, &10_000_i128, &31_536_000_i128);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_escrow_interest_yield_share_config_not_initialized_initially() {
+    let env = Env::default();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let res = client.try_get_escrow_interest_yield();
+    assert_eq!(res, Err(Ok(Error::NotInitialized)));
+}
+
+#[test]
+fn test_escrow_interest_yield_set_valid_config_and_get() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client_addr, freelancer_addr, token, auto_release) = setup_test_env(&env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let arbiter = Address::generate(&env);
+    client.initialize(
+        &admin,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter,
+        &token,
+        &auto_release,
+        &vec![&env, 1_000_i128],
+    );
+
+    client.set_escrow_interest_yield(&admin, &5_000u32, &5_000u32);
+
+    let config = client.get_escrow_interest_yield();
+    assert_eq!(config.client_share_bps, 5_000);
+    assert_eq!(config.freelancer_share_bps, 5_000);
+    assert_eq!(config.locked, false);
+}
+
+#[test]
+fn test_escrow_interest_yield_set_invalid_share_total_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client_addr, freelancer_addr, token, auto_release) = setup_test_env(&env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let arbiter = Address::generate(&env);
+    client.initialize(
+        &admin,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter,
+        &token,
+        &auto_release,
+        &vec![&env, 1_000_i128],
+    );
+
+    let res1 = client.try_set_escrow_interest_yield(&admin, &6_000u32, &5_000u32);
+    assert_eq!(res1, Err(Ok(Error::InvalidRatio)));
+
+    let res2 = client.try_set_escrow_interest_yield(&admin, &3_000u32, &3_000u32);
+    assert_eq!(res2, Err(Ok(Error::InvalidRatio)));
+}
+
+#[test]
+fn test_escrow_interest_yield_lock_unlock_workflow() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client_addr, freelancer_addr, token, auto_release) = setup_test_env(&env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let arbiter = Address::generate(&env);
+    client.initialize(
+        &admin,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter,
+        &token,
+        &auto_release,
+        &vec![&env, 1_000_i128],
+    );
+
+    client.set_escrow_interest_yield(&admin, &5_000u32, &5_000u32);
+    assert_eq!(client.is_escrow_interest_yield_locked(), false);
+
+    client.lock_escrow_interest_yield(&admin);
+    assert_eq!(client.is_escrow_interest_yield_locked(), true);
+
+    let res = client.try_set_escrow_interest_yield(&admin, &6_000u32, &4_000u32);
+    assert_eq!(res, Err(Ok(Error::EscrowLocked)));
+
+    client.unlock_escrow_interest_yield(&admin);
+    assert_eq!(client.is_escrow_interest_yield_locked(), false);
+
+    client.set_escrow_interest_yield(&admin, &6_000u32, &4_000u32);
+    let updated = client.get_escrow_interest_yield();
+    assert_eq!(updated.client_share_bps, 6_000);
+    assert_eq!(updated.freelancer_share_bps, 4_000);
+}
+
+#[test]
+fn test_escrow_interest_yield_unauthorized_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client_addr, freelancer_addr, token, auto_release) = setup_test_env(&env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let arbiter = Address::generate(&env);
+    client.initialize(
+        &admin,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter,
+        &token,
+        &auto_release,
+        &vec![&env, 1_000_i128],
+    );
+
+    let impostor = Address::generate(&env);
+    let res = client.try_set_escrow_interest_yield(&impostor, &5_000u32, &5_000u32);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+

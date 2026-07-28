@@ -535,6 +535,16 @@ pub struct AutoReleaseClaimedEvent {
     pub amount: i128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneTimeExtensionEvent {
+    pub amount: i128,
+    pub elapsed_seconds: i128,
+    pub total_seconds: i128,
+    pub freelancer_share: i128,
+    pub client_refund: i128,
+}
+
 #[contract]
 pub struct MilestoneEscrow;
 
@@ -2426,7 +2436,7 @@ impl MilestoneEscrow {
     /// * `InvalidRatio`   – `total_seconds` is zero, `elapsed_seconds` is
     ///                      negative, or `elapsed_seconds > total_seconds`.
     pub fn milestone_time_extensions(
-        _env: Env,
+        env: Env,
         amount: i128,
         elapsed_seconds: i128,
         total_seconds: i128,
@@ -2451,7 +2461,20 @@ impl MilestoneEscrow {
         //   first  = round_nearest(total × numerator / denominator)
         //   second = total − first
         // Here numerator = elapsed_seconds, denominator = total_seconds.
-        Self::split_round_nearest(amount, elapsed_seconds, total_seconds)
+        let split = Self::split_round_nearest(amount, elapsed_seconds, total_seconds)?;
+
+        env.events().publish(
+            (symbol_short!("m_ext"),),
+            MilestoneTimeExtensionEvent {
+                amount,
+                elapsed_seconds,
+                total_seconds,
+                freelancer_share: split.first,
+                client_refund: split.second,
+            },
+        );
+
+        Ok(split)
     }
 
     pub fn multisig_transfer_admin(
