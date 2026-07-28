@@ -569,8 +569,6 @@ impl MilestoneEscrow {
             .unwrap_or(0)
     }
 
-
-
     /// Check whether `approve_milestone` has marked the given milestone index
     /// as fully released via the temporary completion flag.  Returns `false`
     /// if the flag was never written or has been evicted.
@@ -612,8 +610,9 @@ impl MilestoneEscrow {
         total.checked_add(amount).ok_or(Error::InvalidAmount)
     }
 
+    #[allow(dead_code)]
     fn checked_initialize_total(milestone_amounts: &Vec<i128>) -> Result<i128, Error> {
-        if milestone_amounts.len() == 0 {
+        if milestone_amounts.is_empty() {
             return Err(Error::InvalidAmount);
         }
 
@@ -1117,7 +1116,9 @@ impl MilestoneEscrow {
         }
 
         let milestone = Self::load_milestone(&env, milestone_index)?;
-        if milestone.status != MilestoneStatus::Delivered && milestone.status != MilestoneStatus::PartiallyReleased {
+        if milestone.status != MilestoneStatus::Delivered
+            && milestone.status != MilestoneStatus::PartiallyReleased
+        {
             return Err(Error::InvalidStatus);
         }
 
@@ -1126,11 +1127,14 @@ impl MilestoneEscrow {
         }
 
         let current_extension = Self::load_time_extension(&env, milestone_index);
-        let new_extension = current_extension.checked_add(extra_seconds).ok_or(Error::InvalidExtension)?;
+        let new_extension = current_extension
+            .checked_add(extra_seconds)
+            .ok_or(Error::InvalidExtension)?;
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::MilestoneTimeExtension(milestone_index), &new_extension);
+        env.storage().persistent().set(
+            &DataKey::MilestoneTimeExtension(milestone_index),
+            &new_extension,
+        );
 
         env.events().publish(
             (symbol_short!("extend"),),
@@ -1546,8 +1550,19 @@ impl MilestoneEscrow {
 
         let mut milestone = Self::load_milestone(&env, milestone_index)?;
 
-        if milestone.status != MilestoneStatus::Disputed {
-            return Err(Error::InvalidStatus);
+        // Strict state machine: resolve_dispute may only run while the
+        // milestone is Disputed. Every other source status is rejected with
+        // InvalidStatus before any payment or status mutation occurs.
+        // Allowed transitions:
+        //   Disputed → Released  (release_to_freelancer = true)
+        //   Disputed → Refunded  (release_to_freelancer = false)
+        match milestone.status {
+            MilestoneStatus::Disputed => {}
+            MilestoneStatus::Pending
+            | MilestoneStatus::Delivered
+            | MilestoneStatus::PartiallyReleased
+            | MilestoneStatus::Released
+            | MilestoneStatus::Refunded => return Err(Error::InvalidStatus),
         }
 
         let remaining = milestone
@@ -2254,7 +2269,10 @@ impl MilestoneEscrow {
 
     /// Query whether a proposal has reached the required approval threshold.
     /// Pure read — does not require auth and does not mutate state.
-    pub fn is_multisig_approved(env: Env, proposal_id: u32) -> Result<MultiSigApprovalState, Error> {
+    pub fn is_multisig_approved(
+        env: Env,
+        proposal_id: u32,
+    ) -> Result<MultiSigApprovalState, Error> {
         let threshold: u32 = env
             .storage()
             .instance()
