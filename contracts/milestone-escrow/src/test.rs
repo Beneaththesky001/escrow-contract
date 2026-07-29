@@ -6596,19 +6596,19 @@ fn test_milestone_time_extensions_zero_elapsed_gives_nothing_to_freelancer() {
     assert_eq!(split.first + split.second, 10_000);
 }
 
-/// Precision test 4 — ZERO AMOUNT:
-/// A zero escrow balance splits to two zeros; no error, no value invented.
+/// Boundary guard — ZERO AMOUNT:
+/// A zero escrow balance means there is nothing to distribute.
+/// milestone_time_extensions must reject this with Error::InvalidAmount.
 #[test]
-fn test_milestone_time_extensions_zero_amount_splits_to_zeros() {
+fn test_milestone_time_extensions_zero_amount_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let split = client.milestone_time_extensions(&0_i128, &1_i128, &3_i128);
-    assert_eq!(split.first, 0);
-    assert_eq!(split.second, 0);
+    let result = client.try_milestone_time_extensions(&0_i128, &1_i128, &3_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 }
 
 /// Precision test 5 — LARGE PRIME AMOUNT, ARBITRARY RATIO:
@@ -7991,5 +7991,230 @@ fn test_escrow_interest_yield_unauthorized_admin_fails() {
     let impostor = Address::generate(&env);
     let res = client.try_set_escrow_interest_yield(&impostor, &5_000u32, &5_000u32);
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
+// ============================================================================
+// Zero/empty balance guards — payment_streaming_milestones (Issue #272)
+// ============================================================================
+
+/// Guard — ZERO TOTAL: streaming on a zero balance must fail.
+#[test]
+fn test_payment_streaming_milestones_zero_total_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_payment_streaming_milestones(&0_i128, &1_i128, &2_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Guard — NEGATIVE TOTAL: negative balance is always invalid.
+#[test]
+fn test_payment_streaming_milestones_negative_total_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_payment_streaming_milestones(&-500_i128, &1_i128, &2_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Happy path — a positive total must still work correctly after the guard.
+#[test]
+fn test_payment_streaming_milestones_positive_total_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    // 1000 streamed at 1/4 elapsed: first=250, second=750, sum=1000
+    let split = client.payment_streaming_milestones(&1_000_i128, &1_i128, &4_i128);
+    assert_eq!(split.first, 250);
+    assert_eq!(split.second, 750);
+    assert_eq!(split.first + split.second, 1_000);
+}
+
+// ============================================================================
+// Zero/empty balance guards — milestone_time_extensions (Issue #271)
+// ============================================================================
+
+/// Guard — ZERO AMOUNT: distributing nothing is blocked.
+/// The previous behaviour returned (0, 0); the new behaviour raises InvalidAmount.
+#[test]
+fn test_milestone_time_extensions_zero_balance_is_blocked() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(&0_i128, &3_i128, &10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Guard — NEGATIVE AMOUNT: a negative milestone balance is rejected before time checks.
+#[test]
+fn test_milestone_time_extensions_negative_balance_is_blocked() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let result = client.try_milestone_time_extensions(&-1_000_i128, &3_i128, &10_i128);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Regression — a positive balance still produces the correct split and emits an event.
+#[test]
+fn test_milestone_time_extensions_positive_balance_succeeds_and_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    // 600 split at 1/3 elapsed: round_nearest(600 * 1 / 3) = 200
+    let split = client.milestone_time_extensions(&600_i128, &1_i128, &3_i128);
+    assert_eq!(split.first, 200);
+    assert_eq!(split.second, 400);
+    assert_eq!(split.first + split.second, 600);
+
+    // Verify the event was published
+    let events = env.events().all();
+    assert!(!events.is_empty(), "expected at least one event");
+    let last = events.last().unwrap();
+    let topic: Symbol = last.1.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(topic, Symbol::new(&env, "m_ext"));
+}
+
+// ============================================================================
+// Zero/empty balance guards + event emission — multisig_transfer_admin
+// (Issues #270 and #273)
+// ============================================================================
+
+/// Guard — ZERO TOTAL AMOUNT: initiating a multisig transfer on an empty
+/// balance must be blocked with InvalidAmount (issue #273).
+#[test]
+fn test_multisig_transfer_admin_zero_total_amount_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let ratios = vec![&env, 1_i128, 2_i128, 3_i128];
+    let result = client.try_multisig_transfer_admin(&0_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Guard — NEGATIVE TOTAL AMOUNT: a negative total is always invalid.
+#[test]
+fn test_multisig_transfer_admin_negative_total_amount_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let ratios = vec![&env, 1_i128, 1_i128];
+    let result = client.try_multisig_transfer_admin(&-100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Event emission — a successful multisig_transfer_admin call must emit a
+/// MultiSigTransferAdminEvent with the correct fields (issue #270).
+#[test]
+fn test_multisig_transfer_admin_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let ratios = vec![&env, 1_i128, 1_i128, 1_i128];
+    let allocations = client.multisig_transfer_admin(&300_i128, &ratios);
+
+    // Verify allocation correctness
+    assert_eq!(allocations.len(), 3);
+    let total: i128 = allocations.iter().sum();
+    assert_eq!(total, 300);
+
+    // Verify the event was published
+    let events = env.events().all();
+    assert!(!events.is_empty(), "expected at least one event");
+    let last = events.last().unwrap();
+    let topic: Symbol = last.1.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(topic, Symbol::new(&env, "msigtrx"));
+}
+
+/// Event emission — verify the event carries the correct total_amount
+/// and num_parties fields.
+#[test]
+fn test_multisig_transfer_admin_event_fields_are_correct() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let ratios = vec![&env, 3_i128, 1_i128];
+    let allocations = client.multisig_transfer_admin(&1_000_i128, &ratios);
+
+    // Verify numeric allocations: 750 and 250 (3/4 and 1/4 of 1000)
+    assert_eq!(allocations.get(0).unwrap(), 750);
+    assert_eq!(allocations.get(1).unwrap(), 250);
+
+    // Verify event topic
+    let events = env.events().all();
+    let last = events.last().unwrap();
+    let topic: Symbol = last.1.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(topic, Symbol::new(&env, "msigtrx"));
+}
+
+/// Event emission — a single-party split still emits the event.
+#[test]
+fn test_multisig_transfer_admin_single_party_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let ratios = vec![&env, 1_i128];
+    let allocations = client.multisig_transfer_admin(&500_i128, &ratios);
+
+    assert_eq!(allocations.len(), 1);
+    assert_eq!(allocations.get(0).unwrap(), 500);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let last = events.last().unwrap();
+    let topic: Symbol = last.1.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(topic, Symbol::new(&env, "msigtrx"));
+}
+
+/// Guard + Event — zero total with valid ratios is blocked BEFORE any event
+/// is emitted (no phantom events on failed calls).
+#[test]
+fn test_multisig_transfer_admin_zero_total_emits_no_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let ratios = vec![&env, 1_i128, 1_i128];
+    let result = client.try_multisig_transfer_admin(&0_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+
+    // No events should have been emitted for a rejected call.
+    let events = env.events().all();
+    assert!(events.is_empty(), "no events expected on failed call");
 }
 

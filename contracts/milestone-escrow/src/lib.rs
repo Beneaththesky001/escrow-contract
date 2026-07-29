@@ -545,6 +545,22 @@ pub struct MilestoneTimeExtensionEvent {
     pub client_refund: i128,
 }
 
+/// Emitted by `multisig_transfer_admin` after a successful proportional
+/// allocation of `total_amount` across all ratio entries.  Downstream
+/// indexers can use this event to audit every admin-triggered multi-party
+/// transfer without querying contract storage directly.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiSigTransferAdminEvent {
+    /// The total amount that was distributed.
+    pub total_amount: i128,
+    /// The number of parties the amount was split between.
+    pub num_parties: u32,
+    /// The resulting allocation per party, in the same order as the input
+    /// ratios.  Guaranteed to sum exactly to `total_amount`.
+    pub allocations: Vec<i128>,
+}
+
 #[contract]
 pub struct MilestoneEscrow;
 
@@ -2444,6 +2460,13 @@ impl MilestoneEscrow {
         numerator: i128,
         denominator: i128,
     ) -> Result<RatioSplit, Error> {
+        // Guard: reject zero or negative totals so that streaming operations
+        // are never initiated on an empty balance.  A zero total would
+        // distribute nothing to either party and signals a misconfigured or
+        // already-drained escrow.
+        if total_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
         Self::split_round_nearest(total_amount, numerator, denominator)
     }
 
@@ -2489,9 +2512,11 @@ impl MilestoneEscrow {
         elapsed_seconds: i128,
         total_seconds: i128,
     ) -> Result<RatioSplit, Error> {
-        // Reject negative amounts before delegating to split_round_nearest,
-        // which only accepts total >= 0.
-        if amount < 0 {
+        // Guard: a zero or negative balance means there is nothing left in
+        // this milestone to distribute.  Operations on an empty balance would
+        // produce a split of (0, 0) which is a no-op and signals a
+        // misconfigured or already-drained escrow.
+        if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
 
@@ -2530,7 +2555,15 @@ impl MilestoneEscrow {
         total_amount: i128,
         ratios: Vec<i128>,
     ) -> Result<Vec<i128>, Error> {
-        if total_amount < 0 || ratios.is_empty() {
+        // Guard: reject zero or negative totals so that a multisig transfer
+        // cannot be initiated against an empty or invalid balance.  A zero
+        // total would distribute nothing and signals a drained or
+        // misconfigured escrow.
+        if total_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        if ratios.is_empty() {
             return Err(Error::InvalidRatio);
         }
 
@@ -2586,6 +2619,18 @@ impl MilestoneEscrow {
             );
             remainders.set(best_index, i128::MIN);
         }
+
+        // Emit a structured event so downstream indexers can audit every
+        // multi-party admin transfer without reading contract storage directly.
+        let num_parties = allocations.len();
+        env.events().publish(
+            (symbol_short!("msigtrx"),),
+            MultiSigTransferAdminEvent {
+                total_amount,
+                num_parties,
+                allocations: allocations.clone(),
+            },
+        );
 
         Ok(allocations)
     }
