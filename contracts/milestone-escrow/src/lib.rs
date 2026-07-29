@@ -244,11 +244,21 @@ pub struct ApprovedEvent {
     pub milestone_index: u32,
     pub client: Address,
     pub freelancer: Address,
+    pub arbiter: Address,
     pub token: Address,
+    /// Gross milestone amount (before any partial releases).
     pub amount: i128,
+    /// Cumulative amount released including this approval.
     pub released_amount: i128,
+    /// Remaining balance after this approval (always 0 on a full approval).
     pub remaining: i128,
     pub status: MilestoneStatus,
+    /// Total number of milestones in the contract.
+    pub milestone_count: u32,
+    /// Contract-level total amount across all milestones.
+    pub total_amount: i128,
+    /// Auto-release window configured for this escrow.
+    pub auto_release_seconds: u64,
 }
 
 #[contracttype]
@@ -917,6 +927,26 @@ impl MilestoneEscrow {
             return Err(Error::AlreadyInitialized);
         }
 
+        // Write a sentinel immediately to prevent reentrancy: any reentrant
+        // call to `initialize` will now see `DataKey::Job` already present and
+        // return `AlreadyInitialized` before touching any other state.
+        // The sentinel is a zero-value `JobMeta` placeholder; the real meta
+        // overwrites it at the end of this function once all validation has
+        // passed and milestones have been stored.
+        env.storage().instance().set(
+            &DataKey::Job,
+            &JobMeta {
+                client: admin.clone(),
+                freelancer: admin.clone(),
+                arbiter: admin.clone(),
+                token: admin.clone(),
+                funded: false,
+                auto_release_seconds: 0,
+                milestone_count: 0,
+                total_amount: 0,
+            },
+        );
+
         Self::validate_address(&env, &admin)?;
         Self::validate_address(&env, &client)?;
         Self::validate_address(&env, &freelancer)?;
@@ -1573,11 +1603,15 @@ impl MilestoneEscrow {
                 milestone_index,
                 client: meta.client,
                 freelancer: meta.freelancer,
+                arbiter: meta.arbiter,
                 token: meta.token,
                 amount,
                 released_amount: updated_milestone.released_amount,
                 remaining: event_remaining,
                 status: updated_milestone.status.clone(),
+                milestone_count: meta.milestone_count,
+                total_amount: meta.total_amount,
+                auto_release_seconds: meta.auto_release_seconds,
             },
         );
 
@@ -1658,11 +1692,15 @@ impl MilestoneEscrow {
                 milestone_index,
                 client: meta.client,
                 freelancer: meta.freelancer,
+                arbiter: meta.arbiter,
                 token: meta.token,
                 amount: remaining,
                 released_amount: milestone.released_amount,
                 remaining: event_remaining,
                 status: milestone.status.clone(),
+                milestone_count: meta.milestone_count,
+                total_amount: meta.total_amount,
+                auto_release_seconds: meta.auto_release_seconds,
             },
         );
 
