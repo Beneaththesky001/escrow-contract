@@ -7993,3 +7993,422 @@ fn test_escrow_interest_yield_unauthorized_admin_fails() {
     assert_eq!(res, Err(Ok(Error::Unauthorized)));
 }
 
+// ============================================================================
+// set_interest_yield_consent — dual-signature (client + freelancer)
+// consent test suite
+// ============================================================================
+
+#[test]
+fn test_escrow_interest_yield_consent_both_sign_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client_addr, freelancer_addr, token, auto_release) = setup_test_env(&env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let arbiter = Address::generate(&env);
+    client.initialize(
+        &admin,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter,
+        &token,
+        &auto_release,
+        &vec![&env, 1_000_i128],
+    );
+
+    client.set_interest_yield_consent(&admin, &6_000u32, &4_000u32);
+
+    let config = client.get_escrow_interest_yield();
+    assert_eq!(config.client_share_bps, 6_000);
+    assert_eq!(config.freelancer_share_bps, 4_000);
+}
+
+/// The core validation check: a transaction missing either party's signature
+/// must revert. Here `admin` and `client_addr` both authorize the call, but
+/// `freelancer_addr` never does — `require_auth()` on the freelancer panics
+/// at the host level before the dual-consent logic ever runs, and no state
+/// is written.
+#[test]
+fn test_escrow_interest_yield_consent_single_signature_reverts() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client_addr, freelancer_addr, token, auto_release) = setup_test_env(&env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+    let arbiter = Address::generate(&env);
+    escrow.initialize(
+        &admin,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter,
+        &token,
+        &auto_release,
+        &vec![&env, 1_000_i128],
+    );
+
+    let client_share_bps = 6_000u32;
+    let freelancer_share_bps = 4_000u32;
+
+    let invoke = MockAuthInvoke {
+        contract: &contract_id,
+        fn_name: "set_interest_yield_consent",
+        args: (&admin, client_share_bps, freelancer_share_bps).into_val(&env),
+        sub_invokes: &[],
+    };
+
+    let result = escrow
+        .mock_auths(&[
+            MockAuth {
+                address: &admin,
+                invoke: &invoke,
+            },
+            MockAuth {
+                address: &client_addr,
+                invoke: &invoke,
+            },
+        ])
+        .try_set_interest_yield_consent(&admin, &client_share_bps, &freelancer_share_bps);
+
+    // Host-level auth failure (missing freelancer signature), not a contract
+    // error — the outer Result arm is Err, wrapping a host error.
+    assert!(matches!(result, Err(Err(_))));
+
+    // No config was ever written.
+    let res = escrow.try_get_escrow_interest_yield();
+    assert_eq!(res, Err(Ok(Error::NotInitialized)));
+}
+
+#[test]
+fn test_escrow_interest_yield_consent_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client_addr, freelancer_addr, token, auto_release) = setup_test_env(&env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let arbiter = Address::generate(&env);
+    client.initialize(
+        &admin,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter,
+        &token,
+        &auto_release,
+        &vec![&env, 1_000_i128],
+    );
+
+    let impostor = Address::generate(&env);
+    let result = client.try_set_interest_yield_consent(&impostor, &6_000u32, &4_000u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_escrow_interest_yield_consent_invalid_ratio_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client_addr, freelancer_addr, token, auto_release) = setup_test_env(&env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let arbiter = Address::generate(&env);
+    client.initialize(
+        &admin,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter,
+        &token,
+        &auto_release,
+        &vec![&env, 1_000_i128],
+    );
+
+    let result = client.try_set_interest_yield_consent(&admin, &7_000u32, &4_000u32);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+#[test]
+fn test_escrow_interest_yield_consent_respects_lock() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client_addr, freelancer_addr, token, auto_release) = setup_test_env(&env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let arbiter = Address::generate(&env);
+    client.initialize(
+        &admin,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter,
+        &token,
+        &auto_release,
+        &vec![&env, 1_000_i128],
+    );
+
+    client.set_interest_yield_consent(&admin, &5_000u32, &5_000u32);
+    client.lock_escrow_interest_yield(&admin);
+
+    let result = client.try_set_interest_yield_consent(&admin, &6_000u32, &4_000u32);
+    assert_eq!(result, Err(Ok(Error::EscrowLocked)));
+}
+
+// ============================================================================
+// propose_admin_transfer / execute_admin_transfer / cancel_admin_transfer_proposal
+// — multisig-gated admin transfer status-lock test suite
+// ============================================================================
+
+#[test]
+fn test_propose_admin_transfer_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _signers) = setup_multisig(&env, 2);
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin_transfer(&admin, &new_admin, &1u32);
+
+    let pending = client.get_pending_admin_transfer().unwrap();
+    assert_eq!(pending.new_admin, new_admin);
+    assert_eq!(pending.proposal_id, 1u32);
+}
+
+/// The core validation check: modification attempts while locked are blocked.
+/// A second proposal cannot be created while one is already pending.
+#[test]
+fn test_propose_admin_transfer_while_pending_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _signers) = setup_multisig(&env, 2);
+    let new_admin_1 = Address::generate(&env);
+    let new_admin_2 = Address::generate(&env);
+
+    client.propose_admin_transfer(&admin, &new_admin_1, &1u32);
+
+    let result = client.try_propose_admin_transfer(&admin, &new_admin_2, &2u32);
+    assert_eq!(result, Err(Ok(Error::AdminTransferPending)));
+
+    // Original proposal is untouched.
+    let pending = client.get_pending_admin_transfer().unwrap();
+    assert_eq!(pending.new_admin, new_admin_1);
+}
+
+#[test]
+fn test_execute_admin_transfer_before_threshold_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, signers) = setup_multisig(&env, 2);
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin_transfer(&admin, &new_admin, &1u32);
+
+    let signer1 = signers.get(0).unwrap();
+    client.multisig_approve(&signer1, &1u32);
+
+    let result = client.try_execute_admin_transfer();
+    assert_eq!(result, Err(Ok(Error::MultiSigThresholdNotMet)));
+
+    // Admin key is unchanged.
+    let res = client.try_admin_resume_escrow(&new_admin);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_execute_admin_transfer_succeeds_after_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, signers) = setup_multisig(&env, 2);
+    let new_admin = Address::generate(&env);
+
+    client.propose_admin_transfer(&admin, &new_admin, &1u32);
+
+    let signer1 = signers.get(0).unwrap();
+    let signer2 = signers.get(1).unwrap();
+    client.multisig_approve(&signer1, &1u32);
+    client.multisig_approve(&signer2, &1u32);
+
+    client.execute_admin_transfer();
+
+    assert!(client.get_pending_admin_transfer().is_none());
+
+    // The new admin can now perform admin actions; the old admin can no
+    // longer do so.
+    client.admin_pause_escrow(&new_admin);
+    let res = client.try_admin_resume_escrow(&admin);
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_cancel_admin_transfer_proposal_clears_lock_and_allows_new_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _signers) = setup_multisig(&env, 2);
+    let new_admin_1 = Address::generate(&env);
+    let new_admin_2 = Address::generate(&env);
+
+    client.propose_admin_transfer(&admin, &new_admin_1, &1u32);
+    client.cancel_admin_transfer_proposal(&admin);
+    assert!(client.get_pending_admin_transfer().is_none());
+
+    client.propose_admin_transfer(&admin, &new_admin_2, &2u32);
+    let pending = client.get_pending_admin_transfer().unwrap();
+    assert_eq!(pending.new_admin, new_admin_2);
+}
+
+#[test]
+fn test_propose_admin_transfer_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_escrow_for_multisig(&env);
+    let impostor = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    let result = client.try_propose_admin_transfer(&impostor, &new_admin, &1u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_execute_admin_transfer_no_pending_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_escrow_for_multisig(&env);
+
+    let result = client.try_execute_admin_transfer();
+    assert_eq!(result, Err(Ok(Error::NoPendingAdminTransfer)));
+}
+
+#[test]
+fn test_cancel_admin_transfer_no_pending_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin) = setup_escrow_for_multisig(&env);
+
+    let result = client.try_cancel_admin_transfer_proposal(&admin);
+    assert_eq!(result, Err(Ok(Error::NoPendingAdminTransfer)));
+}
+
+#[test]
+fn test_propose_admin_transfer_zero_address_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin) = setup_escrow_for_multisig(&env);
+    let zero_account = Address::from_str(
+        &env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    );
+
+    let result = client.try_propose_admin_transfer(&admin, &zero_account, &1u32);
+    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
+}
+
+// ============================================================================
+// admin_override_streaming_release — payment_streaming_milestones /
+// milestone_time_extensions emergency admin resolution test suite
+// ============================================================================
+
+#[test]
+fn test_admin_override_streaming_release_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _arbiter, admin_addr, _token, _contract_id, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+
+    let split = escrow.admin_override_streaming_release(&admin_addr, &0u32, &30i128, &100i128);
+    assert_eq!(split.first, 300);
+    assert_eq!(split.second, 700);
+
+    let job = escrow.get_job();
+    let milestone = job.milestones.get(0).unwrap();
+    assert_eq!(milestone.status, MilestoneStatus::Released);
+    // released_amount tracks the freelancer-paid portion only (consistent
+    // with apply_dispute_arbitration_split), not the total settled amount.
+    assert_eq!(milestone.released_amount, 300);
+}
+
+#[test]
+fn test_admin_override_streaming_release_zero_elapsed_refunds_client() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _arbiter, admin_addr, _token, _contract_id, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+
+    let split = escrow.admin_override_streaming_release(&admin_addr, &0u32, &0i128, &100i128);
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 1_000);
+
+    let job = escrow.get_job();
+    let milestone = job.milestones.get(0).unwrap();
+    assert_eq!(milestone.status, MilestoneStatus::Refunded);
+}
+
+/// The core validation check: only the verified admin key can trigger this
+/// override.
+#[test]
+fn test_admin_override_streaming_release_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _arbiter, _admin_addr, _token, _contract_id, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+
+    let impostor = Address::generate(&env);
+    let result = escrow.try_admin_override_streaming_release(&impostor, &0u32, &30i128, &100i128);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+    let job = escrow.get_job();
+    assert_eq!(
+        job.milestones.get(0).unwrap().status,
+        MilestoneStatus::Disputed
+    );
+}
+
+#[test]
+fn test_admin_override_streaming_release_requires_disputed_status() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_client_addr, freelancer_addr, _arbiter, admin_addr, _token, _contract_id, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+
+    let result = escrow.try_admin_override_streaming_release(&admin_addr, &0u32, &30i128, &100i128);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+#[test]
+fn test_admin_override_streaming_release_invalid_time_params_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _arbiter, admin_addr, _token, _contract_id, escrow) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    escrow.mark_delivered(&freelancer_addr, &0u32);
+    escrow.raise_dispute(&client_addr, &0u32);
+
+    let result =
+        escrow.try_admin_override_streaming_release(&admin_addr, &0u32, &150i128, &100i128);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
