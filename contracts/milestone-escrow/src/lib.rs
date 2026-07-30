@@ -33,6 +33,15 @@ pub enum Error {
     MultiSigTooManySigners = 18,
     MultiSigInvalidThreshold = 19,
     MultiSigDuplicateSigner = 20,
+    /// A new `propose_admin_transfer` was attempted while one was already
+    /// pending execution or cancellation.
+    AdminTransferPending = 21,
+    /// `execute_admin_transfer` / `cancel_admin_transfer_proposal` was called
+    /// with no proposal currently pending.
+    NoPendingAdminTransfer = 22,
+    /// `execute_admin_transfer` was called before the proposal's multisig
+    /// approval threshold was reached.
+    MultiSigThresholdNotMet = 23,
 }
 
 const BPS_SCALE: u32 = 10_000;
@@ -186,6 +195,18 @@ pub enum DataKey {
     /// Appended at the end of `DataKey` so existing variant discriminants stay
     /// stable (serialization compatibility for already-written ledger entries).
     ArbitrationSplitBps(u32),
+    /// Persistent: records an in-flight multisig-gated admin transfer
+    /// proposal created by `propose_admin_transfer`. Presence of this key
+    /// blocks any further `propose_admin_transfer` calls until the pending
+    /// proposal is executed (`execute_admin_transfer`) or cancelled
+    /// (`cancel_admin_transfer_proposal`), so the signer approvals already
+    /// collected can never be silently redirected to a different
+    /// `new_admin` mid-flight.
+    ///
+    /// Appended at the end of `DataKey` so existing variant discriminants
+    /// stay stable (serialization compatibility for already-written ledger
+    /// entries).
+    PendingAdminTransfer,
 }
 
 #[contracttype]
@@ -482,6 +503,33 @@ pub struct AdminOverrideRefundEvent {
     pub amount: i128,
 }
 
+/// Emitted by `set_interest_yield_consent` once both the client
+/// and freelancer have authorized the share change alongside the admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowInterestYieldConsentSetEvent {
+    pub admin: Address,
+    pub client: Address,
+    pub freelancer: Address,
+    pub client_share_bps: u32,
+    pub freelancer_share_bps: u32,
+}
+
+/// Emitted by `admin_override_streaming_release` when the admin proportionally
+/// settles a `Disputed` milestone using the streaming/time-extension split.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminOverrideStreamingReleaseEvent {
+    pub admin: Address,
+    pub contract_id: Address,
+    pub milestone_index: u32,
+    pub client: Address,
+    pub freelancer: Address,
+    pub token: Address,
+    pub client_refund: i128,
+    pub freelancer_payout: i128,
+}
+
 /// Result of checking whether a multisig proposal has reached the threshold.
 /// Returned by `is_multisig_approved` to give callers both the boolean
 /// decision and the raw approval bitmap for off-chain inspection.
@@ -492,6 +540,46 @@ pub struct MultiSigApprovalState {
     pub approvals: u32,
     pub threshold: u32,
     pub bitmap: u32,
+}
+
+/// Stored in `DataKey::PendingAdminTransfer` by `propose_admin_transfer`.
+/// Read by `execute_admin_transfer` (to check the multisig threshold and
+/// apply the swap) and `cancel_admin_transfer_proposal` /
+/// `get_pending_admin_transfer`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminTransfer {
+    pub new_admin: Address,
+    pub proposal_id: u32,
+}
+
+/// Emitted by `propose_admin_transfer` when a new multisig-gated admin
+/// transfer proposal is created.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferProposedEvent {
+    pub admin: Address,
+    pub new_admin: Address,
+    pub proposal_id: u32,
+}
+
+/// Emitted by `execute_admin_transfer` once the proposal's multisig
+/// threshold is reached and the admin key is swapped.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferExecutedEvent {
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub proposal_id: u32,
+}
+
+/// Emitted by `cancel_admin_transfer_proposal` when the admin clears a
+/// pending proposal without executing it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCancelledEvent {
+    pub admin: Address,
+    pub proposal_id: u32,
 }
 
 /// Emitted by `admin_pause_escrow` when the admin freezes normal operations.
@@ -2831,6 +2919,154 @@ impl MilestoneEscrow {
         })
     }
 
+    // ── multisig_transfer_admin: transaction status lock ───────────────────
+    //
+    // `propose_admin_transfer` / `execute_admin_transfer` /
+    // `cancel_admin_transfer_proposal` build a status lock on top of the
+    // generic multisig approval bitmap above: once a transfer is proposed,
+    // `DataKey::PendingAdminTransfer` is set and no further proposal can be
+    // created until the pending one executes or is explicitly cancelled by
+    // the admin. This prevents the signer approvals already being collected
+    // for one `new_admin` from being silently redirected mid-flight by a
+    // second, overlapping proposal.
+
+    /// Propose a new admin via the multisig approval workflow.
+    ///
+    /// # Errors
+    /// * `NotInitialized`       – Contract not initialised.
+    /// * `Unauthorized`         – Caller is not the stored admin.
+    /// * `InvalidAddress`       – `new_admin` is a zero address.
+    /// * `AdminTransferPending` – A proposal is already pending; execute or
+    ///   cancel it before proposing another.
+    pub fn propose_admin_transfer(
+        env: Env,
+        admin: Address,
+        new_admin: Address,
+        proposal_id: u32,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+
+        let zero_account = Address::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        );
+        let zero_contract = Address::from_str(
+            &env,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        );
+        if new_admin == zero_account || new_admin == zero_contract {
+            return Err(Error::InvalidAddress);
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingAdminTransfer)
+        {
+            return Err(Error::AdminTransferPending);
+        }
+
+        env.storage().persistent().set(
+            &DataKey::PendingAdminTransfer,
+            &PendingAdminTransfer {
+                new_admin: new_admin.clone(),
+                proposal_id,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("adminprp"),),
+            AdminTransferProposedEvent {
+                admin,
+                new_admin,
+                proposal_id,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Execute a pending admin transfer once its multisig proposal has
+    /// reached the configured approval threshold. Any caller may trigger
+    /// execution — the safety guarantee comes from the collected signer
+    /// approvals, not caller identity — but nothing happens unless
+    /// `is_multisig_approved` reports the threshold met.
+    ///
+    /// # Errors
+    /// * `NoPendingAdminTransfer`  – No transfer is currently proposed.
+    /// * `NotInitialized`          – Multisig has not been initialised.
+    /// * `MultiSigThresholdNotMet` – Approvals collected so far are below the
+    ///   required threshold.
+    pub fn execute_admin_transfer(env: Env) -> Result<(), Error> {
+        let pending: PendingAdminTransfer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminTransfer)
+            .ok_or(Error::NoPendingAdminTransfer)?;
+
+        let state = Self::is_multisig_approved(env.clone(), pending.proposal_id)?;
+        if !state.approved {
+            return Err(Error::MultiSigThresholdNotMet);
+        }
+
+        let old_admin = Self::load_admin(&env)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Admin, &pending.new_admin);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingAdminTransfer);
+
+        env.events().publish(
+            (symbol_short!("adminexc"),),
+            AdminTransferExecutedEvent {
+                old_admin,
+                new_admin: pending.new_admin,
+                proposal_id: pending.proposal_id,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending admin-transfer proposal, clearing the lock so a new
+    /// one can be proposed. Only the current admin may cancel.
+    ///
+    /// # Errors
+    /// * `NotInitialized`         – Contract not initialised.
+    /// * `Unauthorized`           – Caller is not the stored admin.
+    /// * `NoPendingAdminTransfer` – Nothing is currently pending.
+    pub fn cancel_admin_transfer_proposal(env: Env, admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+
+        let pending: PendingAdminTransfer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminTransfer)
+            .ok_or(Error::NoPendingAdminTransfer)?;
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingAdminTransfer);
+
+        env.events().publish(
+            (symbol_short!("admincxl"),),
+            AdminTransferCancelledEvent {
+                admin,
+                proposal_id: pending.proposal_id,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Return the currently pending admin-transfer proposal, if any.
+    pub fn get_pending_admin_transfer(env: Env) -> Option<PendingAdminTransfer> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAdminTransfer)
+    }
+
     pub fn version(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::Version).unwrap_or(1)
     }
@@ -2923,6 +3159,68 @@ impl MilestoneEscrow {
                 locked: false,
             },
         );
+        Ok(())
+    }
+
+    /// Update interest/yield share configuration with **dual consent**: both
+    /// the client and the freelancer must independently authorize the
+    /// transaction, in addition to the admin.
+    ///
+    /// `set_escrow_interest_yield` lets the platform admin unilaterally
+    /// reallocate yield between the two parties. This endpoint exists for
+    /// deployments that want to remove that single point of trust for
+    /// share changes: a compromised or malicious admin key alone cannot move
+    /// funds between client and freelancer here, because `client.require_auth()`
+    /// and `freelancer.require_auth()` must both succeed. If either party's
+    /// signature is missing from the transaction, the host-level auth check
+    /// panics before any state is touched — a single-signature attempt never
+    /// reaches the validation logic below, let alone mutates storage.
+    ///
+    /// # Errors
+    /// * `NotInitialized` – Contract admin key or job metadata missing.
+    /// * `Unauthorized`   – `admin` does not match the stored admin.
+    /// * `InvalidRatio`   – Shares do not sum to exactly 10 000 bps.
+    /// * `EscrowLocked`   – Configuration is locked for execution.
+    pub fn set_interest_yield_consent(
+        env: Env,
+        admin: Address,
+        client_share_bps: u32,
+        freelancer_share_bps: u32,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        let meta = Self::load_job_meta(&env)?;
+
+        // Both parties must independently sign this transaction. A missing
+        // signature causes require_auth to panic at the host level.
+        meta.client.require_auth();
+        meta.freelancer.require_auth();
+
+        Self::validate_interest_yield_share_config(client_share_bps, freelancer_share_bps)?;
+
+        if env.storage().instance().has(&DataKey::InterestYieldState) {
+            Self::ensure_interest_yield_unlocked(&env)?;
+        }
+
+        Self::store_interest_yield_state(
+            &env,
+            &EscrowInterestYieldState {
+                client_share_bps,
+                freelancer_share_bps,
+                locked: false,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("yldcons"),),
+            EscrowInterestYieldConsentSetEvent {
+                admin,
+                client: meta.client,
+                freelancer: meta.freelancer,
+                client_share_bps,
+                freelancer_share_bps,
+            },
+        );
+
         Ok(())
     }
 
@@ -3257,6 +3555,128 @@ impl MilestoneEscrow {
         );
 
         Ok(())
+    }
+
+    /// Emergency admin resolution for a milestone stuck in `Disputed` status,
+    /// using the streaming/time-extension proportional split
+    /// (`milestone_time_extensions` / `payment_streaming_milestones`) instead
+    /// of the all-or-nothing `admin_override_release` / `admin_override_refund`.
+    ///
+    /// Intended for the case where the arbiter is unreachable and the normal
+    /// `resolve_dispute` / `apply_dispute_arbitration_split` flow cannot
+    /// proceed: the admin attests how much of an extension window
+    /// (`elapsed_seconds` of `total_seconds`) had elapsed and the remaining
+    /// balance is split proportionally between freelancer and client in a
+    /// single settlement.
+    ///
+    /// # Parameters
+    /// * `admin`           – Must match `DataKey::Admin`.
+    /// * `milestone_index` – Target milestone; must currently be `Disputed`.
+    /// * `elapsed_seconds` – Portion of the extension window already elapsed.
+    /// * `total_seconds`   – Full length of the extension window.
+    ///
+    /// # Errors
+    /// * `NotInitialized`  – Contract has not been initialised.
+    /// * `Unauthorized`    – `admin` is not the stored admin.
+    /// * `NotFunded`       – Escrow has not been funded.
+    /// * `InvalidMilestone`– `milestone_index` is out of range.
+    /// * `InvalidStatus`   – Milestone is not currently `Disputed`.
+    /// * `InvalidAmount`   – Remaining balance is ≤ 0, or arithmetic overflow.
+    /// * `InvalidRatio`    – `total_seconds` ≤ 0, or `elapsed_seconds` is
+    ///                       negative or exceeds `total_seconds`.
+    pub fn admin_override_streaming_release(
+        env: Env,
+        admin: Address,
+        milestone_index: u32,
+        elapsed_seconds: i128,
+        total_seconds: i128,
+    ) -> Result<RatioSplit, Error> {
+        Self::require_admin(&env, &admin)?;
+
+        let meta = Self::load_job_meta(&env)?;
+        if !meta.funded {
+            return Err(Error::NotFunded);
+        }
+        if milestone_index >= meta.milestone_count {
+            return Err(Error::InvalidMilestone);
+        }
+
+        let mut milestone = Self::load_milestone(&env, milestone_index)?;
+        if milestone.status != MilestoneStatus::Disputed {
+            return Err(Error::InvalidStatus);
+        }
+
+        let remaining = milestone
+            .amount
+            .checked_sub(milestone.released_amount)
+            .ok_or(Error::InvalidAmount)?;
+        if remaining <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let split = Self::milestone_time_extensions(
+            env.clone(),
+            remaining,
+            elapsed_seconds,
+            total_seconds,
+        )?;
+
+        let token_client = token::Client::new(&env, &meta.token);
+        let contract_addr = env.current_contract_address();
+        let contract_balance = token_client.balance(&contract_addr);
+        if contract_balance <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Cap transfers to available contract balance while preserving the
+        // proportional split intent (client first, then freelancer remainder).
+        let client_refund = split.second.min(contract_balance);
+        let freelancer_cap = contract_balance
+            .checked_sub(client_refund)
+            .ok_or(Error::InvalidAmount)?;
+        let freelancer_payout = split.first.min(freelancer_cap);
+
+        if client_refund > 0 {
+            token_client.transfer(&contract_addr, &meta.client, &client_refund);
+        }
+        if freelancer_payout > 0 {
+            token_client.transfer(&contract_addr, &meta.freelancer, &freelancer_payout);
+        }
+
+        milestone.released_amount = milestone
+            .released_amount
+            .checked_add(freelancer_payout)
+            .ok_or(Error::InvalidAmount)?;
+
+        if freelancer_payout == 0 {
+            milestone.status = MilestoneStatus::Refunded;
+        } else {
+            milestone.status = MilestoneStatus::Released;
+            Self::store_milestone_released(&env, milestone_index);
+            Self::increment_reputation(&env, &meta.client);
+            Self::increment_reputation(&env, &meta.freelancer);
+        }
+
+        Self::store_milestone(&env, milestone_index, &milestone);
+
+        env.events().publish(
+            (symbol_short!("admstrm"),),
+            AdminOverrideStreamingReleaseEvent {
+                admin,
+                contract_id: contract_addr,
+                milestone_index,
+                client: meta.client,
+                freelancer: meta.freelancer,
+                token: meta.token,
+                client_refund,
+                freelancer_payout,
+            },
+        );
+
+        Ok(RatioSplit {
+            first: freelancer_payout,
+            second: client_refund,
+        })
     }
 
     // ── pause / resume ────────────────────────────────────────────────────────
