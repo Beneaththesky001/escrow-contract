@@ -6058,17 +6058,21 @@ fn test_payment_streaming_milestones_zero_denominator_fails() {
     );
 }
 
+/// Boundary guard — ZERO AMOUNT:
+/// A zero escrow balance means there is nothing to stream.
+/// payment_streaming_milestones must reject this with Error::InvalidAmount.
 #[test]
-fn test_payment_streaming_milestones_zero_amount_splits_to_zeros() {
+fn test_payment_streaming_milestones_zero_amount_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let split = client.payment_streaming_milestones(&0_i128, &1_i128, &2_i128);
-    assert_eq!(split.first, 0);
-    assert_eq!(split.second, 0);
+    assert_eq!(
+        client.try_payment_streaming_milestones(&0_i128, &1_i128, &2_i128),
+        Err(Ok(Error::InvalidAmount))
+    );
 }
 
 #[test]

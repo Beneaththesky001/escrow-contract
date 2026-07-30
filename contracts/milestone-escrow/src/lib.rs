@@ -555,6 +555,22 @@ pub struct PaymentStreamingEvent {
     pub client_refund: i128,
 }
 
+/// Emitted by `multisig_transfer_admin` after a successful proportional
+/// allocation of `total_amount` across all ratio entries.  Downstream
+/// indexers can use this event to audit every admin-triggered multi-party
+/// transfer without querying contract storage directly.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiSigTransferAdminEvent {
+    /// The total amount that was distributed.
+    pub total_amount: i128,
+    /// The number of parties the amount was split between.
+    pub num_parties: u32,
+    /// The resulting allocation per party, in the same order as the input
+    /// ratios.  Guaranteed to sum exactly to `total_amount`.
+    pub allocations: Vec<i128>,
+}
+
 #[contract]
 pub struct MilestoneEscrow;
 
@@ -2454,7 +2470,11 @@ impl MilestoneEscrow {
         numerator: i128,
         denominator: i128,
     ) -> Result<RatioSplit, Error> {
-        if total_amount < 0 {
+        // Guard: reject zero or negative totals so that streaming operations
+        // are never initiated on an empty balance.  A zero total would
+        // distribute nothing to either party and signals a misconfigured or
+        // already-drained escrow.
+        if total_amount <= 0 {
             return Err(Error::InvalidAmount);
         }
         if denominator <= 0 {
