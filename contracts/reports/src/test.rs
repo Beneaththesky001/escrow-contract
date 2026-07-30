@@ -770,6 +770,66 @@ fn test_raise_dispute_unauthorized_fails() {
 }
 
 #[test]
+fn test_raise_dispute_emits_structured_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+    token_admin.mint(&client_addr, &1_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 1_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+    client.fund(&client_addr);
+    client.raise_dispute(&client_addr, &0u32);
+
+    let dispute_topic: Symbol = symbol_short!("dispute");
+    let dispute_topic_val: Val = dispute_topic.into_val(&env);
+    let mut dispute_events = 0u32;
+    for event in env.events().all().iter() {
+        if let Some(topic) = event.1.get(0) {
+            if topic.get_payload() == dispute_topic_val.get_payload() {
+                dispute_events += 1;
+                assert_eq!(event.1.len(), 1);
+                assert_eq!(
+                    DisputeRaisedEvent::from_val(&env, &event.2),
+                    DisputeRaisedEvent {
+                        contract_id: contract_id.clone(),
+                        milestone_index: 0,
+                        caller: client_addr.clone(),
+                        client: client_addr.clone(),
+                        freelancer: freelancer_addr.clone(),
+                        arbiter: arbiter_addr.clone(),
+                        token: token_contract_id.clone(),
+                        amount: 1_000,
+                        released_amount: 0,
+                        status: MilestoneStatus::Disputed,
+                    }
+                );
+            }
+        }
+    }
+    assert_eq!(dispute_events, 1);
+}
+
+#[test]
 fn test_raise_dispute_wrong_status_fails() {
     let env = Env::default();
     env.mock_all_auths();

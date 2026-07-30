@@ -218,8 +218,16 @@ pub struct ApprovedEvent {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeRaisedEvent {
+    pub contract_id: Address,
     pub milestone_index: u32,
     pub caller: Address,
+    pub client: Address,
+    pub freelancer: Address,
+    pub arbiter: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub released_amount: i128,
+    pub status: MilestoneStatus,
 }
 
 #[contracttype]
@@ -1504,8 +1512,16 @@ impl MilestoneEscrow {
         env.events().publish(
             (symbol_short!("dispute"),),
             DisputeRaisedEvent {
+                contract_id: env.current_contract_address(),
                 milestone_index,
                 caller,
+                client: meta.client.clone(),
+                freelancer: meta.freelancer.clone(),
+                arbiter: meta.arbiter.clone(),
+                token: meta.token.clone(),
+                amount: milestone.amount,
+                released_amount: milestone.released_amount,
+                status: milestone.status.clone(),
             },
         );
 
