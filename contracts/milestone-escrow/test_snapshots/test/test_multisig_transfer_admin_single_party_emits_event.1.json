@@ -82,53 +82,32 @@
           "v0": {
             "topics": [
               {
-                "symbol": "p_stream"
+                "symbol": "msigtrx"
               }
             ],
             "data": {
               "map": [
                 {
                   "key": {
-                    "symbol": "client_refund"
+                    "symbol": "allocations"
                   },
                   "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 50
-                    }
+                    "vec": [
+                      {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 500
+                        }
+                      }
+                    ]
                   }
                 },
                 {
                   "key": {
-                    "symbol": "denominator"
+                    "symbol": "num_parties"
                   },
                   "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 2
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "numerator"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 1
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "streamed_payout"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 51
-                    }
+                    "u32": 1
                   }
                 },
                 {
@@ -138,7 +117,7 @@
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 101
+                      "lo": 500
                     }
                   }
                 }
