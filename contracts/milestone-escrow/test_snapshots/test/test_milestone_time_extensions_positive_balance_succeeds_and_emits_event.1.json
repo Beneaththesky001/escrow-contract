@@ -82,54 +82,63 @@
           "v0": {
             "topics": [
               {
-                "symbol": "msigtrx"
+                "symbol": "m_ext"
               }
             ],
             "data": {
               "map": [
                 {
                   "key": {
-                    "symbol": "allocations"
-                  },
-                  "val": {
-                    "vec": [
-                      {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 34
-                        }
-                      },
-                      {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 33
-                        }
-                      },
-                      {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 33
-                        }
-                      }
-                    ]
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "num_parties"
-                  },
-                  "val": {
-                    "u32": 3
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "total_amount"
+                    "symbol": "amount"
                   },
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 100
+                      "lo": 600
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "client_refund"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 400
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "elapsed_seconds"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 1
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "freelancer_share"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 200
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "total_seconds"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 3
                     }
                   }
                 }
