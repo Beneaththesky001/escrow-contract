@@ -5,6 +5,13 @@
   },
   "auth": [
     [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
     []
   ],
   "ledger": {
@@ -72,82 +79,5 @@
       ]
     ]
   },
-  "events": [
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
-        "type_": "contract",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "p_stream"
-              }
-            ],
-            "data": {
-              "map": [
-                {
-                  "key": {
-                    "symbol": "client_refund"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 50
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "denominator"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 2
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "numerator"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 1
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "streamed_payout"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 51
-                    }
-                  }
-                },
-                {
-                  "key": {
-                    "symbol": "total_amount"
-                  },
-                  "val": {
-                    "i128": {
-                      "hi": 0,
-                      "lo": 101
-                    }
-                  }
-                }
-              ]
-            }
-          }
-        }
-      },
-      "failed_call": false
-    }
-  ]
+  "events": []
 }
