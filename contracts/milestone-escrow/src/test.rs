@@ -5990,6 +5990,8 @@ fn test_emergency_pause_override_unblocks_operations() {
     assert_eq!(funded_result, Err(Ok(Error::AlreadyFunded)));
 }
 
+// payment_streaming_milestones — comprehensive unit test suite (#265)
+
 #[test]
 fn test_payment_streaming_milestones_ratio_split_is_precise_and_conservative() {
     let env = Env::default();
@@ -6012,8 +6014,138 @@ fn test_payment_streaming_milestones_invalid_ratio_fails() {
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
-    let result = client.try_payment_streaming_milestones(&100_i128, &7_i128, &3_i128);
-    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+    // Negative numerator
+    assert_eq!(
+        client.try_payment_streaming_milestones(&100_i128, &-1_i128, &3_i128),
+        Err(Ok(Error::InvalidRatio))
+    );
+    // Numerator > denominator
+    assert_eq!(
+        client.try_payment_streaming_milestones(&100_i128, &4_i128, &3_i128),
+        Err(Ok(Error::InvalidRatio))
+    );
+}
+
+#[test]
+fn test_payment_streaming_milestones_negative_amount_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.try_payment_streaming_milestones(&-1_i128, &1_i128, &2_i128),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
+fn test_payment_streaming_milestones_zero_denominator_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.try_payment_streaming_milestones(&100_i128, &1_i128, &0_i128),
+        Err(Ok(Error::InvalidRatio))
+    );
+    assert_eq!(
+        client.try_payment_streaming_milestones(&100_i128, &1_i128, &-1_i128),
+        Err(Ok(Error::InvalidRatio))
+    );
+}
+
+#[test]
+fn test_payment_streaming_milestones_zero_amount_splits_to_zeros() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.payment_streaming_milestones(&0_i128, &1_i128, &2_i128);
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 0);
+}
+
+#[test]
+fn test_payment_streaming_milestones_full_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.payment_streaming_milestones(&1000_i128, &100_i128, &100_i128);
+    assert_eq!(split.first, 1000);
+    assert_eq!(split.second, 0);
+}
+
+#[test]
+fn test_payment_streaming_milestones_zero_numerator() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let split = client.payment_streaming_milestones(&1000_i128, &0_i128, &100_i128);
+    assert_eq!(split.first, 0);
+    assert_eq!(split.second, 1000);
+}
+
+#[test]
+fn test_payment_streaming_milestones_overflow_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.try_payment_streaming_milestones(&i128::MAX, &i128::MAX, &i128::MAX),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+#[test]
+fn test_payment_streaming_milestones_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amount = 1_000_i128;
+    let num = 300_i128;
+    let den = 600_i128;
+
+    let split = client.payment_streaming_milestones(&amount, &num, &den);
+    assert_eq!(split.first, 500);
+    assert_eq!(split.second, 500);
+
+    let events = env.events().all();
+    let p_stream_topic: Symbol = symbol_short!("p_stream");
+    let p_stream_topic_val: Val = p_stream_topic.into_val(&env);
+
+    let mut found_event = false;
+    for e in events.iter() {
+        if let Some(topic) = e.1.get(0) {
+            if topic.get_payload() == p_stream_topic_val.get_payload() {
+                found_event = true;
+                let event_data = PaymentStreamingEvent::from_val(&env, &e.2);
+                assert_eq!(event_data.total_amount, amount);
+                assert_eq!(event_data.numerator, num);
+                assert_eq!(event_data.denominator, den);
+                assert_eq!(event_data.streamed_payout, 500);
+                assert_eq!(event_data.client_refund, 500);
+            }
+        }
+    }
+    assert!(found_event, "Expected p_stream event to be published");
 }
 
 #[test]
