@@ -4,6 +4,14 @@ use soroban_sdk::{
     Vec,
 };
 
+/// Maximum number of ratio slots that may be passed to `multisig_transfer_admin`.
+/// A multisig setup with more than this many signers is operationally
+/// unreasonable and would impose unbounded per-transaction CPU costs; the cap
+/// guarantees that the nested loop over `ratios` iterates at most
+/// `MAX_MULTISIG_RATIO_COUNT` times both during validation and during
+/// the largest-remainder allocation phase.
+const MAX_MULTISIG_RATIO_COUNT: u32 = 255;
+
 /// Maximum number of tokens that may be held in the whitelist at any one time.
 /// `add_whitelisted_token` enforces this cap before calling `push_back` so
 /// that the internal `u32` length counter of the Soroban `Vec` can never
@@ -2960,6 +2968,7 @@ impl MilestoneEscrow {
 
     pub fn multisig_transfer_admin(
         env: Env,
+        admin: Address,
         total_amount: i128,
         ratios: Vec<i128>,
     ) -> Result<Vec<i128>, Error> {
@@ -2973,6 +2982,10 @@ impl MilestoneEscrow {
 
         if ratios.is_empty() {
             return Err(Error::InvalidRatio);
+        }
+
+        if ratios.len() > MAX_MULTISIG_RATIO_COUNT {
+            return Err(Error::InvalidAmount);
         }
 
         let mut ratio_sum: i128 = 0;

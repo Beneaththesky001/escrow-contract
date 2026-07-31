@@ -6301,16 +6301,62 @@ fn test_payment_streaming_milestones_emits_event() {
     assert!(found_event, "Expected p_stream event to be published");
 }
 
+fn setup_multisig_env(
+    env: &Env,
+) -> (
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+    MilestoneEscrowClient<'_>,
+) {
+    let admin_addr = Address::generate(env);
+    let client_addr = Address::generate(env);
+    let freelancer_addr = Address::generate(env);
+    let arbiter_addr = Address::generate(env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(env, &token_contract_id);
+    token_admin.mint(&client_addr, &1_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(env, &contract_id);
+
+    let amounts = vec![env, 1_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+
+    (
+        admin_addr,
+        client_addr,
+        freelancer_addr,
+        arbiter_addr,
+        token_contract_id,
+        contract_id,
+        client,
+    )
+}
+
 #[test]
 fn test_multisig_transfer_admin_ratio_split_preserves_total() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
 
     let ratios = vec![&env, 1_i128, 1_i128, 1_i128];
-    let allocations = client.multisig_transfer_admin(&100_i128, &ratios);
+    let allocations = client.multisig_transfer_admin(&admin_addr, &100_i128, &ratios);
     assert_eq!(allocations.len(), 3);
     assert_eq!(allocations.get(0).unwrap(), 34);
     assert_eq!(allocations.get(1).unwrap(), 33);
@@ -6325,14 +6371,303 @@ fn test_multisig_transfer_admin_invalid_ratio_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
 
     let ratios = vec![&env, 0_i128, 0_i128];
-    let result = client.try_multisig_transfer_admin(&100_i128, &ratios);
+    let result = client.try_multisig_transfer_admin(&admin_addr, &100_i128, &ratios);
     assert_eq!(result, Err(Ok(Error::InvalidRatio)));
 }
 
+#[test]
+fn test_multisig_transfer_admin_before_initialize_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin_addr = Address::generate(&env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let ratios = vec![&env, 1_i128, 1_i128];
+    let result = client.try_multisig_transfer_admin(&admin_addr, &100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+}
+
+#[test]
+fn test_multisig_transfer_admin_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+    let bad_actor = Address::generate(&env);
+
+    let ratios = vec![&env, 1_i128, 1_i128];
+    let result = client.try_multisig_transfer_admin(&bad_actor, &100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+    let client_addr = Address::generate(&env);
+    let result = client.try_multisig_transfer_admin(&client_addr, &100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+    let _ = admin_addr;
+}
+
+#[test]
+fn test_multisig_transfer_admin_zero_total_amount_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, 1_i128, 1_i128];
+    let result = client.try_multisig_transfer_admin(&admin_addr, &0_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_multisig_transfer_admin_negative_total_amount_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, 1_i128, 1_i128];
+    let result = client.try_multisig_transfer_admin(&admin_addr, &(-1_i128), &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_multisig_transfer_admin_empty_ratios_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = soroban_sdk::Vec::new(&env);
+    let result = client.try_multisig_transfer_admin(&admin_addr, &100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+#[test]
+fn test_multisig_transfer_admin_too_many_ratios_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let mut ratios = vec![&env];
+    for _ in 0..256u32 {
+        ratios.push_back(1_i128);
+    }
+    let result = client.try_multisig_transfer_admin(&admin_addr, &100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+
+    let mut ratios_ok = vec![&env];
+    for _ in 0..255u32 {
+        ratios_ok.push_back(1_i128);
+    }
+    let allocs = client.multisig_transfer_admin(&admin_addr, &255_i128, &ratios_ok);
+    let mut total = 0_i128;
+    for i in 0..allocs.len() {
+        total += allocs.get(i).unwrap();
+    }
+    assert_eq!(total, 255);
+}
+
+#[test]
+fn test_multisig_transfer_admin_negative_single_ratio_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, 1_i128, -1_i128, 1_i128];
+    let result = client.try_multisig_transfer_admin(&admin_addr, &100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+
+    let ratios_first = vec![&env, -5_i128, 1_i128];
+    let result_first = client.try_multisig_transfer_admin(&admin_addr, &100_i128, &ratios_first);
+    assert_eq!(result_first, Err(Ok(Error::InvalidRatio)));
+}
+
+#[test]
+fn test_multisig_transfer_admin_ratio_sum_overflow_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, i128::MAX, 1_i128];
+    let result = client.try_multisig_transfer_admin(&admin_addr, &100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+#[test]
+fn test_multisig_transfer_admin_all_zero_ratios_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, 0_i128, 0_i128, 0_i128];
+    let result = client.try_multisig_transfer_admin(&admin_addr, &100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+#[test]
+fn test_multisig_transfer_admin_single_ratio_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, 1_i128];
+    let allocations = client.multisig_transfer_admin(&admin_addr, &42_i128, &ratios);
+    assert_eq!(allocations.len(), 1);
+    assert_eq!(allocations.get(0).unwrap(), 42);
+}
+
+#[test]
+fn test_multisig_transfer_admin_some_zero_ratios_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, 0_i128, 1_i128, 0_i128, 3_i128];
+    let allocations = client.multisig_transfer_admin(&admin_addr, &100_i128, &ratios);
+    assert_eq!(allocations.len(), 4);
+    assert_eq!(allocations.get(0).unwrap(), 0);
+    assert_eq!(allocations.get(2).unwrap(), 0);
+    let mut total = 0_i128;
+    for i in 0..allocations.len() {
+        total += allocations.get(i).unwrap();
+    }
+    assert_eq!(total, 100);
+}
+
+#[test]
+fn test_multisig_transfer_admin_large_weighted_mul_overflow_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, i128::MAX];
+    let result = client.try_multisig_transfer_admin(&admin_addr, &i128::MAX, &ratios);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_multisig_transfer_admin_equal_ratios_two_party() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, 1_i128, 1_i128];
+    let allocations = client.multisig_transfer_admin(&admin_addr, &101_i128, &ratios);
+    assert_eq!(allocations.len(), 2);
+    let mut total = 0_i128;
+    for i in 0..allocations.len() {
+        total += allocations.get(i).unwrap();
+    }
+    assert_eq!(total, 101);
+    let a = allocations.get(0).unwrap();
+    let b = allocations.get(1).unwrap();
+    assert!((a - b).abs() <= 1);
+}
+
+#[test]
+fn test_multisig_transfer_admin_disparate_ratios() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, 7_i128, 1_i128, 2_i128];
+    let allocations = client.multisig_transfer_admin(&admin_addr, &100_i128, &ratios);
+    let mut total = 0_i128;
+    for i in 0..allocations.len() {
+        total += allocations.get(i).unwrap();
+    }
+    assert_eq!(total, 100);
+    assert_eq!(
+        allocations.get(0).unwrap() + allocations.get(1).unwrap() + allocations.get(2).unwrap(),
+        100
+    );
+}
+
+#[test]
+fn test_multisig_transfer_admin_one_amount_one_ratio() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, 5_i128, 5_i128];
+    let allocations = client.multisig_transfer_admin(&admin_addr, &1_i128, &ratios);
+    assert_eq!(allocations.len(), 2);
+    let mut total = 0_i128;
+    for i in 0..allocations.len() {
+        total += allocations.get(i).unwrap();
+    }
+    assert_eq!(total, 1);
+}
+
+#[test]
+fn test_multisig_transfer_admin_freelancer_is_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, freelancer_addr, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, 1_i128, 1_i128];
+    let result = client.try_multisig_transfer_admin(&freelancer_addr, &100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_multisig_transfer_admin_client_is_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client_addr, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, 1_i128, 1_i128];
+    let result = client.try_multisig_transfer_admin(&client_addr, &100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_multisig_transfer_admin_arbiter_is_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, _, arbiter_addr, _, _, client) = setup_multisig_env(&env);
+
+    let ratios = vec![&env, 1_i128, 1_i128];
+    let result = client.try_multisig_transfer_admin(&arbiter_addr, &100_i128, &ratios);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_multisig_transfer_admin_ratio_at_capacity_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+
+    let mut ratios = vec![&env];
+    for _ in 0..255u32 {
+        ratios.push_back(1_i128);
+    }
+    let result = client.multisig_transfer_admin(&admin_addr, &255_i128, &ratios);
+    assert_eq!(result.len(), 255);
+    let mut total = 0_i128;
+    for i in 0..result.len() {
+        total += result.get(i).unwrap();
+    }
+    assert_eq!(total, 255);
 // ============================================================================
 // raise_dispute — comprehensive boundary / edge-case test suite (Issue #183)
 // ============================================================================
