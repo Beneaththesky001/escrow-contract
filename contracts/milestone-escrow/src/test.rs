@@ -961,6 +961,7 @@ fn test_resolve_dispute_emits_structured_event() {
                         freelancer: freelancer_addr.clone(),
                         token: token_contract_id.clone(),
                         amount: 1_000,
+                        paid_amount: 1_000,
                         released_to_freelancer: true,
                         status: MilestoneStatus::Released,
                     }
@@ -970,6 +971,63 @@ fn test_resolve_dispute_emits_structured_event() {
     }
 
     assert_eq!(resolve_events, 1);
+}
+
+/// Event field: resolve_dispute reports the amount actually transferred
+/// (`paid_amount`) separately from the amount owed (`amount`) so indexers
+/// aren't misled when a shortfall in the contract's balance caps the
+/// payout below what was due.
+#[test]
+fn test_resolve_dispute_paid_amount_reflects_capped_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let token_contract_id = env.register(mock_token::MockToken, ());
+    let token = mock_token::MockTokenClient::new(&env, &token_contract_id);
+    token.mint(&client_addr, &1_000_i128);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 1_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+    client.fund(&client_addr);
+    client.mark_delivered(&freelancer_addr, &0u32);
+    client.raise_dispute(&client_addr, &0u32);
+
+    // Drain most of the contract's balance externally, leaving less than
+    // the milestone's owed amount available to pay out.
+    let token = mock_token::MockTokenClient::new(&env, &token_contract_id);
+    token.transfer(&contract_id, &client_addr, &700_i128);
+
+    client.resolve_dispute(&arbiter_addr, &0u32, &true);
+
+    let resolve_topic: Symbol = symbol_short!("resolve");
+    let resolve_topic_val: Val = resolve_topic.into_val(&env);
+    let mut matched = 0u32;
+    for event in env.events().all().iter() {
+        if let Some(topic) = event.1.get(0) {
+            if topic.get_payload() == resolve_topic_val.get_payload() {
+                matched += 1;
+                let decoded = DisputeResolvedEvent::from_val(&env, &event.2);
+                assert_eq!(decoded.amount, 1_000);
+                assert_eq!(decoded.paid_amount, 300);
+            }
+        }
+    }
+    assert_eq!(matched, 1);
 }
 
 #[test]
@@ -6359,6 +6417,82 @@ fn test_raise_dispute_no_auth_fails() {
     assert!(matches!(result, Err(Err(_))));
 }
 
+/// Gas-scaling audit: raise_dispute reads/writes a single keyed milestone
+/// entry (`DataKey::Milestone(index)`), not a scan over the job's full
+/// milestone list, so its cost must stay roughly flat as the milestone
+/// count grows from 8 to 128+.
+fn raise_dispute_budget_for_milestone_count(count: u32) -> (u64, u64) {
+    let env = env_without_snapshot();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let escrow = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let mut amounts = vec![&env];
+    for _ in 0..count {
+        amounts.push_back(1_i128);
+    }
+    let total: i128 = count as i128;
+
+    escrow.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+    token_admin.mint(&client_addr, &total);
+    escrow.fund(&client_addr);
+
+    // Dispute the last milestone so any accidental linear scan over the
+    // earlier entries would show up in the measured cost.
+    let target_index = count - 1;
+
+    let mut budget = env.cost_estimate().budget();
+    budget.reset_default();
+
+    escrow.raise_dispute(&client_addr, &target_index);
+
+    let budget = env.cost_estimate().budget();
+    (budget.cpu_instruction_cost(), budget.memory_bytes_cost())
+}
+
+#[test]
+fn test_raise_dispute_gas_is_constant_for_many_milestones() {
+    let (cpu_8, memory_8) = raise_dispute_budget_for_milestone_count(8);
+    let (cpu_128, memory_128) = raise_dispute_budget_for_milestone_count(128);
+
+    assert!(cpu_8 > 0);
+    assert!(cpu_128 > 0);
+    assert!(
+        cpu_128 < cpu_8.saturating_mul(2),
+        "raise_dispute cost must not scale with milestone count: cpu {} -> {}",
+        cpu_8,
+        cpu_128
+    );
+
+    assert!(memory_8 > 0);
+    assert!(memory_128 > 0);
+    assert!(
+        memory_128 < memory_8.saturating_mul(2),
+        "raise_dispute memory must not scale with milestone count: memory {} -> {}",
+        memory_8,
+        memory_128
+    );
+}
+
 // ============================================================================
 // multisig_approval — comprehensive unit test suite (Issue #184, #166)
 // ============================================================================
@@ -6390,10 +6524,38 @@ fn setup_escrow_for_multisig(env: &Env) -> (MilestoneEscrowClient<'_>, Address) 
     (client, admin)
 }
 
-/// Helper: register a fresh contract and initialise multisig with three
-/// signers and a threshold of 2.
+/// Helper: register a fresh contract, fund it, and initialise multisig with
+/// three signers and a threshold of 2. `multisig_approve` guards against a
+/// zero contract balance, so this helper funds the escrow (unlike
+/// `setup_escrow_for_multisig`, which intentionally leaves it unfunded for
+/// `multisig_approval_init`-only tests) before setting up signers.
 fn setup_multisig(env: &Env, threshold: u32) -> (MilestoneEscrowClient<'_>, Address, Vec<Address>) {
-    let (client, admin) = setup_escrow_for_multisig(env);
+    let admin = Address::generate(env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(env, &contract_id);
+
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(env, &token_id);
+    let dummy_client = Address::generate(env);
+    let dummy_freelancer = Address::generate(env);
+    let dummy_arbiter = Address::generate(env);
+    let amounts = vec![env, 1_000_i128];
+
+    client.initialize(
+        &admin,
+        &dummy_client,
+        &dummy_freelancer,
+        &dummy_arbiter,
+        &token_id,
+        &604800,
+        &amounts,
+    );
+
+    token_admin.mint(&dummy_client, &1_000_i128);
+    client.fund(&dummy_client);
+
     let signer1 = Address::generate(env);
     let signer2 = Address::generate(env);
     let signer3 = Address::generate(env);
@@ -6660,6 +6822,64 @@ fn test_multisig_approval_proposal_isolation() {
     let state = client.try_is_multisig_approved(&20u32).unwrap().unwrap();
     assert!(!state.approved);
     assert_eq!(state.approvals, 0);
+}
+
+/// Boundary guard: multisig_approve must be blocked when the escrow holds
+/// a zero token balance — there is nothing at stake for signers to approve
+/// against.
+#[test]
+fn test_multisig_approve_blocked_when_contract_balance_is_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Deliberately unfunded: `setup_escrow_for_multisig` initialises the job
+    // but never calls `fund`.
+    let (client, admin) = setup_escrow_for_multisig(&env);
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+    let signers = vec![&env, signer1.clone(), signer2.clone()];
+    client.multisig_approval_init(&admin, &signers, &2u32);
+
+    let result = client.try_multisig_approve(&signer1, &1u32);
+    assert_eq!(result, Err(Ok(Error::MultiSigEmptyBalance)));
+}
+
+/// Event: multisig_approve emits a structured `MultiSigApprovedEvent` on a
+/// successful call, reflecting the signer, proposal, and updated approval
+/// state so downstream indexers can track progress without polling storage.
+#[test]
+fn test_multisig_approve_emits_structured_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, signers) = setup_multisig(&env, 2);
+    let signer1 = signers.get(0).unwrap();
+
+    client.multisig_approve(&signer1, &42u32);
+
+    let topic: Symbol = symbol_short!("msigappr");
+    let topic_val: Val = topic.into_val(&env);
+    let mut matched = 0u32;
+    for event in env.events().all().iter() {
+        if let Some(t) = event.1.get(0) {
+            if t.get_payload() == topic_val.get_payload() {
+                matched += 1;
+                assert_eq!(event.1.len(), 1);
+                assert_eq!(
+                    MultiSigApprovedEvent::from_val(&env, &event.2),
+                    MultiSigApprovedEvent {
+                        proposal_id: 42,
+                        signer: signer1.clone(),
+                        approvals: 1,
+                        threshold: 2,
+                        approved: false,
+                        bitmap: 1,
+                    }
+                );
+            }
+        }
+    }
+    assert_eq!(matched, 1);
 }
 
 /// Admin: unauthorised caller cannot initialise multisig.
