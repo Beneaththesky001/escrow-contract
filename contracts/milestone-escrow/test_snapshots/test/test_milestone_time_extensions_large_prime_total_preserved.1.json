@@ -72,5 +72,82 @@
       ]
     ]
   },
-  "events": []
+  "events": [
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000001",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "m_ext"
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "amount"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 999983
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "client_refund"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 571419
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "elapsed_seconds"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 3
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "freelancer_share"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 428564
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "total_seconds"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 7
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    }
+  ]
 }
