@@ -2201,6 +2201,10 @@ impl MilestoneEscrow {
             freelancer_payout_bps: allocation.freelancer_payout_bps,
         };
 
+        let paid_amount = client_refund
+            .checked_add(freelancer_payout)
+            .ok_or(Error::InvalidAmount)?;
+
         env.events().publish(
             (symbol_short!("resolve"),),
             DisputeResolvedEvent {
@@ -2211,6 +2215,7 @@ impl MilestoneEscrow {
                 freelancer: meta.freelancer.clone(),
                 token: meta.token.clone(),
                 amount: remaining,
+                paid_amount,
                 released_to_freelancer: freelancer_payout > 0,
                 status: milestone.status.clone(),
             },
