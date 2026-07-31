@@ -1979,13 +1979,38 @@ impl MilestoneEscrow {
     ///                        or `PartiallyReleased`.
     pub fn raise_dispute(env: Env, caller: Address, milestone_index: u32) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
+        // ── Re-entrancy lock ─────────────────────────────────────────────
+        if env.storage().temporary().has(&DataKey::DisputeLock(milestone_index)) {
+            return Err(Error::DisputeAlreadyRaised);
+        }
+        env.storage()
+            .temporary()
+            .set(&DataKey::DisputeLock(milestone_index), &true);
+
+        let result = Self::raise_dispute_inner(&env, caller, milestone_index);
+
+        // Always release the lock regardless of success or failure.
+        Self::release_dispute_lock(&env, milestone_index);
+
+        result
+    }
+
+    /// Core dispute logic extracted so that the lock guard in
+    /// `raise_dispute` wraps every path uniformly.  This function
+    /// is never called directly — it exists only to keep the
+    /// lock/release pairing in one place.
+    fn raise_dispute_inner(
+        env: &Env,
+        caller: Address,
+        milestone_index: u32,
+    ) -> Result<(), Error> {
         // Check for zero addresses (both account and contract types)
         let zero_account = Address::from_str(
-            &env,
+            env,
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
         );
         let zero_contract = Address::from_str(
-            &env,
+            env,
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
         );
 
@@ -1993,7 +2018,7 @@ impl MilestoneEscrow {
             return Err(Error::InvalidAddress);
         }
         caller.require_auth();
-        let meta = Self::load_job_meta(&env)?;
+        let meta = Self::load_job_meta(env)?;
 
         if meta.client != caller && meta.freelancer != caller {
             return Err(Error::Unauthorized);
@@ -2002,7 +2027,10 @@ impl MilestoneEscrow {
             return Err(Error::NotFunded);
         }
 
-        let mut milestone = Self::load_milestone(&env, milestone_index)?;
+        // ── Input validation: index boundary check ───────────────────────
+        if milestone_index >= meta.milestone_count {
+            return Err(Error::InvalidMilestone);
+        }
 
         // Strict state machine: only Pending, Delivered, or PartiallyReleased
         // may transition to Disputed. All other statuses (Released, Refunded,
@@ -2015,7 +2043,7 @@ impl MilestoneEscrow {
         }
 
         milestone.status = MilestoneStatus::Disputed;
-        Self::store_milestone(&env, milestone_index, &milestone);
+        Self::store_milestone(env, milestone_index, &milestone);
 
         env.events().publish(
             (symbol_short!("dispute"),),

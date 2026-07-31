@@ -138,6 +138,28 @@ fn setup_funded_escrow(
     )
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Security model: raise_dispute locking and validation
+//
+// raise_dispute uses a two-layer protection strategy:
+//
+//   1. DisputeLock (temporary storage) — re-entrancy guard
+//      Blocks same-transaction re-entrant calls before any state mutation.
+//      The lock is set at entry and released unconditionally on every exit
+//      path (success or error) via the raise_dispute / raise_dispute_inner /
+//      release_dispute_lock pattern.
+//
+//   2. Status transition guard (persistent storage) — double-execution guard
+//      Once the milestone status transitions to Disputed (or any terminal
+//      state: Released, Refunded), the status check in raise_dispute_inner
+//      rejects subsequent calls with InvalidStatus.  This protects across
+//      separate transactions where the DisputeLock has already been cleared.
+//
+//   Together these ensure raise_dispute is safe against both re-entrancy
+//   (same tx) and double-execution (separate txs).
+// ═══════════════════════════════════════════════════════════════════════════════
+
 #[test]
 fn test_full_happy_path() {
     let env = Env::default();
@@ -536,6 +558,25 @@ fn test_mark_delivered_after_refunded_fails() {
 
     let result = client.try_mark_delivered(&freelancer_addr, &0u32);
     assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+/// Verifies that when a dispute is successfully raised, the returned
+/// status is Disputed and the milestone state is persisted correctly.
+/// Also confirms the flow: fund -> deliver -> dispute works end-to-end.
+#[test]
+fn test_raise_dispute_status_transition_to_disputed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _, _, _, _, client) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    client.mark_delivered(&freelancer_addr, &0u32);
+    client.raise_dispute(&client_addr, &0u32);
+
+    let job = client.get_job();
+    let milestone = job.milestones.get(0).unwrap();
+    assert_eq!(milestone.status, MilestoneStatus::Disputed);
 }
 
 /// mark_delivered on a PartiallyReleased milestone must return InvalidStatus.
