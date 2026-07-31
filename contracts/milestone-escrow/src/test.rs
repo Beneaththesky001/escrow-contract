@@ -9,6 +9,7 @@ use soroban_sdk::{
 #[contracttype]
 enum ReentrantTokenDataKey {
     Reentered,
+    Balance(Address),
 }
 
 #[contract]
@@ -65,7 +66,26 @@ mod mock_token {
 
 #[contractimpl]
 impl ReentrantToken {
-    pub fn transfer(env: Env, from: Address, to: Address, _amount: i128) {
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&ReentrantTokenDataKey::Balance(to.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &ReentrantTokenDataKey::Balance(to.clone()),
+            &(current + amount),
+        );
+    }
+
+    pub fn balance(env: Env, who: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&ReentrantTokenDataKey::Balance(who))
+            .unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         if env
             .storage()
             .instance()
@@ -78,8 +98,37 @@ impl ReentrantToken {
             .instance()
             .set(&ReentrantTokenDataKey::Reentered, &true);
 
-        let escrow = MilestoneEscrowClient::new(&env, &to);
-        let _ = escrow.try_fund(&from);
+        let esc_to = MilestoneEscrowClient::new(&env, &to);
+        let _ = esc_to.try_get_job().and_then(|job: Job| {
+            let _ = esc_to.try_apply_dispute_arbitration_split(&job.arbiter, &0u32, &5000u32);
+            Ok(())
+        });
+
+        let esc_from = MilestoneEscrowClient::new(&env, &from);
+        let _ = esc_from.try_get_job().and_then(|job: Job| {
+            let _ = esc_from.try_apply_dispute_arbitration_split(&job.arbiter, &0u32, &5000u32);
+            Ok(())
+        });
+
+        let from_bal: i128 = env
+            .storage()
+            .persistent()
+            .get(&ReentrantTokenDataKey::Balance(from.clone()))
+            .unwrap_or(0);
+        let to_bal: i128 = env
+            .storage()
+            .persistent()
+            .get(&ReentrantTokenDataKey::Balance(to.clone()))
+            .unwrap_or(0);
+
+        env.storage().persistent().set(
+            &ReentrantTokenDataKey::Balance(from.clone()),
+            &(from_bal - amount),
+        );
+        env.storage().persistent().set(
+            &ReentrantTokenDataKey::Balance(to.clone()),
+            &(to_bal + amount),
+        );
     }
 
     pub fn callback_attempted(env: Env) -> bool {
@@ -282,6 +331,162 @@ fn test_dispute_refund_to_client() {
     client.resolve_dispute(&arbiter_addr, &0u32, &false);
 
     assert_eq!(token.balance(&client_addr), 5_000);
+}
+
+#[test]
+fn test_apply_dispute_arbitration_split_transfers_percentages() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Use our ReentrantToken so we can assert reentrant attempt is blocked
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env.register(ReentrantToken, ());
+    let token_client = ReentrantTokenClient::new(&env, &token_contract_id);
+
+    let total: i128 = 10_000;
+    token_client.mint(&client_addr, &total);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 10_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800u64,
+        &amounts,
+    );
+    client.fund(&client_addr);
+
+    // Move milestone into disputed state
+    client.mark_delivered(&freelancer_addr, &0u32);
+    client.raise_dispute(&client_addr, &0u32);
+
+    // Apply a 30% refund to client (3000 bps). During transfers the token
+    // will attempt a reentrant call which should be blocked by the lock.
+    let alloc: RefundAllocation =
+        client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &3000u32);
+
+    assert_eq!(alloc.client_refund, 3_000);
+    assert_eq!(alloc.freelancer_payout, 7_000);
+    assert_eq!(token_client.balance(&client_addr), 3_000);
+    assert_eq!(token_client.balance(&freelancer_addr), 7_000);
+    assert!(token_client.callback_attempted());
+}
+
+#[test]
+fn test_apply_dispute_arbitration_split_full_refund_status() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 10_000_i128];
+    let (
+        client_addr,
+        _freelancer_addr,
+        arbiter_addr,
+        _admin_addr,
+        token_contract_id,
+        contract_id,
+        client,
+    ) = setup_funded_escrow(&env, amounts.clone());
+
+    // Move milestone into disputed state
+    client.raise_dispute(&client_addr, &0u32);
+
+    // Apply 100% refund to client
+    let alloc: RefundAllocation =
+        client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &10000u32);
+
+    assert_eq!(alloc.client_refund, 10_000);
+    assert_eq!(alloc.freelancer_payout, 0);
+    // After full refund, milestone status should be Refunded
+    // Read job and assert milestone status
+    let job: Job = client.get_job();
+    let ms = job.milestones.get(0).unwrap();
+    assert_eq!(ms.status, MilestoneStatus::Refunded);
+}
+
+#[test]
+fn test_apply_dispute_arbitration_split_odd_amounts() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_i128];
+    let (
+        client_addr,
+        freelancer_addr,
+        arbiter_addr,
+        _admin_addr,
+        token_contract_id,
+        contract_id,
+        client,
+    ) = setup_funded_escrow(&env, amounts.clone());
+
+    // Raise dispute on tiny amount and apply 50/50 split
+    client.raise_dispute(&client_addr, &0u32);
+    let alloc: RefundAllocation =
+        client.apply_dispute_arbitration_split(&arbiter_addr, &0u32, &5000u32);
+
+    // Using nearest rounding the single unit should go to client (ties round up)
+    assert_eq!(alloc.client_refund + alloc.freelancer_payout, 1_i128);
+}
+
+#[test]
+fn test_apply_dispute_arbitration_split_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 1_i128];
+    let (
+        client_addr,
+        _freelancer_addr,
+        _arbiter_addr,
+        _admin_addr,
+        token_contract_id,
+        contract_id,
+        client,
+    ) = setup_funded_escrow(&env, amounts.clone());
+
+    // A non-arbiter should not be able to apply split
+    let bad_actor = Address::generate(&env);
+    client.raise_dispute(&client_addr, &0u32);
+    let result = client.try_apply_dispute_arbitration_split(&bad_actor, &0u32, &5000u32);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_resolve_dispute_double_execution_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 5_000_i128];
+    let (
+        client_addr,
+        freelancer_addr,
+        arbiter_addr,
+        _admin_addr,
+        token_contract_id,
+        contract_id,
+        client,
+    ) = setup_funded_escrow(&env, amounts.clone());
+
+    // Move milestone into disputed state
+    client.mark_delivered(&freelancer_addr, &0u32);
+    client.raise_dispute(&client_addr, &0u32);
+
+    // First resolution succeeds
+    client.resolve_dispute(&arbiter_addr, &0u32, &true);
+
+    // Second resolution should fail because status is no longer Disputed
+    let result = client.try_resolve_dispute(&arbiter_addr, &0u32, &true);
+    assert!(result.is_err());
 }
 
 #[test]
@@ -879,7 +1084,7 @@ fn test_resolve_dispute_unauthorized_fails() {
     client.raise_dispute(&client_addr, &0u32);
 
     let result = client.try_resolve_dispute(&bad_actor, &0u32, &true);
-    assert!(result.is_err());
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
 
 #[test]

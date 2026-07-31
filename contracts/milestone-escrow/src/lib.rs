@@ -131,6 +131,9 @@ pub enum DataKey {
     /// the approval workflow for that milestone is permanently closed and this
     /// flag has no further use.
     MilestoneReleased(u32),
+    /// Temporary: lock set when dispute arbitration split execution is in
+    /// progress for a milestone to prevent reentrant or concurrent mutations.
+    DisputeLock(u32),
     Reputation(Address),
     /// Instance: client/freelancer yield-share configuration and execution lock
     /// for the `escrow_interest_yield` module. Written by
@@ -2145,27 +2148,28 @@ impl MilestoneEscrow {
             return Err(Error::InvalidAmount);
         }
 
+        let payout = remaining.min(contract_balance);
         if release_to_freelancer {
-            let payout = remaining.min(contract_balance);
+            milestone.released_amount = milestone
+                .released_amount
+                .checked_add(payout)
+                .ok_or(Error::InvalidAmount)?;
+            milestone.status = MilestoneStatus::Released;
+            Self::store_milestone(&env, milestone_index, &milestone);
+
             if payout > 0 {
                 token_client.transfer(&env.current_contract_address(), &meta.freelancer, &payout);
-                milestone.released_amount = milestone
-                    .released_amount
-                    .checked_add(payout)
-                    .ok_or(Error::InvalidAmount)?;
             }
-            milestone.status = MilestoneStatus::Released;
             Self::increment_reputation(&env, &meta.client);
             Self::increment_reputation(&env, &meta.freelancer);
         } else {
-            let refund = remaining.min(contract_balance);
-            if refund > 0 {
-                token_client.transfer(&env.current_contract_address(), &meta.client, &refund);
-            }
             milestone.status = MilestoneStatus::Refunded;
-        }
+            Self::store_milestone(&env, milestone_index, &milestone);
 
-        Self::store_milestone(&env, milestone_index, &milestone);
+            if payout > 0 {
+                token_client.transfer(&env.current_contract_address(), &meta.client, &payout);
+            }
+        }
 
         env.events().publish(
             (symbol_short!("resolve"),),
@@ -2176,7 +2180,7 @@ impl MilestoneEscrow {
                 client: meta.client.clone(),
                 freelancer: meta.freelancer.clone(),
                 token: meta.token.clone(),
-                amount: remaining,
+                amount: payout,
                 released_to_freelancer: release_to_freelancer,
                 status: milestone.status.clone(),
             },
