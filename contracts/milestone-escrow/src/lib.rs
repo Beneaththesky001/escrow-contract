@@ -50,10 +50,9 @@ pub enum Error {
     /// `execute_admin_transfer` was called before the proposal's multisig
     /// approval threshold was reached.
     MultiSigThresholdNotMet = 23,
-    /// `multisig_approve` was called while the escrow contract holds a
-    /// zero token balance — there are no funds at stake for signers to
-    /// approve against.
-    MultiSigEmptyBalance = 24,
+    /// `raise_dispute` was re-entered for a milestone whose dispute lock is
+    /// still held, i.e. a dispute is already being raised in this transaction.
+    DisputeAlreadyRaised = 24,
 }
 
 const BPS_SCALE: u32 = 10_000;
@@ -167,6 +166,19 @@ pub enum DataKey {
     /// raise_dispute, resolve_dispute) so that an emergency admin investigation
     /// cannot be interfered with.
     Paused,
+    /// Temporary key: written by `raise_dispute` when a milestone enters the
+    /// `Disputed` state.  Acts as a cheap short-lived signal so that callers
+    /// can verify dispute status without loading the full persistent
+    /// `Milestone` entry.  Uses temporary storage because the dispute workflow
+    /// is transient: once resolved, the flag has no further use and its ledger
+    /// footprint should not persist.
+    DisputeFlag(u32),
+    /// Persistent: boolean flag set to `true` when the multisig approval
+    /// workflow enters a locked condition that requires admin intervention.
+    /// Written by multisig-related functions when a deadlock is detected,
+    /// cleared by `multisig_admin_override_release` or
+    /// `multisig_admin_override_refund`.
+    MultisigLocked,
     MilestoneTimeExtension(u32),
     CancelLock,
     // ── tax_withholding_deductions storage keys ──────────────────────────────
@@ -687,6 +699,45 @@ pub struct PaymentStreamingEvent {
     pub client_refund: i128,
 }
 
+// ── multisig_approval events ────────────────────────────────────────────────
+
+/// Emitted by `multisig_admin_override_release` when the admin force-releases
+/// a multisig-locked allocation to the freelancer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigAdminOverrideReleaseEvent {
+    pub admin: Address,
+    pub contract_id: Address,
+    pub milestone_index: u32,
+    pub freelancer: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
+/// Emitted by `multisig_admin_override_refund` when the admin force-refunds
+/// a multisig-locked allocation back to the client.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigAdminOverrideRefundEvent {
+    pub admin: Address,
+    pub contract_id: Address,
+    pub milestone_index: u32,
+    pub client: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
+/// Emitted by `multisig_split_refund` when a split-refund allocation is
+/// calculated between client and freelancer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitRefundCalculatedEvent {
+    pub client_refund: i128,
+    pub freelancer_payout: i128,
+    pub client_refund_bps: u32,
+    pub freelancer_payout_bps: u32,
+}
+
 /// Emitted by `multisig_transfer_admin` after a successful proportional
 /// allocation of `total_amount` across all ratio entries.  Downstream
 /// indexers can use this event to audit every admin-triggered multi-party
@@ -735,6 +786,36 @@ impl MilestoneEscrow {
             return Err(Error::Unauthorized);
         }
         Ok(meta)
+    }
+
+    /// Read the dispute flag for `index`.  Returns `false` when the flag
+    /// was never written or has been evicted.
+    #[allow(dead_code)]
+    fn is_dispute_flag(env: &Env, index: u32) -> bool {
+        env.storage()
+            .temporary()
+            .get::<_, bool>(&DataKey::DisputeFlag(index))
+            .unwrap_or(false)
+    }
+
+    /// Write the dispute flag to temporary storage.  This is a cheap,
+    /// short-lived signal that the milestone at `index` has been disputed.
+    /// Callers that need to verify dispute status can read this temporary key
+    /// rather than fetching the full persistent `Milestone` entry, reducing
+    /// ledger footprint rent on the read path.
+    fn store_dispute_flag(env: &Env, index: u32) {
+        env.storage()
+            .temporary()
+            .set(&DataKey::DisputeFlag(index), &true);
+    }
+
+    /// Release the dispute lock for a given milestone index.  Called
+    /// unconditionally after every `raise_dispute` attempt — success or
+    /// failure — so the lock can never become permanently held.
+    fn release_dispute_lock(env: &Env, milestone_index: u32) {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::DisputeLock(milestone_index));
     }
 
     fn ensure_not_paused(env: &Env) -> Result<(), Error> {
@@ -2064,12 +2145,10 @@ impl MilestoneEscrow {
         if caller == zero_account || caller == zero_contract {
             return Err(Error::InvalidAddress);
         }
-        caller.require_auth();
-        let meta = Self::load_job_meta(env)?;
 
         // require_dispute_party performs caller.require_auth() + verifies the
         // caller matches the stored client or freelancer in a single step.
-        let meta = Self::require_dispute_party(&env, &caller)?;
+        let meta = Self::require_dispute_party(env, &caller)?;
 
         if !meta.funded {
             return Err(Error::NotFunded);
@@ -2078,6 +2157,13 @@ impl MilestoneEscrow {
         // ── Input validation: index boundary check ───────────────────────
         if milestone_index >= meta.milestone_count {
             return Err(Error::InvalidMilestone);
+        }
+
+        let mut milestone = Self::load_milestone(env, milestone_index)?;
+
+        // ── Input validation: non-zero positive amount ───────────────────
+        if milestone.amount <= 0 {
+            return Err(Error::InvalidAmount);
         }
 
         // Strict state machine: only Pending, Delivered, or PartiallyReleased
@@ -3000,6 +3086,9 @@ impl MilestoneEscrow {
         total_amount: i128,
         ratios: Vec<i128>,
     ) -> Result<Vec<i128>, Error> {
+        // Only the stored admin may trigger a multi-party transfer.
+        Self::require_admin(&env, &admin)?;
+
         // Guard: reject zero or negative totals so that a multisig transfer
         // cannot be initiated against an empty or invalid balance.  A zero
         // total would distribute nothing and signals a drained or

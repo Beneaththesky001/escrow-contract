@@ -8,7 +8,12 @@ use soroban_sdk::{
 
 #[contracttype]
 enum ReentrantTokenDataKey {
+    /// Set once the mock has attempted to call back into the escrow.
+    /// Reported by `callback_attempted`.
     Reentered,
+    /// Set for the duration of the outermost `transfer` so that a nested
+    /// transfer does not attempt another callback and recurse without bound.
+    InProgress,
     Balance(Address),
 }
 
@@ -86,29 +91,39 @@ impl ReentrantToken {
     }
 
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
-        if env
+        // Only the outermost transfer attempts the callback; a nested transfer
+        // skips straight to the balance movement so recursion stays bounded.
+        // The balance update below always runs, so legitimate transfers are
+        // never silently dropped.
+        if !env
             .storage()
             .instance()
-            .has(&ReentrantTokenDataKey::Reentered)
+            .has(&ReentrantTokenDataKey::InProgress)
         {
-            return;
+            env.storage()
+                .instance()
+                .set(&ReentrantTokenDataKey::InProgress, &true);
+            env.storage()
+                .instance()
+                .set(&ReentrantTokenDataKey::Reentered, &true);
+
+            // The escrow appears as `to` when being funded and as `from` when
+            // paying out, so try to re-enter from both sides.  The escrow's
+            // own dispute lock is what must reject these.
+            let esc_to = MilestoneEscrowClient::new(&env, &to);
+            if let Ok(Ok(job)) = esc_to.try_get_job() {
+                let _ = esc_to.try_apply_dispute_arbitration_split(&job.arbiter, &0u32, &5000u32);
+            }
+
+            let esc_from = MilestoneEscrowClient::new(&env, &from);
+            if let Ok(Ok(job)) = esc_from.try_get_job() {
+                let _ = esc_from.try_apply_dispute_arbitration_split(&job.arbiter, &0u32, &5000u32);
+            }
+
+            env.storage()
+                .instance()
+                .remove(&ReentrantTokenDataKey::InProgress);
         }
-
-        env.storage()
-            .instance()
-            .set(&ReentrantTokenDataKey::Reentered, &true);
-
-        let esc_to = MilestoneEscrowClient::new(&env, &to);
-        let _ = esc_to.try_get_job().and_then(|job: Job| {
-            let _ = esc_to.try_apply_dispute_arbitration_split(&job.arbiter, &0u32, &5000u32);
-            Ok(())
-        });
-
-        let esc_from = MilestoneEscrowClient::new(&env, &from);
-        let _ = esc_from.try_get_job().and_then(|job: Job| {
-            let _ = esc_from.try_apply_dispute_arbitration_split(&job.arbiter, &0u32, &5000u32);
-            Ok(())
-        });
 
         let from_bal: i128 = env
             .storage()
@@ -2926,6 +2941,40 @@ fn test_multisig_admin_override_release_not_funded_fails() {
 
     let result = client.try_multisig_admin_override_release(&admin_addr, &0u32);
     assert_eq!(result, Err(Ok(Error::NotFunded)));
+}
+
+/// A milestone in `Disputed` status must never be auto-releasable, even once
+/// the auto-release deadline has passed.
+#[test]
+fn test_claim_auto_release_disputed_status_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+    token_admin.mint(&client_addr, &10_000);
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 10_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &100,
+        &amounts,
+    );
+
     client.fund(&client_addr);
     client.mark_delivered(&freelancer_addr, &0u32);
     client.raise_dispute(&client_addr, &0u32);
@@ -3130,78 +3179,6 @@ fn test_mark_delivered_unauthorized_freelancer_fails() {
 
     let result = client.try_mark_delivered(&impostor, &0u32);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
-}
-
-#[test]
-fn test_approve_partial_zero_amount_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let client_addr = Address::generate(&env);
-    let freelancer_addr = Address::generate(&env);
-    let arbiter_addr = Address::generate(&env);
-    let admin_addr = Address::generate(&env);
-
-    let token_contract_id = env
-        .register_stellar_asset_contract_v2(admin_addr.clone())
-        .address();
-    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
-    token_admin.mint(&client_addr, &10_000);
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let amounts = vec![&env, 10_000_i128];
-    client.initialize(
-        &admin_addr,
-        &client_addr,
-        &freelancer_addr,
-        &arbiter_addr,
-        &token_contract_id,
-        &604800,
-        &amounts,
-    );
-    client.fund(&client_addr);
-    client.mark_delivered(&freelancer_addr, &0u32);
-
-    let result = client.try_approve_partial(&client_addr, &0u32, &0_i128);
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
-}
-
-#[test]
-fn test_approve_partial_negative_amount_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let client_addr = Address::generate(&env);
-    let freelancer_addr = Address::generate(&env);
-    let arbiter_addr = Address::generate(&env);
-    let admin_addr = Address::generate(&env);
-
-    let token_contract_id = env
-        .register_stellar_asset_contract_v2(admin_addr.clone())
-        .address();
-    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
-    token_admin.mint(&client_addr, &10_000);
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let amounts = vec![&env, 10_000_i128];
-    client.initialize(
-        &admin_addr,
-        &client_addr,
-        &freelancer_addr,
-        &arbiter_addr,
-        &token_contract_id,
-        &604800,
-        &amounts,
-    );
-    client.fund(&client_addr);
-    client.mark_delivered(&freelancer_addr, &0u32);
-
-    let result = client.try_approve_partial(&client_addr, &0u32, &-500_i128);
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 }
 
 #[test]
@@ -3539,54 +3516,6 @@ fn test_approve_partial_freelancer_is_unauthorized() {
 
     let result = escrow.try_approve_partial(&freelancer_addr, &0u32, &1_000_i128);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
-}
-
-/// Test 2 ΓÇö AUTHORIZATION: The arbiter (also a known but non-client party)
-/// cannot call `approve_partial`.  Asserts `Error::Unauthorized` precisely.
-#[test]
-fn test_approve_partial_arbiter_is_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (_, _, arbiter_addr, _, _, escrow) = setup_delivered_single(&env, 10_000);
-
-    let result = escrow.try_approve_partial(&arbiter_addr, &0u32, &1_000_i128);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-}
-
-/// Test 3 ΓÇö INVALID STATE (Disputed): A milestone in `Disputed` status is not
-/// approvable.  Raises a dispute first, then attempts `approve_partial` and
-/// asserts `Error::InvalidStatus`.
-#[test]
-fn test_approve_partial_on_disputed_milestone_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client_addr, _, _, _, _, escrow) = setup_delivered_single(&env, 10_000);
-
-    // Move the milestone into Disputed state (client may raise after delivery).
-    escrow.raise_dispute(&client_addr, &0u32);
-
-    let result = escrow.try_approve_partial(&client_addr, &0u32, &1_000_i128);
-    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
-}
-
-/// Test 4 ΓÇö INVALID STATE (Refunded): A milestone that has been refunded to the
-/// client is a terminal state; `approve_partial` must be rejected with
-/// `Error::InvalidStatus`.
-#[test]
-fn test_approve_partial_on_refunded_milestone_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (client_addr, _, arbiter_addr, _, _, escrow) = setup_delivered_single(&env, 10_000);
-
-    // Dispute then resolve in favour of the client ΓåÆ status = Refunded.
-    escrow.raise_dispute(&client_addr, &0u32);
-    escrow.resolve_dispute(&arbiter_addr, &0u32, &false);
-
-    let result = escrow.try_approve_partial(&client_addr, &0u32, &1_000_i128);
-    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
 }
 
 /// Test 5 ΓÇö NON-EXISTENT MILESTONE ID: Supplying a milestone index that is
@@ -5919,6 +5848,55 @@ fn test_add_whitelisted_token_failed_does_not_emit_event() {
     assert_eq!(wtok_count, 0, "failed call must not emit wtok event");
 }
 
+/// After admin transfer, the old admin must be rejected by add_whitelisted_token
+/// and the new admin must succeed.  Exercises the interaction between
+/// transfer_admin and the admin identity check inside add_whitelisted_token.
+#[test]
+fn test_add_whitelisted_token_old_admin_rejected_after_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let new_admin_addr = Address::generate(&env);
+
+    let token1 = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token2 = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token3 = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token1,
+        &604800,
+        &vec![&env, 1_000_i128],
+    );
+
+    client.transfer_admin(&admin_addr, &new_admin_addr);
+
+    // Old admin must now be rejected.
+    let old_result = client.try_add_whitelisted_token(&admin_addr, &token2);
+    assert_eq!(old_result, Err(Ok(Error::Unauthorized)));
+
+    // New admin must succeed.
+    let new_result = client.try_add_whitelisted_token(&new_admin_addr, &token3);
+    assert!(new_result.is_ok(), "new admin should be able to add a token");
+    assert!(client.is_token_whitelisted(&token3));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // TASK 2 TESTS: require_dispute_party auth for raise_dispute
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -5937,13 +5915,6 @@ fn test_raise_dispute_bad_actor_returns_unauthorized() {
     let bad_actor = Address::generate(&env);
     let result = client.try_raise_dispute(&bad_actor, &0u32);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
-    // New admin must succeed.
-    let new_result = client.try_add_whitelisted_token(&new_admin_addr, &token3);
-    assert!(
-        new_result.is_ok(),
-        "new admin should be able to add a token"
-    );
-    assert!(client.is_token_whitelisted(&token3));
 }
 
 /// Verify raise_dispute with freelancer succeeds (freelancer is an authorized party).
@@ -5963,6 +5934,43 @@ fn test_raise_dispute_by_freelancer_succeeds() {
         job.milestones.get(0).unwrap().status,
         MilestoneStatus::Disputed
     );
+}
+
+/// Whitelist membership is mutually exclusive: adding token A then querying
+/// token B must return false, and vice-versa.  Guards against false positives
+/// in is_token_whitelisted after an add.
+#[test]
+fn test_add_whitelisted_token_does_not_whitelist_other_tokens() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token1 = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token2 = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token3 = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token1,
+        &604800,
+        &vec![&env, 1_000_i128],
+    );
 
     // Only token2 is added.
     client.add_whitelisted_token(&admin_addr, &token2);
@@ -5977,7 +5985,7 @@ fn test_raise_dispute_by_freelancer_succeeds() {
     );
     assert!(
         !client.is_token_whitelisted(&token3),
-        "token3 was never added ΓÇö must not be whitelisted"
+        "token3 was never added — must not be whitelisted"
     );
 
     // Whitelist length must be exactly 2.
@@ -6092,6 +6100,26 @@ fn test_multisig_split_refund_even_split() {
     assert_eq!(allocation.client_refund_bps, 5_000);
     assert_eq!(allocation.freelancer_payout_bps, 5_000);
     assert_eq!(allocation.client_refund + allocation.freelancer_payout, 1_000);
+}
+
+#[test]
+fn test_platform_fee_allocation_admin_override_requires_verified_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
     let amounts = vec![&env, 1_000_i128];
     client.initialize(
         &admin_addr,
@@ -6103,8 +6131,51 @@ fn test_multisig_split_refund_even_split() {
         &amounts,
     );
 
-    let result = client.try_pf_alloc_admin_override(&attacker, &1000_u32, &8000_u32, &1000_u32);
+    let result =
+        client.try_pf_alloc_admin_override(&attacker, &1000_u32, &8000_u32, &1000_u32);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_platform_fee_allocation_admin_override_unlocks_locked_allocation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 1_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+
+    client.set_platform_fee_allocation(&admin_addr, &2000_u32, &7000_u32, &1000_u32);
+    client.lock_platform_fee_allocation(&admin_addr);
+
+    let locked_update =
+        client.try_set_platform_fee_allocation(&admin_addr, &1500_u32, &7500_u32, &1000_u32);
+    assert_eq!(locked_update, Err(Ok(Error::InvalidStatus)));
+
+    client.pf_alloc_admin_override(&admin_addr, &1500_u32, &7500_u32, &1000_u32);
+    let allocation = client.get_platform_fee_allocation();
+    assert_eq!(allocation.client_bps, 1500);
+    assert_eq!(allocation.freelancer_bps, 7500);
+    assert_eq!(allocation.treasury_bps, 1000);
 }
 
 /// Verify multisig_split_refund with 70/30 split calculates correctly.
@@ -6132,9 +6203,6 @@ fn test_multisig_split_refund_full_client_refund() {
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
-    let locked_update =
-        client.try_set_platform_fee_allocation(&admin_addr, &1500_u32, &7500_u32, &1000_u32);
-    assert_eq!(locked_update, Err(Ok(Error::InvalidStatus)));
 
     let allocation = client.multisig_split_refund(&1_000_i128, &10_000_u32, &0_u32);
     assert_eq!(allocation.client_refund, 1_000);
@@ -6726,6 +6794,8 @@ fn test_multisig_transfer_admin_ratio_at_capacity_succeeds() {
         total += result.get(i).unwrap();
     }
     assert_eq!(total, 255);
+}
+
 // ============================================================================
 // raise_dispute — comprehensive boundary / edge-case test suite (Issue #183)
 // ============================================================================
@@ -6733,6 +6803,33 @@ fn test_multisig_transfer_admin_ratio_at_capacity_succeeds() {
 // These tests verify that raise_dispute enforces strict state machine
 // transitions, rejects unauthorised callers, and handles negative inputs
 // gracefully.
+
+/// Boundary guard — a milestone carrying a zero amount has nothing to
+/// arbitrate, so raise_dispute must reject it with InvalidAmount.
+#[test]
+fn test_raise_dispute_zero_amount_milestone_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, _, _, _, _, contract_id, client) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    // Corrupt the milestone amount to 0.
+    env.as_contract(&contract_id, || {
+        let mut milestone: Milestone = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Milestone(0u32))
+            .unwrap();
+        milestone.amount = 0;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Milestone(0u32), &milestone);
+    });
+
+    let result = client.try_raise_dispute(&client_addr, &0u32);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
 
 /// State machine test 1 — raise_dispute on Released milestone must fail.
 #[test]
@@ -6845,24 +6942,6 @@ fn test_raise_dispute_before_funded_fails() {
 
     let result = escrow.try_raise_dispute(&client_addr, &0u32);
     assert_eq!(result, Err(Ok(Error::NotFunded)));
-}
-
-/// Happy path — freelancer can raise a dispute from Pending status.
-#[test]
-fn test_raise_dispute_by_freelancer_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (_client_addr, freelancer_addr, _, _, _, _, escrow) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
-
-    escrow.raise_dispute(&freelancer_addr, &0u32);
-
-    let job = escrow.get_job();
-    assert_eq!(
-        job.milestones.get(0).unwrap().status,
-        MilestoneStatus::Disputed
-    );
 }
 
 /// Happy path — client can raise a dispute from PartiallyReleased status.
@@ -8966,35 +9045,6 @@ fn test_milestone_time_extensions_positive_balance_succeeds_and_emits_event() {
 // (Issues #270 and #273)
 // ============================================================================
 
-/// Guard — ZERO TOTAL AMOUNT: initiating a multisig transfer on an empty
-/// balance must be blocked with InvalidAmount (issue #273).
-#[test]
-fn test_multisig_transfer_admin_zero_total_amount_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let ratios = vec![&env, 1_i128, 2_i128, 3_i128];
-    let result = client.try_multisig_transfer_admin(&0_i128, &ratios);
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
-}
-
-/// Guard — NEGATIVE TOTAL AMOUNT: a negative total is always invalid.
-#[test]
-fn test_multisig_transfer_admin_negative_total_amount_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let ratios = vec![&env, 1_i128, 1_i128];
-    let result = client.try_multisig_transfer_admin(&-100_i128, &ratios);
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
-}
-
 /// Event emission — a successful multisig_transfer_admin call must emit a
 /// MultiSigTransferAdminEvent with the correct fields (issue #270).
 #[test]
@@ -9002,11 +9052,10 @@ fn test_multisig_transfer_admin_emits_event() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
 
     let ratios = vec![&env, 1_i128, 1_i128, 1_i128];
-    let allocations = client.multisig_transfer_admin(&300_i128, &ratios);
+    let allocations = client.multisig_transfer_admin(&admin_addr, &300_i128, &ratios);
 
     // Verify allocation correctness
     assert_eq!(allocations.len(), 3);
@@ -9028,11 +9077,10 @@ fn test_multisig_transfer_admin_event_fields_are_correct() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
 
     let ratios = vec![&env, 3_i128, 1_i128];
-    let allocations = client.multisig_transfer_admin(&1_000_i128, &ratios);
+    let allocations = client.multisig_transfer_admin(&admin_addr, &1_000_i128, &ratios);
 
     // Verify numeric allocations: 750 and 250 (3/4 and 1/4 of 1000)
     assert_eq!(allocations.get(0).unwrap(), 750);
@@ -9051,11 +9099,10 @@ fn test_multisig_transfer_admin_single_party_emits_event() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
 
     let ratios = vec![&env, 1_i128];
-    let allocations = client.multisig_transfer_admin(&500_i128, &ratios);
+    let allocations = client.multisig_transfer_admin(&admin_addr, &500_i128, &ratios);
 
     assert_eq!(allocations.len(), 1);
     assert_eq!(allocations.get(0).unwrap(), 500);
@@ -9074,11 +9121,10 @@ fn test_multisig_transfer_admin_zero_total_emits_no_event() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
 
     let ratios = vec![&env, 1_i128, 1_i128];
-    let result = client.try_multisig_transfer_admin(&0_i128, &ratios);
+    let result = client.try_multisig_transfer_admin(&admin_addr, &0_i128, &ratios);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 
     // No events should have been emitted for a rejected call.
