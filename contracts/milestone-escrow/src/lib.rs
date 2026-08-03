@@ -325,7 +325,13 @@ pub struct DisputeResolvedEvent {
     pub client: Address,
     pub freelancer: Address,
     pub token: Address,
+    /// Amount owed on the milestone at the time of resolution (before
+    /// capping to the contract's available balance).
     pub amount: i128,
+    /// Amount actually transferred to the freelancer or refunded to the
+    /// client. May be less than `amount` if the contract balance was
+    /// insufficient to cover the full owed amount.
+    pub paid_amount: i128,
     pub released_to_freelancer: bool,
     pub status: MilestoneStatus,
 }
@@ -576,6 +582,19 @@ pub struct MultiSigApprovalState {
     pub approved: bool,
     pub approvals: u32,
     pub threshold: u32,
+    pub bitmap: u32,
+}
+
+/// Emitted by `multisig_approve` on every successful call so downstream
+/// indexers can track approval progress without polling contract storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiSigApprovedEvent {
+    pub proposal_id: u32,
+    pub signer: Address,
+    pub approvals: u32,
+    pub threshold: u32,
+    pub approved: bool,
     pub bitmap: u32,
 }
 
@@ -2598,6 +2617,10 @@ impl MilestoneEscrow {
             freelancer_payout_bps: allocation.freelancer_payout_bps,
         };
 
+        let paid_amount = client_refund
+            .checked_add(freelancer_payout)
+            .ok_or(Error::InvalidAmount)?;
+
         env.events().publish(
             (symbol_short!("resolve"),),
             DisputeResolvedEvent {
@@ -2608,6 +2631,7 @@ impl MilestoneEscrow {
                 freelancer: meta.freelancer.clone(),
                 token: meta.token.clone(),
                 amount: remaining,
+                paid_amount,
                 released_to_freelancer: freelancer_payout > 0,
                 status: milestone.status.clone(),
             },
@@ -3393,6 +3417,16 @@ impl MilestoneEscrow {
     ) -> Result<MultiSigApprovalState, Error> {
         signer.require_auth();
 
+        // Boundary guard: an approval collected against an empty escrow has
+        // no funds behind it, so block processing until the contract holds
+        // a positive token balance.
+        let meta = Self::load_job_meta(&env)?;
+        let token_client = token::Client::new(&env, &meta.token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        if contract_balance <= 0 {
+            return Err(Error::MultiSigEmptyBalance);
+        }
+
         let signers: Vec<Address> = env
             .storage()
             .instance()
@@ -3430,6 +3464,18 @@ impl MilestoneEscrow {
 
         let approvals = bitmap.count_ones();
         let approved = approvals >= threshold;
+
+        env.events().publish(
+            (symbol_short!("msigappr"),),
+            MultiSigApprovedEvent {
+                proposal_id,
+                signer,
+                approvals,
+                threshold,
+                approved,
+                bitmap,
+            },
+        );
 
         Ok(MultiSigApprovalState {
             approved,
