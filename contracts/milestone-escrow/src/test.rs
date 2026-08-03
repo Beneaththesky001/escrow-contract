@@ -6213,6 +6213,17 @@ fn test_multisig_split_refund_extreme_split_preserves_total() {
     let env = Env::default();
     env.mock_all_auths();
 
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+    token_admin.mint(&client_addr, &5_000);
+
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
 
@@ -6227,6 +6238,17 @@ fn test_multisig_split_refund_extreme_split_preserves_total() {
 fn test_multisig_split_refund_emits_event() {
     let env = Env::default();
     env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
+    token_admin.mint(&client_addr, &5_000);
 
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
@@ -6417,7 +6439,7 @@ fn setup_multisig_env(
 }
 
 #[test]
-fn test_multisig_transfer_admin_ratio_split_preserves_total() {
+fn test_tax_withholding_deductions_emits_event() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -6434,8 +6456,9 @@ fn test_multisig_transfer_admin_ratio_split_preserves_total() {
     assert_eq!(total, 100);
 }
 
+/// Failed tax_withholding_deductions (e.g. wrong caller) must NOT emit any `taxwh` event.
 #[test]
-fn test_multisig_transfer_admin_invalid_ratio_fails() {
+fn test_tax_withholding_deductions_failed_does_not_emit_event() {
     let env = Env::default();
     env.mock_all_auths();
 
