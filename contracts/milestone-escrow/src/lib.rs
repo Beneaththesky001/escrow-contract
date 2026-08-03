@@ -53,6 +53,18 @@ pub enum Error {
     /// `raise_dispute` was re-entered for a milestone whose dispute lock is
     /// still held, i.e. a dispute is already being raised in this transaction.
     DisputeAlreadyRaised = 24,
+    /// A multisig payout was attempted while the contract token balance is
+    /// zero, so there is nothing to allocate across the signer ratios.
+    MultiSigEmptyBalance = 25,
+    /// A guarded endpoint was called while `tax_withholding_deductions` is
+    /// mid-execution and holds `DataKey::TaxWithholdingExecutionLock`.
+    TaxWithholdingInProgress = 26,
+    /// A guarded endpoint was called while a platform-fee allocation is
+    /// mid-execution and holds `DataKey::PlatformFeeAllocationLock`.
+    PlatformFeeAllocationInProgress = 27,
+    /// A guarded endpoint was called while an emergency pause transition is
+    /// mid-execution and holds `DataKey::EmergencyPauseLock`.
+    EmergencyPauseInProgress = 28,
 }
 
 const BPS_SCALE: u32 = 10_000;
@@ -234,6 +246,26 @@ pub enum DataKey {
     /// stay stable (serialization compatibility for already-written ledger
     /// entries).
     PendingAdminTransfer,
+    // ── execution locks (see `assert_no_*_in_progress` guards) ─────────────
+    //
+    // These three are unit variants holding a `bool`, set for the duration of
+    // a single admin operation and cleared before it returns. They exist so
+    // that concurrent/reentrant calls observe the in-progress state and bail
+    // out rather than interleaving state mutations.
+    //
+    // Appended at the end of `DataKey` so existing variant discriminants stay
+    // stable (serialization compatibility for already-written ledger entries).
+    /// Instance: held while `tax_withholding_deductions` executes.
+    ///
+    /// Distinct from `TaxWithholdingLock(u32)` above, which is a *per-milestone
+    /// record* rather than an execution lock. The two arrived from separate
+    /// PRs that both chose the name `TaxWithholdingLock`; this one is renamed
+    /// to keep both behaviours.
+    TaxWithholdingExecutionLock,
+    /// Instance: held while a platform-fee allocation executes.
+    PlatformFeeAllocationLock,
+    /// Instance: held while an emergency pause/resume transition executes.
+    EmergencyPauseLock,
 }
 
 #[contracttype]
@@ -334,6 +366,18 @@ pub struct DisputeResolvedEvent {
     pub paid_amount: i128,
     pub released_to_freelancer: bool,
     pub status: MilestoneStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaxWithholdingDeductionsEvent {
+    pub admin: Address,
+    pub contract_id: Address,
+    pub milestone_index: u32,
+    pub gross_amount: i128,
+    pub tax_amount: i128,
+    pub net_amount: i128,
+    pub tax_rate_bps: u32,
 }
 
 #[contracttype]
@@ -845,7 +889,7 @@ impl MilestoneEscrow {
         let locked: bool = env
             .storage()
             .instance()
-            .get::<_, bool>(&DataKey::TaxWithholdingLock)
+            .get::<_, bool>(&DataKey::TaxWithholdingExecutionLock)
             .unwrap_or(false);
         if locked {
             return Err(Error::TaxWithholdingInProgress);
@@ -2382,7 +2426,10 @@ impl MilestoneEscrow {
                 client: meta.client.clone(),
                 freelancer: meta.freelancer.clone(),
                 token: meta.token.clone(),
-                amount: payout,
+                // `amount` is what was owed before capping to the available
+                // balance; `paid_amount` is what actually moved.
+                amount: remaining,
+                paid_amount: payout,
                 released_to_freelancer: release_to_freelancer,
                 status: milestone.status.clone(),
             },
@@ -4675,9 +4722,16 @@ impl MilestoneEscrow {
         Ok((rate_bps, total_accrued, is_paused))
     }
 
-    /// Calculate tax withholding deductions for a milestone payout.
+    /// Calculate tax withholding deductions for a milestone payout (admin).
     ///
-    /// This function sets a lock (`TaxWithholdingLock`) while executing to
+    /// Distinct from `tax_withholding_deductions`, which records a
+    /// `TaxWithholdingRecord` per milestone for the normal approval flow. This
+    /// admin-gated variant computes and returns the split directly and emits
+    /// `TaxWithholdingDeductionsEvent`. Both arrived from separate PRs under
+    /// the same name; this one carries the `admin_` prefix used by the other
+    /// admin-gated endpoints.
+    ///
+    /// This function sets a lock (`TaxWithholdingExecutionLock`) while executing to
     /// prevent concurrent state mutations.  The lock is automatically cleared
     /// when the calculation completes, ensuring that normal escrow operations
     /// remain blocked only for the duration of the tax calculation.
@@ -4698,7 +4752,7 @@ impl MilestoneEscrow {
     /// * `InvalidMilestone` – `milestone_index` is out of range.
     /// * `InvalidRatio`     – `tax_rate_bps` exceeds 10 000.
     /// * `InvalidAmount`    – Milestone amount is ≤ 0 or arithmetic overflow.
-    pub fn tax_withholding_deductions(
+    pub fn admin_tax_withholding_deductions(
         env: Env,
         admin: Address,
         milestone_index: u32,
@@ -4710,7 +4764,7 @@ impl MilestoneEscrow {
         // Acquire lock before any state reads to prevent concurrent mutations.
         env.storage()
             .instance()
-            .set(&DataKey::TaxWithholdingLock, &true);
+            .set(&DataKey::TaxWithholdingExecutionLock, &true);
 
         // Ensure lock is released even if the function returns early due to error.
         // We use a defer-like pattern by clearing the lock before returning.
@@ -4747,7 +4801,7 @@ impl MilestoneEscrow {
         // Release lock regardless of success or failure.
         env.storage()
             .instance()
-            .set(&DataKey::TaxWithholdingLock, &false);
+            .set(&DataKey::TaxWithholdingExecutionLock, &false);
 
         let (gross_amount, tax_amount, net_amount) = result?;
 
