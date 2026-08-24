@@ -4542,6 +4542,12 @@ impl MilestoneEscrow {
         admin: Address,
         milestone_index: u32,
     ) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !env.storage().persistent().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+
         Self::require_admin(&env, &admin)?;
 
         let meta = Self::load_job_meta(&env)?;
