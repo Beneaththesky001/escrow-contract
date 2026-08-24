@@ -9155,3 +9155,29 @@ fn test_multisig_transfer_admin_zero_total_emits_no_event() {
     assert!(events.is_empty(), "no events expected on failed call");
 }
 
+#[test]
+fn test_admin_override_cancel_refund_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, _, _, _, _, client) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    let attacker = Address::generate(&env);
+    let result = client.try_admin_override_cancel_refund(&attacker);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_admin_override_cancel_refund_illegal_source_state_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, _, admin_addr, _, _, client) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    // Escrow is funded but NOT cancel locked (illegal source state)
+    let result = client.try_admin_override_cancel_refund(&admin_addr);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+

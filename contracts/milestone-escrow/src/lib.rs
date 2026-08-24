@@ -2874,12 +2874,8 @@ impl MilestoneEscrow {
     /// * `InvalidStatus`   – `CancelLock` is not active.
     /// * `InvalidAmount`   – Total remaining balance is zero (nothing to refund).
     pub fn admin_override_cancel_refund(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
         Self::require_admin(&env, &admin)?;
-
-        let meta = Self::load_job_meta(&env)?;
-        if !meta.funded {
-            return Err(Error::NotFunded);
-        }
 
         // Only valid when a cancel lock is active.
         let cancel_locked = env
@@ -2889,6 +2885,11 @@ impl MilestoneEscrow {
             .unwrap_or(false);
         if !cancel_locked {
             return Err(Error::InvalidStatus);
+        }
+
+        let meta = Self::load_job_meta(&env)?;
+        if !meta.funded {
+            return Err(Error::NotFunded);
         }
 
         // Walk every milestone; accumulate remaining balance and mark Refunded.
