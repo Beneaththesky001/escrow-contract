@@ -1644,6 +1644,17 @@ impl MilestoneEscrow {
         paused: bool,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+
+        let current = env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::EmergencyPaused)
+            .unwrap_or(false);
+
+        if current == paused {
+            return Err(Error::InvalidStatus);
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::EmergencyPaused, &paused);
@@ -1711,6 +1722,17 @@ impl MilestoneEscrow {
         treasury_bps: u32,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+
+        let current: PlatformFeeAllocation = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformFeeAllocation)
+            .ok_or(Error::NotInitialized)?;
+
+        if !current.locked {
+            return Err(Error::InvalidStatus);
+        }
+
         Self::validate_fee_allocation(client_bps, freelancer_bps, treasury_bps)?;
         env.storage().instance().set(
             &DataKey::PlatformFeeAllocation,
