@@ -2684,6 +2684,42 @@ impl MilestoneEscrow {
         Ok(resolved)
     }
 
+    /// Calculate a cancellation allocation between the client and freelancer.
+    ///
+    /// The client share is rounded to the nearest stroop and the freelancer
+    /// receives the exact remainder, so no value is lost to integer division.
+    /// The ratios must sum to exactly `BPS_SCALE`.
+    pub fn cancel_escrow_split_refund(
+        _env: Env,
+        total_amount: i128,
+        client_refund_bps: u32,
+        freelancer_payout_bps: u32,
+    ) -> Result<RefundAllocation, Error> {
+        if total_amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let total_bps = client_refund_bps
+            .checked_add(freelancer_payout_bps)
+            .ok_or(Error::InvalidRatio)?;
+        if total_bps != BPS_SCALE {
+            return Err(Error::InvalidRatio);
+        }
+
+        let client_split = Self::split_round_nearest(
+            total_amount,
+            client_refund_bps as i128,
+            BPS_SCALE as i128,
+        )?;
+
+        Ok(RefundAllocation {
+            client_refund: client_split.first,
+            freelancer_payout: client_split.second,
+            client_refund_bps,
+            freelancer_payout_bps,
+        })
+    }
+
     /// Initiate cancellation of the escrow, freezing it pending an admin
     /// override.
     ///

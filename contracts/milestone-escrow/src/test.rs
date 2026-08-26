@@ -9363,3 +9363,78 @@ fn test_multisig_transfer_admin_zero_total_emits_no_event() {
     let events = env.events().all();
     assert!(events.is_empty(), "no events expected on failed call");
 }
+
+#[test]
+fn test_cancel_escrow_split_refund_preserves_value_with_nearest_rounding() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let allocation = client.cancel_escrow_split_refund(&101_i128, &5_000_u32, &5_000_u32);
+
+    assert_eq!(allocation.client_refund, 51);
+    assert_eq!(allocation.freelancer_payout, 50);
+    assert_eq!(
+        allocation.client_refund + allocation.freelancer_payout,
+        101
+    );
+}
+
+#[test]
+fn test_cancel_escrow_split_refund_rounds_down_without_losing_remainder() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let allocation = client.cancel_escrow_split_refund(&101_i128, &4_900_u32, &5_100_u32);
+
+    assert_eq!(allocation.client_refund, 49);
+    assert_eq!(allocation.freelancer_payout, 52);
+    assert_eq!(
+        allocation.client_refund + allocation.freelancer_payout,
+        101
+    );
+}
+
+#[test]
+fn test_cancel_escrow_split_refund_supports_boundary_ratios() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let client_only = client.cancel_escrow_split_refund(&1_000_i128, &10_000_u32, &0_u32);
+    assert_eq!(client_only.client_refund, 1_000);
+    assert_eq!(client_only.freelancer_payout, 0);
+
+    let freelancer_only = client.cancel_escrow_split_refund(&1_000_i128, &0_u32, &10_000_u32);
+    assert_eq!(freelancer_only.client_refund, 0);
+    assert_eq!(freelancer_only.freelancer_payout, 1_000);
+}
+
+#[test]
+fn test_cancel_escrow_split_refund_rejects_invalid_ratio_or_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.try_cancel_escrow_split_refund(&100_i128, &5_000_u32, &4_999_u32),
+        Err(Ok(Error::InvalidRatio))
+    );
+    assert_eq!(
+        client.try_cancel_escrow_split_refund(&-1_i128, &5_000_u32, &5_000_u32),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        client.try_cancel_escrow_split_refund(&i128::MAX, &5_000_u32, &5_000_u32),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
