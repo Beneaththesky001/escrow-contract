@@ -6679,30 +6679,154 @@ fn test_tax_withholding_deductions_emits_event() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
-    let ratios = vec![&env, 1_i128, 1_i128, 1_i128];
-    let allocations = client.multisig_transfer_admin(&admin_addr, &100_i128, &ratios);
-    assert_eq!(allocations.len(), 3);
-    assert_eq!(allocations.get(0).unwrap(), 34);
-    assert_eq!(allocations.get(1).unwrap(), 33);
-    assert_eq!(allocations.get(2).unwrap(), 33);
+    let record = client.tax_withholding_deductions(&0_u32, &2_500_u32);
+    assert_eq!(record.gross_amount, 1_000);
+    assert_eq!(record.tax_amount, 250);
+    assert_eq!(record.net_amount, 750);
+    assert_eq!(record.gross_amount, record.tax_amount + record.net_amount);
 
-    let total: i128 = allocations.iter().sum();
-    assert_eq!(total, 100);
+    let tax_topic: Val = symbol_short!("taxwith").into_val(&env);
+    assert!(env.events().all().iter().any(|event| {
+        event
+            .1
+            .get(0)
+            .map(|topic| topic.get_payload() == tax_topic.get_payload())
+            .unwrap_or(false)
+    }));
 }
 
-/// Failed tax_withholding_deductions (e.g. wrong caller) must NOT emit any `taxwh` event.
 #[test]
-fn test_tax_withholding_deductions_failed_does_not_emit_event() {
+fn test_tax_withholding_deductions_rounds_nearest_and_preserves_gross() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (admin_addr, _, _, _, _, _, client) = setup_multisig_env(&env);
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, vec![&env, 101_i128]);
 
-    let ratios = vec![&env, 0_i128, 0_i128];
-    let result = client.try_multisig_transfer_admin(&admin_addr, &100_i128, &ratios);
-    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+    let record = client.tax_withholding_deductions(&0_u32, &5_000_u32);
+    assert_eq!(record.tax_amount, 51);
+    assert_eq!(record.net_amount, 50);
+    assert_eq!(record.gross_amount, record.tax_amount + record.net_amount);
+}
+
+#[test]
+fn test_tax_withholding_deductions_accepts_zero_and_full_tax_rates() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    let no_tax = client.tax_withholding_deductions(&0_u32, &0_u32);
+    assert_eq!(no_tax.tax_amount, 0);
+    assert_eq!(no_tax.net_amount, 1_000);
+
+    let full_tax = client.tax_withholding_deductions(&0_u32, &10_000_u32);
+    assert_eq!(full_tax.tax_amount, 1_000);
+    assert_eq!(full_tax.net_amount, 0);
+}
+
+#[test]
+fn test_tax_withholding_record_can_be_resolved_as_net_release() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, freelancer_addr, _, admin_addr, token_contract_id, _, client) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let token = token::Client::new(&env, &token_contract_id);
+
+    client.tax_withholding_deductions(&0_u32, &2_500_u32);
+    client.admin_override_tax_release(&admin_addr, &0_u32);
+
+    assert_eq!(token.balance(&freelancer_addr), 750);
+    assert_eq!(client.get_job().milestones.get(0).unwrap().status, MilestoneStatus::Released);
+    assert_eq!(
+        client.try_admin_override_tax_release(&admin_addr, &0_u32),
+        Err(Ok(Error::InvalidStatus))
+    );
+}
+
+#[test]
+fn test_tax_withholding_record_can_be_resolved_as_gross_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, _, admin_addr, _, _, client) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    client.tax_withholding_deductions(&0_u32, &7_500_u32);
+    client.admin_override_tax_refund(&admin_addr, &0_u32);
+
+    assert_eq!(client.get_job().milestones.get(0).unwrap().status, MilestoneStatus::Refunded);
+    assert_eq!(client.try_admin_override_tax_refund(&admin_addr, &0_u32), Err(Ok(Error::InvalidStatus)));
+}
+
+#[test]
+fn test_tax_withholding_deductions_rejects_invalid_state_and_inputs() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin_addr = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.try_tax_withholding_deductions(&0_u32, &1_u32),
+        Err(Ok(Error::NotInitialized))
+    );
+
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &vec![&env, 1_000_i128],
+    );
+    assert_eq!(
+        client.try_tax_withholding_deductions(&0_u32, &1_u32),
+        Err(Ok(Error::NotFunded))
+    );
+
+    let (_, _, _, _, _, _, funded_client) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    assert_eq!(
+        funded_client.try_tax_withholding_deductions(&1_u32, &1_u32),
+        Err(Ok(Error::InvalidMilestone))
+    );
+    assert_eq!(
+        funded_client.try_tax_withholding_deductions(&0_u32, &10_001_u32),
+        Err(Ok(Error::InvalidRatio))
+    );
+}
+
+#[test]
+fn test_tax_withholding_deductions_terminal_milestone_fails_without_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client_addr, freelancer_addr, _, _, _, _, client) =
+        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    client.mark_delivered(&freelancer_addr, &0_u32);
+    client.approve_milestone(&client_addr, &0_u32);
+
+    let result = client.try_tax_withholding_deductions(&0_u32, &2_500_u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    let tax_topic: Val = symbol_short!("taxwith").into_val(&env);
+    assert!(!env.events().all().iter().any(|event| {
+        event
+            .1
+            .get(0)
+            .map(|topic| topic.get_payload() == tax_topic.get_payload())
+            .unwrap_or(false)
+    }));
 }
 
 #[test]
