@@ -391,6 +391,14 @@ pub struct PlatformFeeAllocation {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformFeeDistribution {
+    pub client_amount: i128,
+    pub freelancer_amount: i128,
+    pub treasury_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoReleasedEvent {
     pub contract_id: Address,
     pub milestone_index: u32,
@@ -1031,6 +1039,59 @@ impl MilestoneEscrow {
         Ok(RatioSplit {
             first: rounded,
             second: total.checked_sub(rounded).ok_or(Error::InvalidAmount)?,
+        })
+    }
+
+    fn allocate_platform_fee(
+        total_amount: i128,
+        allocation: &PlatformFeeAllocation,
+    ) -> Result<PlatformFeeDistribution, Error> {
+        if total_amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let scale = BPS_SCALE as i128;
+        let ratios = [
+            allocation.client_bps as i128,
+            allocation.freelancer_bps as i128,
+            allocation.treasury_bps as i128,
+        ];
+        let mut amounts = [0_i128; 3];
+        let mut remainders = [0_i128; 3];
+        let mut allocated = 0_i128;
+
+        for index in 0..3 {
+            let weighted = total_amount
+                .checked_mul(ratios[index])
+                .ok_or(Error::InvalidAmount)?;
+            amounts[index] = weighted / scale;
+            remainders[index] = weighted % scale;
+            allocated = allocated
+                .checked_add(amounts[index])
+                .ok_or(Error::InvalidAmount)?;
+        }
+
+        // Largest-remainder allocation preserves every unit. Ties are resolved
+        // by field order, making the result deterministic across runtimes.
+        let mut remaining = total_amount
+            .checked_sub(allocated)
+            .ok_or(Error::InvalidAmount)?;
+        while remaining > 0 {
+            let mut best = 0_usize;
+            for index in 1..3 {
+                if remainders[index] > remainders[best] {
+                    best = index;
+                }
+            }
+            amounts[best] = amounts[best].checked_add(1).ok_or(Error::InvalidAmount)?;
+            remainders[best] = -1;
+            remaining -= 1;
+        }
+
+        Ok(PlatformFeeDistribution {
+            client_amount: amounts[0],
+            freelancer_amount: amounts[1],
+            treasury_amount: amounts[2],
         })
     }
 
@@ -3180,6 +3241,23 @@ impl MilestoneEscrow {
             .instance()
             .get(&DataKey::PlatformFeeAllocation)
             .ok_or(Error::NotInitialized)
+    }
+
+    /// Split an amount according to the configured platform-fee ratios.
+    ///
+    /// Each component is calculated with checked integer arithmetic. Any
+    /// units left after flooring are assigned by largest remainder, so the
+    /// three returned amounts always sum exactly to `total_amount`.
+    pub fn calculate_platform_fee_split(
+        env: Env,
+        total_amount: i128,
+    ) -> Result<PlatformFeeDistribution, Error> {
+        let allocation: PlatformFeeAllocation = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformFeeAllocation)
+            .ok_or(Error::NotInitialized)?;
+        Self::allocate_platform_fee(total_amount, &allocation)
     }
 
     pub fn payment_streaming_milestones(
