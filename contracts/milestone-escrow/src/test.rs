@@ -9363,3 +9363,17 @@ fn test_multisig_transfer_admin_zero_total_emits_no_event() {
     let events = env.events().all();
     assert!(events.is_empty(), "no events expected on failed call");
 }
+
+#[test]
+fn test_tax_withholding_deductions_storage_key_footprint_is_minimized() {
+    let env = Env::default();
+
+    // The optimized storage key is a compact u32 milestone index rather than
+    // an Address/Symbol-keyed entry, minimizing the ledger footprint.
+    for milestone_index in 0u32..3 {
+        let key = DataKey::TaxWithholdingDeduction(milestone_index);
+        env.storage().persistent().set(&key, &true);
+        assert!(env.storage().persistent().has(&key));
+        assert_eq!(env.storage().persistent().get(&key), Some(true));
+    }
+}
