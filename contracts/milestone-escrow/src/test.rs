@@ -9403,3 +9403,152 @@ fn test_admin_tax_withholding_deductions_zero_balance_fails() {
     let res = client.try_admin_tax_withholding_deductions(&admin_addr, &0u32, &1000u32);
     assert_eq!(res, Err(Ok(Error::InvalidAmount)));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// tax_withholding_deductions: ratio-split precision (#299)
+//
+// tax_withholding_deductions computes its split via the shared
+// split_round_nearest helper: round(gross * rate / BPS_SCALE) to the nearest
+// integer for tax_amount, then derive net_amount = gross - tax_amount by
+// subtraction rather than a second independent division. That subtraction is
+// what guarantees tax_amount + net_amount == gross_amount exactly for every
+// rate — there is no way for the split to lose or manufacture value, and no
+// way for it to silently truncate (floor) a fraction that should round up.
+// These tests exercise that guarantee directly against the public
+// tax_withholding_deductions entry point, which the two "emits_event" tests
+// above do not (they call the unrelated multisig_transfer_admin function).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_tax_withholding_deductions_conserves_value_across_rates() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let milestone_amounts = vec![&env, 1_000_000_i128];
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
+
+    // tax_amount + net_amount must equal gross_amount exactly for every rate,
+    // including rates that do not divide the gross amount evenly (37 bps,
+    // 3_333 bps, 6_667 bps) — no value may be created or destroyed by the
+    // split, regardless of rounding.
+    for tax_rate_bps in [0u32, 1, 37, 2_500, 3_333, 5_000, 6_667, 9_999, 10_000] {
+        let record = client.tax_withholding_deductions(&0u32, &tax_rate_bps);
+        assert_eq!(
+            record.tax_amount + record.net_amount,
+            record.gross_amount,
+            "value lost/gained at tax_rate_bps={tax_rate_bps}"
+        );
+        assert_eq!(record.gross_amount, 1_000_000);
+        assert_eq!(record.tax_rate_bps, tax_rate_bps);
+        assert!(record.tax_amount >= 0 && record.net_amount >= 0);
+    }
+}
+
+#[test]
+fn test_tax_withholding_deductions_rounds_to_nearest_not_down() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let milestone_amounts = vec![&env, 3_i128];
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
+
+    // gross=3, rate=50% (5_000 bps): exact tax is 1.5, which must round to
+    // the nearest integer (2) rather than truncate down to 1 the way plain
+    // floor division (gross * rate / BPS_SCALE) would.
+    let record = client.tax_withholding_deductions(&0u32, &5_000u32);
+    assert_eq!(record.tax_amount, 2);
+    assert_eq!(record.net_amount, 1);
+    assert_eq!(record.tax_amount + record.net_amount, 3);
+}
+
+#[test]
+fn test_tax_withholding_deductions_rounds_down_when_fraction_is_below_half() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let milestone_amounts = vec![&env, 100_i128];
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
+
+    // gross=100, rate=12.49% (1_249 bps): exact tax is 12.49, which rounds
+    // down to 12 — proving the split rounds to the nearest integer rather
+    // than always rounding up (a ceiling would incorrectly give 13).
+    let record = client.tax_withholding_deductions(&0u32, &1_249u32);
+    assert_eq!(record.tax_amount, 12);
+    assert_eq!(record.net_amount, 88);
+}
+
+#[test]
+fn test_tax_withholding_deductions_zero_rate_withholds_nothing() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let milestone_amounts = vec![&env, 1_000_i128];
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
+
+    let record = client.tax_withholding_deductions(&0u32, &0u32);
+    assert_eq!(record.tax_amount, 0);
+    assert_eq!(record.net_amount, 1_000);
+}
+
+#[test]
+fn test_tax_withholding_deductions_full_rate_withholds_everything() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let milestone_amounts = vec![&env, 1_000_i128];
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
+
+    let record = client.tax_withholding_deductions(&0u32, &10_000u32);
+    assert_eq!(record.tax_amount, 1_000);
+    assert_eq!(record.net_amount, 0);
+}
+
+#[test]
+fn test_tax_withholding_deductions_rejects_rate_above_100_percent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let milestone_amounts = vec![&env, 1_000_i128];
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
+
+    let result = client.try_tax_withholding_deductions(&0u32, &10_001u32);
+    assert_eq!(result, Err(Ok(Error::InvalidRatio)));
+}
+
+#[test]
+fn test_tax_withholding_deductions_conserves_value_at_smallest_unit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let milestone_amounts = vec![&env, 1_i128];
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
+
+    // Even at the smallest indivisible unit, every rate must still conserve
+    // the total exactly and never produce a negative or out-of-range part.
+    for tax_rate_bps in [0u32, 1, 4_999, 5_000, 5_001, 9_999, 10_000] {
+        let record = client.tax_withholding_deductions(&0u32, &tax_rate_bps);
+        assert_eq!(record.tax_amount + record.net_amount, 1);
+        assert!(record.tax_amount == 0 || record.tax_amount == 1);
+        assert!(record.net_amount == 0 || record.net_amount == 1);
+    }
+}
+
+#[test]
+fn test_tax_withholding_deductions_independent_across_milestones() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let milestone_amounts = vec![&env, 400_i128, 600_i128];
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
+
+    let record_a = client.tax_withholding_deductions(&0u32, &2_500u32);
+    let record_b = client.tax_withholding_deductions(&1u32, &7_500u32);
+
+    assert_eq!(record_a.gross_amount, 400);
+    assert_eq!(record_a.tax_amount, 100);
+    assert_eq!(record_a.net_amount, 300);
+
+    assert_eq!(record_b.gross_amount, 600);
+    assert_eq!(record_b.tax_amount, 450);
+    assert_eq!(record_b.net_amount, 150);
+}
