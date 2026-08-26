@@ -485,6 +485,32 @@ pub struct AdminCancelOverrideRefundEvent {
     pub total_refunded: i128,
 }
 
+/// Emitted by `emergency_pause` when the admin pauses the escrow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyPausedEvent {
+    pub admin: Address,
+    pub contract_id: Address,
+}
+
+/// Emitted by `emergency_unpause` when the admin unpauses the escrow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyUnpausedEvent {
+    pub admin: Address,
+    pub contract_id: Address,
+}
+
+/// Emitted by `emergency_pause_admin_override` when the admin overrides the pause state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyPauseAdminOverrideEvent {
+    pub admin: Address,
+    pub contract_id: Address,
+    pub paused: bool,
+}
+
+
 // ── tax_withholding_deductions types and events ──────────────────────────────
 
 /// Stored in `DataKey::TaxWithholdingLock(milestone_index)` by
@@ -2984,6 +3010,16 @@ impl MilestoneEscrow {
             .instance()
             .set(&DataKey::EmergencyPauseLock, &false);
 
+        if result.is_ok() {
+            env.events().publish(
+                (symbol_short!("empause"),),
+                EmergencyPausedEvent {
+                    admin: admin.clone(),
+                    contract_id: env.current_contract_address(),
+                },
+            );
+        }
+
         result
     }
 
@@ -3005,6 +3041,16 @@ impl MilestoneEscrow {
         env.storage()
             .instance()
             .set(&DataKey::EmergencyPauseLock, &false);
+
+        if result.is_ok() {
+            env.events().publish(
+                (symbol_short!("emunpause"),),
+                EmergencyUnpausedEvent {
+                    admin: admin.clone(),
+                    contract_id: env.current_contract_address(),
+                },
+            );
+        }
 
         result
     }
@@ -3042,6 +3088,17 @@ impl MilestoneEscrow {
         env.storage()
             .instance()
             .set(&DataKey::EmergencyPauseLock, &false);
+
+        if result.is_ok() {
+            env.events().publish(
+                (symbol_short!("emoverrid"),),
+                EmergencyPauseAdminOverrideEvent {
+                    admin: admin.clone(),
+                    contract_id: env.current_contract_address(),
+                    paused,
+                },
+            );
+        }
 
         result
     }
@@ -3923,6 +3980,7 @@ impl MilestoneEscrow {
 
 mod test;
 
+
 // ── escrow_interest_yield: admin emergency override endpoints ─────────────────
 //
 // Design rationale
@@ -4486,6 +4544,12 @@ impl MilestoneEscrow {
             return Err(Error::InvalidRatio);
         }
 
+        let token_client = token::Client::new(&env, &meta.token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        if contract_balance <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
         let milestone = Self::load_milestone(&env, milestone_index)?;
 
         if milestone.status == MilestoneStatus::Released
@@ -4774,8 +4838,18 @@ impl MilestoneEscrow {
         milestone_index: u32,
         tax_rate_bps: u32,
     ) -> Result<(i128, i128, i128), Error> {
-        admin.require_auth();
         Self::require_admin(&env, &admin)?;
+
+        let meta = Self::load_job_meta(&env)?;
+        if !meta.funded {
+            return Err(Error::NotFunded);
+        }
+
+        let token_client = token::Client::new(&env, &meta.token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        if contract_balance <= 0 {
+            return Err(Error::InvalidAmount);
+        }
 
         // Acquire lock before any state reads to prevent concurrent mutations.
         env.storage()
@@ -4785,10 +4859,6 @@ impl MilestoneEscrow {
         // Ensure lock is released even if the function returns early due to error.
         // We use a defer-like pattern by clearing the lock before returning.
         let result = (|| {
-            let meta = Self::load_job_meta(&env)?;
-            if !meta.funded {
-                return Err(Error::NotFunded);
-            }
             if milestone_index >= meta.milestone_count {
                 return Err(Error::InvalidMilestone);
             }
