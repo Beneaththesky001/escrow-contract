@@ -7,6 +7,9 @@ use soroban_sdk::{
     Val,
 };
 
+#[path = "milestone_time_extensions_tests.rs"]
+mod milestone_time_extensions_tests;
+
 #[contracttype]
 enum ReentrantTokenDataKey {
     /// Set once the mock has attempted to call back into the escrow.
