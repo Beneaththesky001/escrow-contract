@@ -2215,7 +2215,11 @@ impl MilestoneEscrow {
     pub fn raise_dispute(env: Env, caller: Address, milestone_index: u32) -> Result<(), Error> {
         Self::ensure_not_paused(&env)?;
         // ── Re-entrancy lock ─────────────────────────────────────────────
-        if env.storage().temporary().has(&DataKey::DisputeLock(milestone_index)) {
+        if env
+            .storage()
+            .temporary()
+            .has(&DataKey::DisputeLock(milestone_index))
+        {
             return Err(Error::DisputeAlreadyRaised);
         }
         env.storage()
@@ -2234,11 +2238,7 @@ impl MilestoneEscrow {
     /// `raise_dispute` wraps every path uniformly.  This function
     /// is never called directly — it exists only to keep the
     /// lock/release pairing in one place.
-    fn raise_dispute_inner(
-        env: &Env,
-        caller: Address,
-        milestone_index: u32,
-    ) -> Result<(), Error> {
+    fn raise_dispute_inner(env: &Env, caller: Address, milestone_index: u32) -> Result<(), Error> {
         // Check for zero addresses (both account and contract types)
         let zero_account = Address::from_str(
             env,
@@ -2540,11 +2540,8 @@ impl MilestoneEscrow {
         // Use the shared split_round_nearest primitive for consistent rounding.
         // numerator   = freelancer_bps
         // denominator = BPS_SCALE (10_000)
-        let split = Self::split_round_nearest(
-            total_amount,
-            freelancer_bps as i128,
-            BPS_SCALE as i128,
-        )?;
+        let split =
+            Self::split_round_nearest(total_amount, freelancer_bps as i128, BPS_SCALE as i128)?;
 
         let freelancer_payout = split.first;
         let client_refund = split.second;
@@ -3018,6 +3015,17 @@ impl MilestoneEscrow {
         paused: bool,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+
+        let current = env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::EmergencyPaused)
+            .unwrap_or(false);
+
+        if current == paused {
+            return Err(Error::InvalidStatus);
+        }
+
         Self::assert_emergency_pause_not_locked(&env)?;
 
         env.storage()
@@ -3128,6 +3136,17 @@ impl MilestoneEscrow {
         treasury_bps: u32,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+
+        let current: PlatformFeeAllocation = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformFeeAllocation)
+            .ok_or(Error::NotInitialized)?;
+
+        if !current.locked {
+            return Err(Error::InvalidStatus);
+        }
+
         Self::assert_platform_fee_allocation_not_locked(&env)?;
         Self::assert_emergency_pause_not_locked(&env)?;
         Self::validate_fee_allocation(client_bps, freelancer_bps, treasury_bps)?;
@@ -4484,11 +4503,8 @@ impl MilestoneEscrow {
         }
 
         // tax_amount = round_nearest(gross × rate / 10_000)
-        let tax_split = Self::split_round_nearest(
-            gross_amount,
-            tax_rate_bps as i128,
-            BPS_SCALE as i128,
-        )?;
+        let tax_split =
+            Self::split_round_nearest(gross_amount, tax_rate_bps as i128, BPS_SCALE as i128)?;
         let tax_amount = tax_split.first;
         let net_amount = tax_split.second;
 
@@ -4625,6 +4641,12 @@ impl MilestoneEscrow {
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
 
+        let record: TaxWithholdingRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TaxWithholdingLock(milestone_index))
+            .ok_or(Error::InvalidStatus)?;
+
         let meta = Self::load_job_meta(&env)?;
         if !meta.funded {
             return Err(Error::NotFunded);
@@ -4632,12 +4654,6 @@ impl MilestoneEscrow {
         if milestone_index >= meta.milestone_count {
             return Err(Error::InvalidMilestone);
         }
-
-        let record: TaxWithholdingRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TaxWithholdingLock(milestone_index))
-            .ok_or(Error::InvalidStatus)?;
 
         let mut milestone = Self::load_milestone(&env, milestone_index)?;
         if milestone.status == MilestoneStatus::Released
@@ -4993,11 +5009,7 @@ impl MilestoneEscrow {
             .set(&DataKey::MultisigLocked, &false);
 
         let token_client = token::Client::new(&env, &meta.token);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &meta.client,
-            &remaining,
-        );
+        token_client.transfer(&env.current_contract_address(), &meta.client, &remaining);
 
         env.events().publish(
             (symbol_short!("msadmref"),),
@@ -5058,11 +5070,8 @@ impl MilestoneEscrow {
         }
 
         // Use the existing split_round_nearest to compute client refund.
-        let client_split = Self::split_round_nearest(
-            total_amount,
-            client_refund_bps as i128,
-            BPS_SCALE as i128,
-        )?;
+        let client_split =
+            Self::split_round_nearest(total_amount, client_refund_bps as i128, BPS_SCALE as i128)?;
 
         // freelancer_payout = total_amount - client_refund
         let freelancer_payout = total_amount
@@ -5078,6 +5087,68 @@ impl MilestoneEscrow {
 
         env.events().publish(
             (symbol_short!("splitref"),),
+            SplitRefundCalculatedEvent {
+                client_refund: allocation.client_refund,
+                freelancer_payout: allocation.freelancer_payout,
+                client_refund_bps: allocation.client_refund_bps,
+                freelancer_payout_bps: allocation.freelancer_payout_bps,
+            },
+        );
+
+        Ok(allocation)
+    }
+
+    /// Implement refund distribution pathways for split-refund claims during
+    /// an emergency pause.
+    ///
+    /// # Parameters
+    /// * `env`                  – Soroban environment (used only for event emission).
+    /// * `total_amount`         – Total amount to split.
+    /// * `client_refund_bps`    – Client's refund share in basis points.
+    /// * `freelancer_payout_bps`– Freelancer's payout share in basis points.
+    ///
+    /// # Returns
+    /// A `RefundAllocation` struct with computed amounts and the basis-point
+    /// ratios that were used.
+    ///
+    /// # Errors
+    /// * `InvalidRatio` – Ratios do not sum to `BPS_SCALE`.
+    /// * `InvalidAmount`– `total_amount` ≤ 0 or arithmetic overflow.
+    pub fn emergency_pause_split_refund(
+        env: Env,
+        total_amount: i128,
+        client_refund_bps: u32,
+        freelancer_payout_bps: u32,
+    ) -> Result<RefundAllocation, Error> {
+        if total_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let total_bps = client_refund_bps
+            .checked_add(freelancer_payout_bps)
+            .ok_or(Error::InvalidRatio)?;
+        if total_bps != BPS_SCALE {
+            return Err(Error::InvalidRatio);
+        }
+
+        // Use the existing split_round_nearest to compute client refund.
+        let client_split =
+            Self::split_round_nearest(total_amount, client_refund_bps as i128, BPS_SCALE as i128)?;
+
+        // freelancer_payout = total_amount - client_refund
+        let freelancer_payout = total_amount
+            .checked_sub(client_split.first)
+            .ok_or(Error::InvalidAmount)?;
+
+        let allocation = RefundAllocation {
+            client_refund: client_split.first,
+            freelancer_payout,
+            client_refund_bps,
+            freelancer_payout_bps,
+        };
+
+        env.events().publish(
+            (symbol_short!("epspltref"),),
             SplitRefundCalculatedEvent {
                 client_refund: allocation.client_refund,
                 freelancer_payout: allocation.freelancer_payout,
