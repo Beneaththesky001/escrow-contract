@@ -1,14 +1,11 @@
 #![cfg(test)]
 use super::*;
 use crate::{
-    EmergencyPausedEvent, EmergencyUnpausedEvent, EmergencyPauseAdminOverrideEvent, Error, DataKey,
-};
-use soroban_sdk::{
-    Address, Env, symbol_short, Symbol, IntoVal, FromVal, vec, Val,
-    TryIntoVal,
+    DataKey, EmergencyPauseAdminOverrideEvent, EmergencyPausedEvent, EmergencyUnpausedEvent, Error,
 };
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::testutils::Events as _;
+use soroban_sdk::{symbol_short, vec, Address, Env, FromVal, IntoVal, Symbol, TryIntoVal, Val};
 
 #[test]
 fn test_emergency_pause_happy_path_and_event() {
@@ -16,8 +13,7 @@ fn test_emergency_pause_happy_path_and_event() {
     env.mock_all_auths();
 
     let milestone_amounts = vec![&env, 1000_i128];
-    let (_, _, _, admin_addr, _, _, client) =
-        setup_funded_escrow(&env, milestone_amounts);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
 
     // Initial state: not paused
     assert!(!client.is_emergency_paused());
@@ -44,8 +40,7 @@ fn test_emergency_unpause_happy_path_and_event() {
     env.mock_all_auths();
 
     let milestone_amounts = vec![&env, 1000_i128];
-    let (_, _, _, admin_addr, _, _, client) =
-        setup_funded_escrow(&env, milestone_amounts);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
 
     // Pause first
     client.emergency_pause(&admin_addr);
@@ -72,8 +67,7 @@ fn test_emergency_pause_admin_override_happy_path_and_event() {
     env.mock_all_auths();
 
     let milestone_amounts = vec![&env, 1000_i128];
-    let (_, _, _, admin_addr, _, _, client) =
-        setup_funded_escrow(&env, milestone_amounts);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
 
     // Override to paused (true)
     client.emergency_pause_admin_override(&admin_addr, &true);
@@ -114,8 +108,7 @@ fn test_emergency_pause_unauthorized() {
     env.mock_all_auths();
 
     let milestone_amounts = vec![&env, 1000_i128];
-    let (client_addr, _, _, _, _, _, client) =
-        setup_funded_escrow(&env, milestone_amounts);
+    let (client_addr, _, _, _, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
 
     // Call pause as client (should fail)
     let res = client.try_emergency_pause(&client_addr);
@@ -128,8 +121,7 @@ fn test_emergency_unpause_unauthorized() {
     env.mock_all_auths();
 
     let milestone_amounts = vec![&env, 1000_i128];
-    let (client_addr, _, _, _, _, _, client) =
-        setup_funded_escrow(&env, milestone_amounts);
+    let (client_addr, _, _, _, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
 
     // Call unpause as client (should fail)
     let res = client.try_emergency_unpause(&client_addr);
@@ -142,8 +134,7 @@ fn test_emergency_pause_admin_override_unauthorized() {
     env.mock_all_auths();
 
     let milestone_amounts = vec![&env, 1000_i128];
-    let (client_addr, _, _, _, _, _, client) =
-        setup_funded_escrow(&env, milestone_amounts);
+    let (client_addr, _, _, _, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
 
     // Call override as client (should fail)
     let res = client.try_emergency_pause_admin_override(&client_addr, &true);
@@ -156,8 +147,7 @@ fn test_emergency_pause_admin_override_invalid_state() {
     env.mock_all_auths();
 
     let milestone_amounts = vec![&env, 1000_i128];
-    let (_, _, _, admin_addr, _, _, client) =
-        setup_funded_escrow(&env, milestone_amounts);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, milestone_amounts);
 
     // Initially not paused. Calling override to false should fail.
     let res = client.try_emergency_pause_admin_override(&admin_addr, &false);
