@@ -237,21 +237,20 @@ fn test_pause_emits_a_state_change_event() {
 
     escrow.emergency_pause(&admin);
 
-    let topic: Val = symbol_short!("emgpause").into_val(&env);
+    let topic: Val = symbol_short!("empause").into_val(&env);
     let mut found = false;
 
     for e in env.events().all().iter() {
         if let Some(t) = e.1.get(0) {
             if t.get_payload() == topic.get_payload() {
                 found = true;
-                let data = EmergencyPauseStateChangedEvent::from_val(&env, &e.2);
+                let data = EmergencyPausedEvent::from_val(&env, &e.2);
                 assert_eq!(data.admin, admin);
-                assert!(data.paused);
             }
         }
     }
 
-    assert!(found, "expected an emgpause event carrying paused = true");
+    assert!(found, "expected an empause event naming the admin");
 }
 
 #[test]
@@ -261,17 +260,24 @@ fn test_rejected_transitions_emit_no_event() {
     let attacker = Address::generate(&env);
 
     // Neither an unauthorised pause nor an unpause of a running contract may
-    // publish a state-change event.
+    // publish a state-change event — on either topic.
     let _ = escrow.try_emergency_pause(&attacker);
     let _ = escrow.try_emergency_unpause(&admin);
 
-    let topic: Val = symbol_short!("emgpause").into_val(&env);
+    let paused_topic: Val = symbol_short!("empause").into_val(&env);
+    let unpaused_topic: Val = symbol_short!("emunpause").into_val(&env);
+
     for e in env.events().all().iter() {
         if let Some(t) = e.1.get(0) {
             assert_ne!(
                 t.get_payload(),
-                topic.get_payload(),
-                "a rejected transition published a state-change event"
+                paused_topic.get_payload(),
+                "a rejected pause published a state-change event"
+            );
+            assert_ne!(
+                t.get_payload(),
+                unpaused_topic.get_payload(),
+                "a rejected unpause published a state-change event"
             );
         }
     }

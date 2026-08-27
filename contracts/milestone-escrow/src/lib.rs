@@ -804,16 +804,6 @@ pub struct PaymentStreamingConsentEvent {
 
 // ── emergency_pause events ──────────────────────────────────────────────────
 
-/// Emitted by `emergency_pause` and `emergency_unpause` on a successful state
-/// transition. `paused` carries the new state so subscribers do not have to
-/// infer it from the topic.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EmergencyPauseStateChangedEvent {
-    pub admin: Address,
-    pub paused: bool,
-}
-
 /// Emitted by `emergency_pause_allocation` with the exact per-party
 /// amounts. `total_amount` always equals the sum of `allocations`.
 #[contracttype]
