@@ -5883,8 +5883,63 @@ fn test_platform_fee_allocation_admin_override_requires_verified_admin() {
         &amounts,
     );
 
+    client.set_platform_fee_allocation(&admin_addr, &2000_u32, &7000_u32, &1000_u32);
+    client.lock_platform_fee_allocation(&admin_addr);
+
     let result = client.try_pf_alloc_admin_override(&attacker, &1000_u32, &8000_u32, &1000_u32);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    
+    let allocation = client.get_platform_fee_allocation();
+    assert_eq!(allocation.client_bps, 2000);
+    assert_eq!(allocation.freelancer_bps, 7000);
+    assert!(allocation.locked);
+}
+
+#[test]
+fn test_platform_fee_allocation_admin_override_invalid_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let client_addr = Address::generate(&env);
+    let freelancer_addr = Address::generate(&env);
+    let arbiter_addr = Address::generate(&env);
+    let admin_addr = Address::generate(&env);
+
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(admin_addr.clone())
+        .address();
+
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+
+    let amounts = vec![&env, 1_000_i128];
+    client.initialize(
+        &admin_addr,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter_addr,
+        &token_contract_id,
+        &604800,
+        &amounts,
+    );
+
+    // If we try to override before setting it up (but after initialize), it's not locked.
+    // It should fail with InvalidStatus.
+    let result = client.try_pf_alloc_admin_override(&admin_addr, &1000_u32, &8000_u32, &1000_u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+
+    client.set_platform_fee_allocation(&admin_addr, &2000_u32, &7000_u32, &1000_u32);
+    
+    // Now it's set but NOT locked. An override is unnecessary and should fail with InvalidStatus.
+    let result2 = client.try_pf_alloc_admin_override(&admin_addr, &1500_u32, &7500_u32, &1000_u32);
+    assert_eq!(result2, Err(Ok(Error::InvalidStatus)));
+    
+    // Storage remains unchanged
+    let allocation = client.get_platform_fee_allocation();
+    assert_eq!(allocation.client_bps, 2000);
+    assert_eq!(allocation.freelancer_bps, 7000);
+    assert_eq!(allocation.treasury_bps, 1000);
+    assert!(!allocation.locked);
 }
 
 #[test]
@@ -5961,6 +6016,38 @@ fn test_emergency_pause_admin_override_requires_verified_admin() {
 
     let result = client.try_emergency_pause_admin_override(&attacker, &true);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert!(!client.is_emergency_paused());
+}
+
+#[test]
+fn test_emergency_pause_admin_override_invalid_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let amounts = vec![&env, 10_000_i128];
+    let (_client, _freelancer, _arbiter, admin_addr, _token, _id, client) =
+        setup_funded_escrow(&env, amounts);
+
+    // Initial state is unpaused (false)
+    assert!(!client.is_emergency_paused());
+
+    // Overriding with the exact same state (false) should fail with InvalidStatus
+    let result = client.try_emergency_pause_admin_override(&admin_addr, &false);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    
+    // State remains unchanged
+    assert!(!client.is_emergency_paused());
+    
+    // Pause it normally
+    client.emergency_pause(&admin_addr);
+    assert!(client.is_emergency_paused());
+    
+    // Overriding with the exact same state (true) should fail with InvalidStatus
+    let result2 = client.try_emergency_pause_admin_override(&admin_addr, &true);
+    assert_eq!(result2, Err(Ok(Error::InvalidStatus)));
+    
+    // State remains unchanged
+    assert!(client.is_emergency_paused());
 }
 
 #[test]
