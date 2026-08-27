@@ -2920,6 +2920,15 @@ impl MilestoneEscrow {
             return Err(Error::NotFunded);
         }
 
+        // Boundary guard: cancelling against an empty escrow has no funds
+        // to resolve, so block processing until the contract holds a
+        // positive token balance.
+        let token_client = token::Client::new(&env, &meta.token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        if contract_balance <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
         env.storage().instance().set(&DataKey::CancelLock, &true);
 
         env.events().publish(
