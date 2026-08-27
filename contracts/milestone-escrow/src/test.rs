@@ -1,5 +1,9 @@
 #![cfg(test)]
 use super::*;
+#[path = "cancel_escrow_test.rs"]
+mod cancel_escrow_test;
+#[path = "emergency_pause_test.rs"]
+mod emergency_pause_test;
 use crate::Error::NotFunded;
 use soroban_sdk::{
     contract, contractimpl, contracttype, testutils::Address as _, testutils::EnvTestConfig,
@@ -9745,4 +9749,40 @@ fn test_cancel_escrow_empty_balance_emits_no_event() {
         acc
     });
     assert_eq!(cancel_events, 0);
+}
+
+#[test]
+fn test_tax_withholding_deductions_zero_balance_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let milestone_amounts = vec![&env, 1000_i128];
+    let (_, _, _, _, token_contract_id, contract_id, client) =
+        setup_funded_escrow(&env, milestone_amounts);
+
+    // Empty the contract balance by transferring all tokens out
+    let token_client = token::Client::new(&env, &token_contract_id);
+    token_client.transfer(&contract_id, &Address::generate(&env), &1000_i128);
+
+    // Call tax_withholding_deductions (should fail with InvalidAmount)
+    let res = client.try_tax_withholding_deductions(&0u32, &1000u32);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_admin_tax_withholding_deductions_zero_balance_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let milestone_amounts = vec![&env, 1000_i128];
+    let (_, _, _, admin_addr, token_contract_id, contract_id, client) =
+        setup_funded_escrow(&env, milestone_amounts);
+
+    // Empty the contract balance by transferring all tokens out
+    let token_client = token::Client::new(&env, &token_contract_id);
+    token_client.transfer(&contract_id, &Address::generate(&env), &1000_i128);
+
+    // Call admin_tax_withholding_deductions (should fail with InvalidAmount)
+    let res = client.try_admin_tax_withholding_deductions(&admin_addr, &0u32, &1000u32);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
 }
