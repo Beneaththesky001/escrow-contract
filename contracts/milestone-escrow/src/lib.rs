@@ -4827,6 +4827,7 @@ impl MilestoneEscrow {
     /// Calculates the tax owed on the milestone's remaining gross balance using
     /// the supplied `tax_rate_bps`, writes the result to
     /// `DataKey::TaxWithholdingLock(milestone_index)` and emits an event.
+    /// Both the client and freelancer must authorize the calculation.
     /// The milestone is left in its current state so the normal approval flow
     /// remains intact; the admin override endpoints read the stored record to
     /// resolve any locked condition.
@@ -4849,6 +4850,9 @@ impl MilestoneEscrow {
         tax_rate_bps: u32,
     ) -> Result<TaxWithholdingRecord, Error> {
         let meta = Self::load_job_meta(&env)?;
+
+        meta.client.require_auth();
+        meta.freelancer.require_auth();
 
         if !meta.funded {
             return Err(Error::NotFunded);

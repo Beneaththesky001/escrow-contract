@@ -11,6 +11,9 @@ use soroban_sdk::{
     Val,
 };
 
+#[path = "tax_withholding_tests.rs"]
+mod tax_withholding_tests;
+
 #[contracttype]
 enum ReentrantTokenDataKey {
     /// Set once the mock has attempted to call back into the escrow.
