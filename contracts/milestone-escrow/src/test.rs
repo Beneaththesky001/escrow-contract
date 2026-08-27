@@ -9369,6 +9369,42 @@ fn test_multisig_transfer_admin_zero_total_emits_no_event() {
 }
 
 #[test]
+fn test_platform_fee_allocation_preserves_value_with_largest_remainders() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client_addr, freelancer_addr, token, auto_release) = setup_test_env(&env);
+    let arbiter = Address::generate(&env);
+    let contract_id = env.register(MilestoneEscrow, ());
+    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    client.initialize(
+        &admin,
+        &client_addr,
+        &freelancer_addr,
+        &arbiter,
+        &token,
+        &auto_release,
+        &vec![&env, 1_000_i128],
+    );
+
+    client.set_platform_fee_allocation(&admin, &3333, &3333, &3334);
+    let distribution = client.calculate_platform_fee_split(&2_i128);
+    assert_eq!(distribution.client_amount, 1);
+    assert_eq!(distribution.freelancer_amount, 0);
+    assert_eq!(distribution.treasury_amount, 1);
+    assert_eq!(
+        distribution.client_amount + distribution.freelancer_amount + distribution.treasury_amount,
+        2
+    );
+
+    let zero = client.calculate_platform_fee_split(&0_i128);
+    assert_eq!(
+        zero.client_amount + zero.freelancer_amount + zero.treasury_amount,
+        0
+    );
+    let negative = client.try_calculate_platform_fee_split(&-1_i128);
+    assert_eq!(negative, Err(Ok(Error::InvalidAmount)));
+}
 fn test_tax_withholding_deductions_zero_balance_fails() {
     let env = Env::default();
     env.mock_all_auths();
