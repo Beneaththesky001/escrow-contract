@@ -5210,10 +5210,11 @@ impl MilestoneEscrow {
             Ok((gross_amount, tax_amount, net_amount))
         })();
 
-        // Release lock regardless of success or failure.
+        // Release lock regardless of success or failure.  Remove the key so a
+        // stale `false` entry does not remain on the ledger.
         env.storage()
             .instance()
-            .set(&DataKey::TaxWithholdingExecutionLock, &false);
+            .remove(&DataKey::TaxWithholdingExecutionLock);
 
         let (gross_amount, tax_amount, net_amount) = result?;
 
