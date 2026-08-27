@@ -18,6 +18,12 @@ const MAX_MULTISIG_RATIO_COUNT: u32 = 255;
 /// overflow regardless of how many times the function is invoked.
 const MAX_WHITELIST_SIZE: u32 = 50;
 
+/// Maximum number of parties that may share an emergency-pause allocation.
+/// `emergency_pause_allocation` runs a nested loop over the weight
+/// vector during the largest-remainder phase, so the cap bounds its worst-case
+/// CPU cost and keeps the `u32` party counter from overflowing.
+const MAX_EMERGENCY_ALLOCATION_PARTIES: u32 = 255;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -65,6 +71,18 @@ pub enum Error {
     /// A guarded endpoint was called while an emergency pause transition is
     /// mid-execution and holds `DataKey::EmergencyPauseLock`.
     EmergencyPauseInProgress = 28,
+    /// `emergency_pause` was called while the contract is already paused.
+    /// Re-pausing is rejected rather than silently no-opping so an operator
+    /// cannot mistake a redundant call for having taken fresh action.
+    AlreadyPaused = 29,
+    /// `emergency_unpause`, or a pause-gated endpoint such as
+    /// `emergency_pause_claim_refund`, was called while the contract is
+    /// not paused.
+    NotPaused = 30,
+    /// A weight vector passed to `emergency_pause_allocation` was
+    /// empty, exceeded the party cap, contained a negative weight, or summed
+    /// to zero.
+    InvalidAllocationWeights = 31,
 }
 
 const BPS_SCALE: u32 = 10_000;
@@ -485,6 +503,31 @@ pub struct AdminCancelOverrideRefundEvent {
     pub total_refunded: i128,
 }
 
+/// Emitted by `emergency_pause` when the admin pauses the escrow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyPausedEvent {
+    pub admin: Address,
+    pub contract_id: Address,
+}
+
+/// Emitted by `emergency_unpause` when the admin unpauses the escrow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyUnpausedEvent {
+    pub admin: Address,
+    pub contract_id: Address,
+}
+
+/// Emitted by `emergency_pause_admin_override` when the admin overrides the pause state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyPauseAdminOverrideEvent {
+    pub admin: Address,
+    pub contract_id: Address,
+    pub paused: bool,
+}
+
 // ── tax_withholding_deductions types and events ──────────────────────────────
 
 /// Stored in `DataKey::TaxWithholdingLock(milestone_index)` by
@@ -743,6 +786,34 @@ pub struct PaymentStreamingEvent {
     pub client_refund: i128,
 }
 
+/// Emitted by `payment_streaming_consent` once both the client's
+/// and the freelancer's signatures have been collected and the streaming
+/// split has been computed. The two addresses are included so an indexer can
+/// audit *who* consented without re-reading job metadata.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentStreamingConsentEvent {
+    pub client: Address,
+    pub freelancer: Address,
+    pub total_amount: i128,
+    pub numerator: i128,
+    pub denominator: i128,
+    pub streamed_payout: i128,
+    pub client_refund: i128,
+}
+
+// ── emergency_pause events ──────────────────────────────────────────────────
+
+/// Emitted by `emergency_pause_allocation` with the exact per-party
+/// amounts. `total_amount` always equals the sum of `allocations`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyPauseAllocationEvent {
+    pub total_amount: i128,
+    pub num_parties: u32,
+    pub allocations: Vec<i128>,
+}
+
 // ── multisig_approval events ────────────────────────────────────────────────
 
 /// Emitted by `multisig_admin_override_release` when the admin force-releases
@@ -817,6 +888,32 @@ impl MilestoneEscrow {
             return Err(Error::Unauthorized);
         }
         Ok(())
+    }
+
+    /// Validation hook: verify that **both** the client and the freelancer
+    /// recorded on the job have signed the current transaction.
+    ///
+    /// Both signatures are collected before any business logic runs.  A
+    /// transaction carrying only one of the two signatures never reaches the
+    /// caller's logic: the missing `require_auth()` panics at the host level,
+    /// so a single-signature attempt reverts the whole invocation and no
+    /// storage is mutated.
+    ///
+    /// Returns the loaded `JobMeta` so callers do not need a second instance
+    /// read.
+    ///
+    /// # Errors
+    /// * `NotInitialized` – Job metadata has never been written, so there is
+    ///   no client/freelancer pair to collect signatures from.
+    fn require_client_and_freelancer_consent(env: &Env) -> Result<JobMeta, Error> {
+        let meta = Self::load_job_meta(env)?;
+
+        // Order is irrelevant to correctness — both must succeed — but the
+        // client is checked first to mirror `set_interest_yield_consent`.
+        meta.client.require_auth();
+        meta.freelancer.require_auth();
+
+        Ok(meta)
     }
 
     /// Verify that the caller is either the stored client or freelancer for
@@ -3001,9 +3098,38 @@ impl MilestoneEscrow {
         Ok(())
     }
 
+    /// Freeze the escrow: set `DataKey::EmergencyPaused`, blocking every
+    /// endpoint guarded by `ensure_not_paused`.
+    ///
+    /// # Business rules
+    /// Bad setups are rejected before any state is written, each with a
+    /// distinct error variant:
+    ///
+    /// 1. The contract must be initialised — `require_admin` loads the stored
+    ///    admin key and returns `NotInitialized` when it is absent.  Pausing
+    ///    an uninitialised contract would write a flag no endpoint could ever
+    ///    clear through the normal admin path.
+    /// 2. The caller must be the stored admin, both at the SDK level
+    ///    (`admin.require_auth()`) and by key comparison (`Unauthorized`).
+    /// 3. No pause transition may already be mid-execution
+    ///    (`EmergencyPauseInProgress`).
+    /// 4. The contract must not already be paused (`AlreadyPaused`).  A
+    ///    redundant pause previously succeeded silently, which let an operator
+    ///    believe they had taken fresh action during an incident when the
+    ///    freeze was in fact already in place.
+    ///
+    /// # Errors
+    /// * `NotInitialized`            – Admin key has never been stored.
+    /// * `Unauthorized`              – `admin` is not the stored admin.
+    /// * `EmergencyPauseInProgress`  – A pause transition is already running.
+    /// * `AlreadyPaused`             – The contract is already paused.
     pub fn emergency_pause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         Self::assert_emergency_pause_not_locked(&env)?;
+
+        if Self::is_emergency_paused(env.clone()) {
+            return Err(Error::AlreadyPaused);
+        }
 
         env.storage()
             .instance()
@@ -3020,12 +3146,41 @@ impl MilestoneEscrow {
             .instance()
             .set(&DataKey::EmergencyPauseLock, &false);
 
+        if result.is_ok() {
+            env.events().publish(
+                (symbol_short!("empause"),),
+                EmergencyPausedEvent {
+                    admin: admin.clone(),
+                    contract_id: env.current_contract_address(),
+                },
+            );
+        }
+
         result
     }
 
+    /// Lift an emergency freeze, restoring normal operation.
+    ///
+    /// # Business rules
+    /// Mirrors [`emergency_pause`]: the contract must be initialised, the
+    /// caller must be the stored admin, no transition may be mid-execution,
+    /// and the contract must actually be paused.  Unpausing a running
+    /// contract is rejected with `NotPaused` rather than silently succeeding,
+    /// so a mistaken call is visible to the operator instead of reading as a
+    /// completed recovery.
+    ///
+    /// # Errors
+    /// * `NotInitialized`            – Admin key has never been stored.
+    /// * `Unauthorized`              – `admin` is not the stored admin.
+    /// * `EmergencyPauseInProgress`  – A pause transition is already running.
+    /// * `NotPaused`                 – The contract is not currently paused.
     pub fn emergency_unpause(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         Self::assert_emergency_pause_not_locked(&env)?;
+
+        if !Self::is_emergency_paused(env.clone()) {
+            return Err(Error::NotPaused);
+        }
 
         env.storage()
             .instance()
@@ -3041,6 +3196,16 @@ impl MilestoneEscrow {
         env.storage()
             .instance()
             .set(&DataKey::EmergencyPauseLock, &false);
+
+        if result.is_ok() {
+            env.events().publish(
+                (symbol_short!("emunpause"),),
+                EmergencyUnpausedEvent {
+                    admin: admin.clone(),
+                    contract_id: env.current_contract_address(),
+                },
+            );
+        }
 
         result
     }
@@ -3078,6 +3243,17 @@ impl MilestoneEscrow {
         env.storage()
             .instance()
             .set(&DataKey::EmergencyPauseLock, &false);
+
+        if result.is_ok() {
+            env.events().publish(
+                (symbol_short!("emoverrid"),),
+                EmergencyPauseAdminOverrideEvent {
+                    admin: admin.clone(),
+                    contract_id: env.current_contract_address(),
+                    paused,
+                },
+            );
+        }
 
         result
     }
@@ -3243,6 +3419,78 @@ impl MilestoneEscrow {
         env.events().publish(
             (symbol_short!("p_stream"),),
             PaymentStreamingEvent {
+                total_amount,
+                numerator,
+                denominator,
+                streamed_payout: split.first,
+                client_refund: split.second,
+            },
+        );
+
+        Ok(split)
+    }
+
+    /// Compute a streaming milestone split that requires **dual consent**:
+    /// both the client and the freelancer must independently sign the
+    /// transaction.
+    ///
+    /// `payment_streaming_milestones` is an unauthenticated calculator — any
+    /// caller may ask it what a given ratio works out to.  This endpoint is
+    /// the consent-gated counterpart, for deployments that want a streaming
+    /// settlement to be agreed by both parties before it is computed and
+    /// recorded on-chain.
+    ///
+    /// # Signature collection
+    /// [`require_client_and_freelancer_consent`] calls `require_auth()` on the
+    /// client address and then on the freelancer address, both taken from the
+    /// stored job metadata rather than from caller-supplied arguments.  If
+    /// either signature is missing from the transaction the host-level auth
+    /// check panics before any ratio validation runs, so a single-signature
+    /// attempt reverts the invocation entirely.  Neither party can be
+    /// impersonated by passing a different address, because no address is
+    /// accepted as a parameter.
+    ///
+    /// # Parameters
+    /// * `total_amount` – Total streaming amount; must be > 0.
+    /// * `numerator`    – Streamed portion; must satisfy 0 ≤ n ≤ denominator.
+    /// * `denominator`  – Ratio denominator; must be > 0.
+    ///
+    /// # Returns
+    /// A `RatioSplit` where `first` is the streamed payout and `second` is the
+    /// client refund.  The two always sum to `total_amount` exactly.
+    ///
+    /// # Errors
+    /// * `NotInitialized` – Job metadata missing, so no signers are known.
+    /// * `InvalidAmount`  – `total_amount` ≤ 0.
+    /// * `InvalidRatio`   – `denominator` ≤ 0, or `numerator` outside
+    ///   `0..=denominator`.
+    pub fn payment_streaming_consent(
+        env: Env,
+        total_amount: i128,
+        numerator: i128,
+        denominator: i128,
+    ) -> Result<RatioSplit, Error> {
+        // Collect both signatures first: an unauthorised caller must not be
+        // able to probe the validation rules below.
+        let meta = Self::require_client_and_freelancer_consent(&env)?;
+
+        if total_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if denominator <= 0 {
+            return Err(Error::InvalidRatio);
+        }
+        if numerator < 0 || numerator > denominator {
+            return Err(Error::InvalidRatio);
+        }
+
+        let split = Self::split_round_nearest(total_amount, numerator, denominator)?;
+
+        env.events().publish(
+            (symbol_short!("p_strcns"),),
+            PaymentStreamingConsentEvent {
+                client: meta.client,
+                freelancer: meta.freelancer,
                 total_amount,
                 numerator,
                 denominator,
@@ -3958,6 +4206,8 @@ impl MilestoneEscrow {
 }
 
 mod test;
+mod test_emergency_pause;
+mod test_payment_streaming_milestones;
 
 // ── escrow_interest_yield: admin emergency override endpoints ─────────────────
 //
@@ -4522,6 +4772,12 @@ impl MilestoneEscrow {
             return Err(Error::InvalidRatio);
         }
 
+        let token_client = token::Client::new(&env, &meta.token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        if contract_balance <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
         let milestone = Self::load_milestone(&env, milestone_index)?;
 
         if milestone.status == MilestoneStatus::Released
@@ -4594,6 +4850,12 @@ impl MilestoneEscrow {
         admin: Address,
         milestone_index: u32,
     ) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !env.storage().persistent().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+
         Self::require_admin(&env, &admin)?;
 
         let meta = Self::load_job_meta(&env)?;
@@ -4810,8 +5072,18 @@ impl MilestoneEscrow {
         milestone_index: u32,
         tax_rate_bps: u32,
     ) -> Result<(i128, i128, i128), Error> {
-        admin.require_auth();
         Self::require_admin(&env, &admin)?;
+
+        let meta = Self::load_job_meta(&env)?;
+        if !meta.funded {
+            return Err(Error::NotFunded);
+        }
+
+        let token_client = token::Client::new(&env, &meta.token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        if contract_balance <= 0 {
+            return Err(Error::InvalidAmount);
+        }
 
         // Acquire lock before any state reads to prevent concurrent mutations.
         env.storage()
@@ -4821,10 +5093,6 @@ impl MilestoneEscrow {
         // Ensure lock is released even if the function returns early due to error.
         // We use a defer-like pattern by clearing the lock before returning.
         let result = (|| {
-            let meta = Self::load_job_meta(&env)?;
-            if !meta.funded {
-                return Err(Error::NotFunded);
-            }
             if milestone_index >= meta.milestone_count {
                 return Err(Error::InvalidMilestone);
             }
@@ -5194,6 +5462,193 @@ impl MilestoneEscrow {
         );
 
         Ok(allocation)
+    }
+
+    /// Admin-gated split-refund claim that may only run **while the contract
+    /// is actually frozen**.
+    ///
+    /// `emergency_pause_split_refund` is an unauthenticated calculator that
+    /// answers "what would this split be?" at any time.  This endpoint is the
+    /// operational counterpart: it enforces the business rules that must hold
+    /// before an emergency refund is settled, rejecting each bad setup with a
+    /// distinct error variant before any arithmetic runs.
+    ///
+    /// # Business rules
+    /// 1. Contract initialised and caller is the stored admin
+    ///    (`NotInitialized` / `Unauthorized`).
+    /// 2. No pause transition mid-execution (`EmergencyPauseInProgress`) — a
+    ///    refund must not be computed against a half-applied freeze.
+    /// 3. The contract **is** paused (`NotPaused`).  Settling an emergency
+    ///    refund on a running escrow would bypass the normal release and
+    ///    dispute paths.
+    /// 4. `total_amount` > 0 (`InvalidAmount`) and the two shares sum to
+    ///    exactly `BPS_SCALE` (`InvalidRatio`).
+    ///
+    /// # Returns
+    /// A `RefundAllocation` whose two amounts sum to `total_amount` exactly.
+    ///
+    /// # Errors
+    /// * `NotInitialized`           – Admin key has never been stored.
+    /// * `Unauthorized`             – `admin` is not the stored admin.
+    /// * `EmergencyPauseInProgress` – A pause transition is already running.
+    /// * `NotPaused`                – The contract is not frozen.
+    /// * `InvalidAmount`            – `total_amount` ≤ 0, or overflow.
+    /// * `InvalidRatio`             – Shares do not sum to 10 000 bps.
+    pub fn emergency_pause_claim_refund(
+        env: Env,
+        admin: Address,
+        total_amount: i128,
+        client_refund_bps: u32,
+        freelancer_payout_bps: u32,
+    ) -> Result<RefundAllocation, Error> {
+        Self::require_admin(&env, &admin)?;
+        Self::assert_emergency_pause_not_locked(&env)?;
+
+        if !Self::is_emergency_paused(env.clone()) {
+            return Err(Error::NotPaused);
+        }
+
+        Self::emergency_pause_split_refund(
+            env,
+            total_amount,
+            client_refund_bps,
+            freelancer_payout_bps,
+        )
+    }
+
+    /// Divide a frozen escrow balance across an arbitrary number of parties
+    /// without losing value to rounding.
+    ///
+    /// # Why plain division is not enough
+    /// Allocating `total × weightᵢ / Σweights` with truncating division rounds
+    /// every party down, so the shares sum to *less* than `total`.  The
+    /// shortfall is at most `n − 1` stroops per call, but it is systematic:
+    /// the same party sizes lose value every time, and the residue is stranded
+    /// in the contract with no owner.
+    ///
+    /// # Algorithm — largest remainder (Hare quota)
+    /// ```text
+    /// weightedᵢ = total × weightᵢ
+    /// baseᵢ     = weightedᵢ / Σweights      (floor)
+    /// remᵢ      = weightedᵢ % Σweights      (exact fractional part, scaled)
+    /// residue   = total − Σbaseᵢ            (0 ≤ residue < n)
+    /// ```
+    /// The `residue` indivisible units are then handed out one at a time to
+    /// the parties with the largest `remᵢ`, each party receiving at most one.
+    /// This is exact rather than approximate: `remᵢ` is the true numerator of
+    /// the discarded fraction, so the units go to whoever was rounded down
+    /// hardest.
+    ///
+    /// # Guarantees
+    /// * **Conservation** – `Σallocations == total_amount` exactly, for every
+    ///   input.  No value is lost and none is created.
+    /// * **Bounded error** – each `allocationᵢ` is within one unit of the
+    ///   exact rational share `total × weightᵢ / Σweights`; it is never more
+    ///   than one unit below it, so no party is systematically rounded down.
+    /// * **Determinism** – ties in `remᵢ` are broken by lowest index, so the
+    ///   same inputs always produce the same vector.
+    /// * **Zero weights** – a party weighted `0` receives exactly `0`; its
+    ///   remainder is also `0`, so it never wins a residue unit ahead of a
+    ///   party with a real fractional claim.
+    ///
+    /// # Parameters
+    /// * `total_amount` – Amount to divide; must be > 0.
+    /// * `weights`      – Per-party weights.  Need not sum to any particular
+    ///   scale; only their ratios matter.  Must be non-empty, at most
+    ///   `MAX_EMERGENCY_ALLOCATION_PARTIES` long, non-negative, and sum to > 0.
+    ///
+    /// # Returns
+    /// A `Vec<i128>` of per-party amounts, index-aligned with `weights`.
+    ///
+    /// # Errors
+    /// * `InvalidAmount`             – `total_amount` ≤ 0, or arithmetic overflow.
+    /// * `InvalidAllocationWeights`  – `weights` empty, over the cap, negative,
+    ///   or summing to zero.
+    pub fn emergency_pause_allocation(
+        env: Env,
+        total_amount: i128,
+        weights: Vec<i128>,
+    ) -> Result<Vec<i128>, Error> {
+        if total_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        if weights.is_empty() || weights.len() > MAX_EMERGENCY_ALLOCATION_PARTIES {
+            return Err(Error::InvalidAllocationWeights);
+        }
+
+        let mut weight_sum: i128 = 0;
+        for weight in weights.iter() {
+            if weight < 0 {
+                return Err(Error::InvalidAllocationWeights);
+            }
+            weight_sum = weight_sum
+                .checked_add(weight)
+                .ok_or(Error::InvalidAllocationWeights)?;
+        }
+
+        if weight_sum <= 0 {
+            return Err(Error::InvalidAllocationWeights);
+        }
+
+        let mut allocations: Vec<i128> = Vec::new(&env);
+        let mut remainders: Vec<i128> = Vec::new(&env);
+        let mut allocated_total: i128 = 0;
+
+        for weight in weights.iter() {
+            let weighted = total_amount
+                .checked_mul(weight)
+                .ok_or(Error::InvalidAmount)?;
+
+            allocations.push_back(weighted / weight_sum);
+            remainders.push_back(weighted % weight_sum);
+
+            allocated_total = allocated_total
+                .checked_add(weighted / weight_sum)
+                .ok_or(Error::InvalidAmount)?;
+        }
+
+        // `residue` is strictly less than the number of parties, because each
+        // discarded fraction is < 1 unit. The loop below therefore runs at
+        // most `MAX_EMERGENCY_ALLOCATION_PARTIES` times.
+        let residue = total_amount
+            .checked_sub(allocated_total)
+            .ok_or(Error::InvalidAmount)?;
+
+        for _ in 0..residue {
+            let mut best_index: u32 = 0;
+            let mut best_remainder: i128 = i128::MIN;
+
+            // Strict `>` keeps the lowest index on a tie, making the result
+            // deterministic across identical inputs.
+            for (idx, rem) in remainders.iter().enumerate() {
+                if rem > best_remainder {
+                    best_remainder = rem;
+                    best_index = idx as u32;
+                }
+            }
+
+            let current = allocations.get(best_index).ok_or(Error::InvalidAmount)?;
+            allocations.set(
+                best_index,
+                current.checked_add(1).ok_or(Error::InvalidAmount)?,
+            );
+
+            // Retire this party so it cannot win a second residue unit.
+            remainders.set(best_index, i128::MIN);
+        }
+
+        let num_parties = allocations.len();
+        env.events().publish(
+            (symbol_short!("epalloc"),),
+            EmergencyPauseAllocationEvent {
+                total_amount,
+                num_parties,
+                allocations: allocations.clone(),
+            },
+        );
+
+        Ok(allocations)
     }
 
     /// Lock the multisig approval workflow, preventing further normal
