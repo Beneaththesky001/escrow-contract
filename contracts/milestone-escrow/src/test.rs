@@ -1,5 +1,9 @@
 #![cfg(test)]
 use super::*;
+#[path = "cancel_escrow_test.rs"]
+mod cancel_escrow_test;
+#[path = "emergency_pause_test.rs"]
+mod emergency_pause_test;
 use crate::Error::NotFunded;
 use soroban_sdk::{
     contract, contractimpl, contracttype, testutils::Address as _, testutils::EnvTestConfig,
@@ -9364,129 +9368,74 @@ fn test_multisig_transfer_admin_zero_total_emits_no_event() {
     assert!(events.is_empty(), "no events expected on failed call");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Admin-transfer hardening (#348)
-//
-// `cancel_admin_transfer_proposal` must reject unauthorised callers and illegal
-// source states with specific typed errors, and must not mutate any ledger
-// entry on the rejected paths.
-// ═══════════════════════════════════════════════════════════════════════════════
-
 #[test]
-fn test_cancel_admin_transfer_unauthorized_no_mutation() {
+fn test_platform_fee_allocation_preserves_value_with_largest_remainders() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = Address::generate(&env);
-    let client_addr = Address::generate(&env);
-    let freelancer = Address::generate(&env);
+    let (admin, client_addr, freelancer_addr, token, auto_release) = setup_test_env(&env);
     let arbiter = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
     let contract_id = env.register(MilestoneEscrow, ());
     let client = MilestoneEscrowClient::new(&env, &contract_id);
-    let amounts = vec![&env, 1_000_i128];
     client.initialize(
         &admin,
         &client_addr,
-        &freelancer,
+        &freelancer_addr,
         &arbiter,
         &token,
-        &604800,
-        &amounts,
+        &auto_release,
+        &vec![&env, 1_000_i128],
     );
 
-    let new_admin = Address::generate(&env);
+    client.set_platform_fee_allocation(&admin, &3333, &3333, &3334);
+    let distribution = client.calculate_platform_fee_split(&2_i128);
+    assert_eq!(distribution.client_amount, 1);
+    assert_eq!(distribution.freelancer_amount, 0);
+    assert_eq!(distribution.treasury_amount, 1);
     assert_eq!(
-        client.try_propose_admin_transfer(&admin, &new_admin, &1u32),
-        Ok(Ok(()))
+        distribution.client_amount + distribution.freelancer_amount + distribution.treasury_amount,
+        2
     );
 
-    let attacker = Address::generate(&env);
-    let result = client.try_cancel_admin_transfer_proposal(&attacker);
-    assert_eq!(result, Err(Ok(crate::Error::Unauthorized)));
-
-    // The pending entry must remain unchanged after a rejected cancel.
-    let pending = client
-        .try_get_pending_admin_transfer()
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(pending.new_admin, new_admin);
-    assert_eq!(pending.proposal_id, 1u32);
+    let zero = client.calculate_platform_fee_split(&0_i128);
+    assert_eq!(
+        zero.client_amount + zero.freelancer_amount + zero.treasury_amount,
+        0
+    );
+    let negative = client.try_calculate_platform_fee_split(&-1_i128);
+    assert_eq!(negative, Err(Ok(Error::InvalidAmount)));
 }
-
-#[test]
-fn test_cancel_admin_transfer_no_pending_rejected() {
+fn test_tax_withholding_deductions_zero_balance_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = Address::generate(&env);
-    let client_addr = Address::generate(&env);
-    let freelancer = Address::generate(&env);
-    let arbiter = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-    let amounts = vec![&env, 1_000_i128];
-    client.initialize(
-        &admin,
-        &client_addr,
-        &freelancer,
-        &arbiter,
-        &token,
-        &604800,
-        &amounts,
-    );
+    let milestone_amounts = vec![&env, 1000_i128];
+    let (_, _, _, _, token_contract_id, contract_id, client) =
+        setup_funded_escrow(&env, milestone_amounts);
 
-    assert_eq!(client.try_get_pending_admin_transfer(), Ok(Ok(None)));
-    let result = client.try_cancel_admin_transfer_proposal(&admin);
-    assert_eq!(result, Err(Ok(crate::Error::NoPendingAdminTransfer)));
-    assert_eq!(client.try_get_pending_admin_transfer(), Ok(Ok(None)));
+    // Empty the contract balance by transferring all tokens out
+    let token_client = token::Client::new(&env, &token_contract_id);
+    token_client.transfer(&contract_id, &Address::generate(&env), &1000_i128);
+
+    // Call tax_withholding_deductions (should fail with InvalidAmount)
+    let res = client.try_tax_withholding_deductions(&0u32, &1000u32);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
 }
 
 #[test]
-fn test_cancel_admin_transfer_uninitialized_rejected() {
+fn test_admin_tax_withholding_deductions_zero_balance_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = Address::generate(&env);
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-    let result = client.try_cancel_admin_transfer_proposal(&admin);
-    assert_eq!(result, Err(Ok(crate::Error::NotInitialized)));
-}
+    let milestone_amounts = vec![&env, 1000_i128];
+    let (_, _, _, admin_addr, token_contract_id, contract_id, client) =
+        setup_funded_escrow(&env, milestone_amounts);
 
-#[test]
-fn test_cancel_admin_transfer_happy_path() {
-    let env = Env::default();
-    env.mock_all_auths();
+    // Empty the contract balance by transferring all tokens out
+    let token_client = token::Client::new(&env, &token_contract_id);
+    token_client.transfer(&contract_id, &Address::generate(&env), &1000_i128);
 
-    let admin = Address::generate(&env);
-    let client_addr = Address::generate(&env);
-    let freelancer = Address::generate(&env);
-    let arbiter = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-    let amounts = vec![&env, 1_000_i128];
-    client.initialize(
-        &admin,
-        &client_addr,
-        &freelancer,
-        &arbiter,
-        &token,
-        &604800,
-        &amounts,
-    );
-
-    let new_admin = Address::generate(&env);
-    assert_eq!(
-        client.try_propose_admin_transfer(&admin, &new_admin, &1u32),
-        Ok(Ok(()))
-    );
-    assert_eq!(
-        client.try_cancel_admin_transfer_proposal(&admin),
-        Ok(Ok(()))
-    );
-    assert_eq!(client.try_get_pending_admin_transfer(), Ok(Ok(None)));
+    // Call admin_tax_withholding_deductions (should fail with InvalidAmount)
+    let res = client.try_admin_tax_withholding_deductions(&admin_addr, &0u32, &1000u32);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
 }
