@@ -1,9 +1,9 @@
 #![cfg(test)]
 use super::*;
-#[path = "emergency_pause_test.rs"]
-mod emergency_pause_test;
 #[path = "cancel_escrow_test.rs"]
 mod cancel_escrow_test;
+#[path = "emergency_pause_test.rs"]
+mod emergency_pause_test;
 use crate::Error::NotFunded;
 use soroban_sdk::{
     contract, contractimpl, contracttype, testutils::Address as _, testutils::EnvTestConfig,
@@ -9403,4 +9403,3 @@ fn test_admin_tax_withholding_deductions_zero_balance_fails() {
     let res = client.try_admin_tax_withholding_deductions(&admin_addr, &0u32, &1000u32);
     assert_eq!(res, Err(Ok(Error::InvalidAmount)));
 }
-

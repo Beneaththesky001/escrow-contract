@@ -510,7 +510,6 @@ pub struct EmergencyPauseAdminOverrideEvent {
     pub paused: bool,
 }
 
-
 // ── tax_withholding_deductions types and events ──────────────────────────────
 
 /// Stored in `DataKey::TaxWithholdingLock(milestone_index)` by
@@ -3979,7 +3978,6 @@ impl MilestoneEscrow {
 }
 
 mod test;
-
 
 // ── escrow_interest_yield: admin emergency override endpoints ─────────────────
 //
