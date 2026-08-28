@@ -2973,12 +2973,8 @@ impl MilestoneEscrow {
     /// * `InvalidStatus`   – `CancelLock` is not active.
     /// * `InvalidAmount`   – Total remaining balance is zero (nothing to pay out).
     pub fn admin_override_cancel_release(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
         Self::require_admin(&env, &admin)?;
-
-        let meta = Self::load_job_meta(&env)?;
-        if !meta.funded {
-            return Err(Error::NotFunded);
-        }
 
         // Only valid when a cancel lock is active.
         let cancel_locked = env
@@ -2988,6 +2984,11 @@ impl MilestoneEscrow {
             .unwrap_or(false);
         if !cancel_locked {
             return Err(Error::InvalidStatus);
+        }
+
+        let meta = Self::load_job_meta(&env)?;
+        if !meta.funded {
+            return Err(Error::NotFunded);
         }
 
         // Walk every milestone; accumulate remaining balance and mark Released.
@@ -5437,7 +5438,8 @@ impl MilestoneEscrow {
     /// executing on-chain transfers.
     ///
     /// # Parameters
-    /// * `env`                  – Soroban environment (used only for event emission).
+    /// * `env`                  – Soroban environment.
+    /// * `admin`                – Must match `DataKey::Admin`.
     /// * `total_amount`         – Total amount to split.
     /// * `client_refund_bps`    – Client's refund share in basis points.
     /// * `freelancer_payout_bps`– Freelancer's payout share in basis points.
@@ -5447,14 +5449,29 @@ impl MilestoneEscrow {
     /// ratios that were used.
     ///
     /// # Errors
-    /// * `InvalidRatio` – Ratios do not sum to `BPS_SCALE`.
-    /// * `InvalidAmount`– `total_amount` ≤ 0 or arithmetic overflow.
+    /// * `NotInitialized`– Contract has not been initialized.
+    /// * `Unauthorized`  – `admin` is not the verified admin.
+    /// * `InvalidStatus` – Multisig workflow is not locked.
+    /// * `InvalidRatio`  – Ratios do not sum to `BPS_SCALE`.
+    /// * `InvalidAmount` – `total_amount` ≤ 0 or arithmetic overflow.
     pub fn multisig_split_refund(
         env: Env,
+        admin: Address,
         total_amount: i128,
         client_refund_bps: u32,
         freelancer_payout_bps: u32,
     ) -> Result<RefundAllocation, Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        let multisig_locked = env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::MultisigLocked)
+            .unwrap_or(false);
+        if !multisig_locked {
+            return Err(Error::InvalidStatus);
+        }
         if total_amount <= 0 {
             return Err(Error::InvalidAmount);
         }
