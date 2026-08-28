@@ -2973,7 +2973,6 @@ impl MilestoneEscrow {
     /// * `InvalidStatus`   – `CancelLock` is not active.
     /// * `InvalidAmount`   – Total remaining balance is zero (nothing to pay out).
     pub fn admin_override_cancel_release(env: Env, admin: Address) -> Result<(), Error> {
-        admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
         // Only valid when a cancel lock is active.
@@ -4865,18 +4864,18 @@ impl MilestoneEscrow {
             return Err(Error::InvalidRatio);
         }
 
-        let token_client = token::Client::new(&env, &meta.token);
-        let contract_balance = token_client.balance(&env.current_contract_address());
-        if contract_balance <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
         let milestone = Self::load_milestone(&env, milestone_index)?;
 
         if milestone.status == MilestoneStatus::Released
             || milestone.status == MilestoneStatus::Refunded
         {
             return Err(Error::InvalidStatus);
+        }
+
+        let token_client = token::Client::new(&env, &meta.token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        if contract_balance <= 0 {
+            return Err(Error::InvalidAmount);
         }
 
         let gross_amount = milestone
@@ -4943,8 +4942,6 @@ impl MilestoneEscrow {
         admin: Address,
         milestone_index: u32,
     ) -> Result<(), Error> {
-        admin.require_auth();
-
         if !env.storage().persistent().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
@@ -5461,7 +5458,6 @@ impl MilestoneEscrow {
         client_refund_bps: u32,
         freelancer_payout_bps: u32,
     ) -> Result<RefundAllocation, Error> {
-        admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
         let multisig_locked = env
