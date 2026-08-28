@@ -11,6 +11,10 @@ use soroban_sdk::{
     Val,
 };
 
+#[path = "multisig_admin_override_refund_tests.rs"]
+mod multisig_admin_override_refund_tests;
+#[path = "multisig_transfer_admin_tests.rs"]
+mod multisig_transfer_admin_tests;
 #[path = "tax_withholding_tests.rs"]
 mod tax_withholding_tests;
 
@@ -2792,7 +2796,10 @@ fn test_multisig_admin_override_refund_requires_admin() {
     let result = client.try_multisig_admin_override_refund(&attacker, &0u32);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
 
-    // Admin override should succeed and refund to client
+    // Admin override should succeed and refund to client. The source
+    // state must be multisig-locked; otherwise the precondition guard
+    // rejects the call before any refund is applied.
+    client.multisig_lock(&admin_addr);
     let token = token::Client::new(&env, &token_id);
     let client_before = token.balance(&client_addr);
     client.multisig_admin_override_refund(&admin_addr, &0u32);
@@ -2841,6 +2848,7 @@ fn test_multisig_admin_override_refund_emits_event() {
     let (client_addr, _, _, admin_addr, token_id, contract_id, client) =
         setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
+    client.multisig_lock(&admin_addr);
     client.multisig_admin_override_refund(&admin_addr, &0u32);
 
     let topic_val: Val = symbol_short!("msadmref").into_val(&env);
@@ -6735,7 +6743,10 @@ fn test_tax_withholding_record_can_be_resolved_as_net_release() {
     client.admin_override_tax_release(&admin_addr, &0_u32);
 
     assert_eq!(token.balance(&freelancer_addr), 750);
-    assert_eq!(client.get_job().milestones.get(0).unwrap().status, MilestoneStatus::Released);
+    assert_eq!(
+        client.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Released
+    );
     assert_eq!(
         client.try_admin_override_tax_release(&admin_addr, &0_u32),
         Err(Ok(Error::InvalidStatus))
@@ -6747,14 +6758,19 @@ fn test_tax_withholding_record_can_be_resolved_as_gross_refund() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (_, _, _, admin_addr, _, _, client) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
     client.tax_withholding_deductions(&0_u32, &7_500_u32);
     client.admin_override_tax_refund(&admin_addr, &0_u32);
 
-    assert_eq!(client.get_job().milestones.get(0).unwrap().status, MilestoneStatus::Refunded);
-    assert_eq!(client.try_admin_override_tax_refund(&admin_addr, &0_u32), Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Refunded
+    );
+    assert_eq!(
+        client.try_admin_override_tax_refund(&admin_addr, &0_u32),
+        Err(Ok(Error::InvalidStatus))
+    );
 }
 
 #[test]
@@ -6791,8 +6807,7 @@ fn test_tax_withholding_deductions_rejects_invalid_state_and_inputs() {
         Err(Ok(Error::NotFunded))
     );
 
-    let (_, _, _, _, _, _, funded_client) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let (_, _, _, _, _, _, funded_client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
     assert_eq!(
         funded_client.try_tax_withholding_deductions(&1_u32, &1_u32),
         Err(Ok(Error::InvalidMilestone))
@@ -9500,8 +9515,7 @@ fn test_cancel_escrow_succeeds_with_positive_balance() {
     env.mock_all_auths();
 
     let amounts = vec![&env, 5_000_i128];
-    let (client_addr, _, _, _, _, _, client) =
-        setup_funded_escrow(&env, amounts);
+    let (client_addr, _, _, _, _, _, client) = setup_funded_escrow(&env, amounts);
 
     // Balance is positive — cancel should succeed.
     client.cancel_escrow(&client_addr);
@@ -9760,8 +9774,7 @@ fn test_cancel_escrow_freelancer_can_cancel() {
     env.mock_all_auths();
 
     let amounts = vec![&env, 4_000_i128];
-    let (_, freelancer_addr, _, _, _, _, client) =
-        setup_funded_escrow(&env, amounts);
+    let (_, freelancer_addr, _, _, _, _, client) = setup_funded_escrow(&env, amounts);
 
     client.cancel_escrow(&freelancer_addr);
 
@@ -10093,8 +10106,7 @@ fn test_admin_override_cancel_release_unauthorized_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (_, _, _, _, _, _, client) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
     let attacker = Address::generate(&env);
     let result = client.try_admin_override_cancel_release(&attacker);
@@ -10106,8 +10118,7 @@ fn test_admin_override_cancel_release_illegal_source_state_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (_, _, _, admin_addr, _, _, client) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
     // Escrow is funded but NOT cancel locked (illegal source state)
     let result = client.try_admin_override_cancel_release(&admin_addr);
@@ -10119,8 +10130,7 @@ fn test_multisig_split_refund_unauthorized_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (_, _, _, admin_addr, _, _, client) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
     client.multisig_lock(&admin_addr);
 
     let attacker = Address::generate(&env);
@@ -10133,8 +10143,7 @@ fn test_multisig_split_refund_illegal_source_state_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (_, _, _, admin_addr, _, _, client) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
     // Escrow is funded but NOT multisig locked (illegal source state)
     let result = client.try_multisig_split_refund(&admin_addr, &1_000_i128, &5_000_u32, &5_000_u32);

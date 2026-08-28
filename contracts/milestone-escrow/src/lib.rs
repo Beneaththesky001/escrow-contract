@@ -2864,11 +2864,8 @@ impl MilestoneEscrow {
             return Err(Error::InvalidRatio);
         }
 
-        let client_split = Self::split_round_nearest(
-            total_amount,
-            client_refund_bps as i128,
-            BPS_SCALE as i128,
-        )?;
+        let client_split =
+            Self::split_round_nearest(total_amount, client_refund_bps as i128, BPS_SCALE as i128)?;
 
         Ok(RefundAllocation {
             client_refund: client_split.first,
@@ -5351,6 +5348,19 @@ impl MilestoneEscrow {
     /// and a full token transfer is executed back to the client.  The
     /// `MultisigLocked` flag is cleared.
     ///
+    /// # Checks (in order)
+    /// Authorization and source-state guards run **before** any job or
+    /// milestone ledger entry is read or written, so a rejected call cannot
+    /// mutate storage:
+    /// 1. `require_admin` — caller must be the stored admin (`Unauthorized`
+    ///    / `NotInitialized`).
+    /// 2. `MultisigLocked` must be active (`InvalidStatus`).
+    /// 3. Escrow must be funded (`NotFunded`).
+    /// 4. `milestone_index` must be in range (`InvalidMilestone`).
+    /// 5. Milestone must not already be `Released` or `Refunded`
+    ///    (`InvalidStatus`).
+    /// 6. Remaining balance must be > 0 (`InvalidAmount`).
+    ///
     /// # Parameters
     /// * `admin`           – Must match `DataKey::Admin`.
     /// * `milestone_index` – Target milestone.
@@ -5358,9 +5368,10 @@ impl MilestoneEscrow {
     /// # Errors
     /// * `NotInitialized`  – Contract has not been initialised.
     /// * `Unauthorized`    – `admin` is not the stored admin.
+    /// * `InvalidStatus`   – Multisig workflow is not locked, or the
+    ///                       milestone is already `Released` / `Refunded`.
     /// * `NotFunded`       – Escrow has not been funded.
     /// * `InvalidMilestone`– `milestone_index` is out of range.
-    /// * `InvalidStatus`   – Milestone is already `Released` or `Refunded`.
     /// * `InvalidAmount`   – Remaining balance is ≤ 0.
     pub fn multisig_admin_override_refund(
         env: Env,
@@ -5368,6 +5379,16 @@ impl MilestoneEscrow {
         milestone_index: u32,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+
+        // Reject illegal source state before any job/milestone ledger I/O.
+        let multisig_locked = env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::MultisigLocked)
+            .unwrap_or(false);
+        if !multisig_locked {
+            return Err(Error::InvalidStatus);
+        }
 
         let meta = Self::load_job_meta(&env)?;
         if !meta.funded {
