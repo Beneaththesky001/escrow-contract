@@ -210,10 +210,8 @@ pub enum DataKey {
     /// `multisig_admin_override_refund`.
     MultisigLocked,
     MilestoneTimeExtension(u32),
-    /// Compact instance key for the cancel_escrow lock.  This workflow flag
-    /// is stored once per escrow, so keeping its serialized key to one byte
-    /// materially reduces the ledger footprint.
-    C,
+    /// Instance key for the cancel_escrow lock.
+    CancelLock,
     // ── tax_withholding_deductions storage keys ──────────────────────────────
     /// Persistent: tax rate in basis points (1 bp = 0.01 %) set by
     /// `admin_set_tax_rate`.  Range 0–10 000 (0 %–100 %).
@@ -982,7 +980,7 @@ impl MilestoneEscrow {
         let cancel_locked = env
             .storage()
             .instance()
-            .get::<_, bool>(&DataKey::C)
+            .get::<_, bool>(&DataKey::CancelLock)
             .unwrap_or(false);
         if cancel_locked {
             return Err(Error::EscrowLocked);
@@ -2867,11 +2865,8 @@ impl MilestoneEscrow {
             return Err(Error::InvalidRatio);
         }
 
-        let client_split = Self::split_round_nearest(
-            total_amount,
-            client_refund_bps as i128,
-            BPS_SCALE as i128,
-        )?;
+        let client_split =
+            Self::split_round_nearest(total_amount, client_refund_bps as i128, BPS_SCALE as i128)?;
 
         Ok(RefundAllocation {
             client_refund: client_split.first,
@@ -2987,7 +2982,7 @@ impl MilestoneEscrow {
         let cancel_locked = env
             .storage()
             .instance()
-            .get::<_, bool>(&DataKey::C)
+            .get::<_, bool>(&DataKey::CancelLock)
             .unwrap_or(false);
         if !cancel_locked {
             return Err(Error::InvalidStatus);
@@ -3022,7 +3017,7 @@ impl MilestoneEscrow {
         }
 
         // CEI: clear the lock and reset yield before the external transfer.
-        env.storage().instance().set(&DataKey::C, &false);
+        env.storage().instance().set(&DataKey::CancelLock, &false);
         env.storage()
             .persistent()
             .set(&DataKey::YieldAccrued, &0_i128);
@@ -3084,7 +3079,7 @@ impl MilestoneEscrow {
         let cancel_locked = env
             .storage()
             .instance()
-            .get::<_, bool>(&DataKey::C)
+            .get::<_, bool>(&DataKey::CancelLock)
             .unwrap_or(false);
         if !cancel_locked {
             return Err(Error::InvalidStatus);
@@ -3123,7 +3118,7 @@ impl MilestoneEscrow {
         }
 
         // CEI: clear the lock and reset yield before the external transfer.
-        env.storage().instance().set(&DataKey::C, &false);
+        env.storage().instance().set(&DataKey::CancelLock, &false);
         env.storage()
             .persistent()
             .set(&DataKey::YieldAccrued, &0_i128);

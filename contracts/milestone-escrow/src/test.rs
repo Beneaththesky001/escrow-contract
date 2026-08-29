@@ -221,9 +221,15 @@ fn test_cancel_escrow_uses_compact_lock_key() {
     client.cancel_escrow(&client_addr);
 
     let lock = env.as_contract(&contract_id, || {
-        env.storage().instance().get::<_, bool>(&DataKey::C)
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::CancelLock)
     });
-    assert_eq!(lock, Some(true), "cancel_escrow must set the compact C key");
+    assert_eq!(
+        lock,
+        Some(true),
+        "cancel_escrow must set the CancelLock key"
+    );
 
     let blocked = client.try_mark_delivered(&freelancer_addr, &0u32);
     assert_eq!(blocked, Err(Ok(Error::EscrowLocked)));
@@ -6765,7 +6771,10 @@ fn test_tax_withholding_record_can_be_resolved_as_net_release() {
     client.admin_override_tax_release(&admin_addr, &0_u32);
 
     assert_eq!(token.balance(&freelancer_addr), 750);
-    assert_eq!(client.get_job().milestones.get(0).unwrap().status, MilestoneStatus::Released);
+    assert_eq!(
+        client.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Released
+    );
     assert_eq!(
         client.try_admin_override_tax_release(&admin_addr, &0_u32),
         Err(Ok(Error::InvalidStatus))
@@ -6777,14 +6786,19 @@ fn test_tax_withholding_record_can_be_resolved_as_gross_refund() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let (_, _, _, admin_addr, _, _, client) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
     client.tax_withholding_deductions(&0_u32, &7_500_u32);
     client.admin_override_tax_refund(&admin_addr, &0_u32);
 
-    assert_eq!(client.get_job().milestones.get(0).unwrap().status, MilestoneStatus::Refunded);
-    assert_eq!(client.try_admin_override_tax_refund(&admin_addr, &0_u32), Err(Ok(Error::InvalidStatus)));
+    assert_eq!(
+        client.get_job().milestones.get(0).unwrap().status,
+        MilestoneStatus::Refunded
+    );
+    assert_eq!(
+        client.try_admin_override_tax_refund(&admin_addr, &0_u32),
+        Err(Ok(Error::InvalidStatus))
+    );
 }
 
 #[test]
@@ -6821,8 +6835,7 @@ fn test_tax_withholding_deductions_rejects_invalid_state_and_inputs() {
         Err(Ok(Error::NotFunded))
     );
 
-    let (_, _, _, _, _, _, funded_client) =
-        setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    let (_, _, _, _, _, _, funded_client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
     assert_eq!(
         funded_client.try_tax_withholding_deductions(&1_u32, &1_u32),
         Err(Ok(Error::InvalidMilestone))
@@ -9530,8 +9543,7 @@ fn test_cancel_escrow_succeeds_with_positive_balance() {
     env.mock_all_auths();
 
     let amounts = vec![&env, 5_000_i128];
-    let (client_addr, _, _, _, _, _, client) =
-        setup_funded_escrow(&env, amounts);
+    let (client_addr, _, _, _, _, _, client) = setup_funded_escrow(&env, amounts);
 
     // Balance is positive — cancel should succeed.
     client.cancel_escrow(&client_addr);
@@ -9790,8 +9802,7 @@ fn test_cancel_escrow_freelancer_can_cancel() {
     env.mock_all_auths();
 
     let amounts = vec![&env, 4_000_i128];
-    let (_, freelancer_addr, _, _, _, _, client) =
-        setup_funded_escrow(&env, amounts);
+    let (_, freelancer_addr, _, _, _, _, client) = setup_funded_escrow(&env, amounts);
 
     client.cancel_escrow(&freelancer_addr);
 
