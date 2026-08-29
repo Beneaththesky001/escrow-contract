@@ -3006,8 +3006,14 @@ impl MilestoneEscrow {
                     .ok_or(Error::InvalidAmount)?;
                 milestone.released_amount = milestone.amount;
                 milestone.status = MilestoneStatus::Released;
+                // Write only the persistent Milestone entry.  The temporary
+                // MilestoneReleased flag is omitted here: it is a hot-read
+                // optimisation for the approve_milestone path and is redundant
+                // in this admin-override code path because the persistent
+                // status already carries the Released state.  Skipping it
+                // reduces the number of distinct ledger keys written by this
+                // function by one per updated milestone (issue #383).
                 Self::store_milestone(&env, index, &milestone);
-                Self::store_milestone_released(&env, index);
             }
         }
 
@@ -3098,10 +3104,21 @@ impl MilestoneEscrow {
             {
                 continue;
             }
-            let remaining = milestone
-                .amount
-                .checked_sub(milestone.released_amount)
-                .ok_or(Error::InvalidAmount)?;
+            let remaining = {
+                // Guard: both fields must be non-negative before arithmetic.
+                // A malformed entry with a negative amount or released_amount
+                // (e.g. i128::MIN) could yield a nonsensical positive
+                // `remaining` after wrapping; rejecting here keeps the
+                // guarantee that every exit path either refunds a valid
+                // positive total or returns Error::InvalidAmount (issue #386).
+                if milestone.amount < 0 || milestone.released_amount < 0 {
+                    return Err(Error::InvalidAmount);
+                }
+                milestone
+                    .amount
+                    .checked_sub(milestone.released_amount)
+                    .ok_or(Error::InvalidAmount)?
+            };
             if remaining > 0 {
                 total_refunded = total_refunded
                     .checked_add(remaining)
@@ -4293,6 +4310,7 @@ impl MilestoneEscrow {
 mod test;
 mod test_emergency_pause;
 mod test_payment_streaming_milestones;
+mod admin_override_cancel_tests;
 
 // ── escrow_interest_yield: admin emergency override endpoints ─────────────────
 //
