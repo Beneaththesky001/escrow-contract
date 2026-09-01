@@ -11,6 +11,10 @@ use soroban_sdk::{
     Val,
 };
 
+#[path = "multisig_admin_override_refund_tests.rs"]
+mod multisig_admin_override_refund_tests;
+#[path = "multisig_transfer_admin_tests.rs"]
+mod multisig_transfer_admin_tests;
 #[path = "tax_withholding_tests.rs"]
 mod tax_withholding_tests;
 
@@ -161,7 +165,7 @@ impl ReentrantToken {
     }
 }
 
-fn setup_funded_escrow(
+pub(crate) fn setup_funded_escrow(
     env: &Env,
     milestone_amounts: soroban_sdk::Vec<i128>,
 ) -> (
@@ -2817,7 +2821,10 @@ fn test_multisig_admin_override_refund_requires_admin() {
     let result = client.try_multisig_admin_override_refund(&attacker, &0u32);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
 
-    // Admin override should succeed and refund to client
+    // Admin override should succeed and refund to client. The source
+    // state must be multisig-locked; otherwise the precondition guard
+    // rejects the call before any refund is applied.
+    client.multisig_lock(&admin_addr);
     let token = token::Client::new(&env, &token_id);
     let client_before = token.balance(&client_addr);
     client.multisig_admin_override_refund(&admin_addr, &0u32);
@@ -2866,6 +2873,7 @@ fn test_multisig_admin_override_refund_emits_event() {
     let (client_addr, _, _, admin_addr, token_id, contract_id, client) =
         setup_funded_escrow(&env, vec![&env, 1_000_i128]);
 
+    client.multisig_lock(&admin_addr);
     client.multisig_admin_override_refund(&admin_addr, &0u32);
 
     let topic_val: Val = symbol_short!("msadmref").into_val(&env);
@@ -6171,10 +6179,10 @@ fn test_multisig_split_refund_even_split() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    client.multisig_lock(&admin_addr);
 
-    let allocation = client.multisig_split_refund(&1_000_i128, &5_000_u32, &5_000_u32);
+    let allocation = client.multisig_split_refund(&admin_addr, &1_000_i128, &5_000_u32, &5_000_u32);
     assert_eq!(allocation.client_refund, 500);
     assert_eq!(allocation.freelancer_payout, 500);
     assert_eq!(allocation.client_refund_bps, 5_000);
@@ -6388,10 +6396,10 @@ fn test_multisig_split_refund_uneven_split() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    client.multisig_lock(&admin_addr);
 
-    let allocation = client.multisig_split_refund(&1_000_i128, &7_000_u32, &3_000_u32);
+    let allocation = client.multisig_split_refund(&admin_addr, &1_000_i128, &7_000_u32, &3_000_u32);
     assert_eq!(allocation.client_refund, 700);
     assert_eq!(allocation.freelancer_payout, 300);
     assert_eq!(allocation.client_refund_bps, 7_000);
@@ -6408,10 +6416,10 @@ fn test_multisig_split_refund_full_client_refund() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    client.multisig_lock(&admin_addr);
 
-    let allocation = client.multisig_split_refund(&1_000_i128, &10_000_u32, &0_u32);
+    let allocation = client.multisig_split_refund(&admin_addr, &1_000_i128, &10_000_u32, &0_u32);
     assert_eq!(allocation.client_refund, 1_000);
     assert_eq!(allocation.freelancer_payout, 0);
 }
@@ -6422,10 +6430,10 @@ fn test_multisig_split_refund_full_freelancer_payout() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    client.multisig_lock(&admin_addr);
 
-    let allocation = client.multisig_split_refund(&1_000_i128, &0_u32, &10_000_u32);
+    let allocation = client.multisig_split_refund(&admin_addr, &1_000_i128, &0_u32, &10_000_u32);
     assert_eq!(allocation.client_refund, 0);
     assert_eq!(allocation.freelancer_payout, 1_000);
 }
@@ -6436,11 +6444,11 @@ fn test_multisig_split_refund_invalid_ratio_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    client.multisig_lock(&admin_addr);
 
     // Total is 8000, not 10000
-    let result = client.try_multisig_split_refund(&1_000_i128, &5_000_u32, &3_000_u32);
+    let result = client.try_multisig_split_refund(&admin_addr, &1_000_i128, &5_000_u32, &3_000_u32);
     assert_eq!(result, Err(Ok(Error::InvalidRatio)));
 }
 
@@ -6450,10 +6458,10 @@ fn test_multisig_split_refund_zero_total_fails() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    client.multisig_lock(&admin_addr);
 
-    let result = client.try_multisig_split_refund(&0_i128, &5_000_u32, &5_000_u32);
+    let result = client.try_multisig_split_refund(&admin_addr, &0_i128, &5_000_u32, &5_000_u32);
     assert_eq!(result, Err(Ok(Error::InvalidAmount)));
 }
 
@@ -6463,11 +6471,11 @@ fn test_multisig_split_refund_odd_amount_rounding() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    client.multisig_lock(&admin_addr);
 
     // 101 split 50/50 should produce 51/50 (rounding up for client)
-    let allocation = client.multisig_split_refund(&101_i128, &5_000_u32, &5_000_u32);
+    let allocation = client.multisig_split_refund(&admin_addr, &101_i128, &5_000_u32, &5_000_u32);
     assert_eq!(allocation.client_refund + allocation.freelancer_payout, 101);
 }
 
@@ -6478,21 +6486,10 @@ fn test_multisig_split_refund_extreme_split_preserves_total() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let client_addr = Address::generate(&env);
-    let freelancer_addr = Address::generate(&env);
-    let arbiter_addr = Address::generate(&env);
-    let admin_addr = Address::generate(&env);
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 10_000_i128]);
+    client.multisig_lock(&admin_addr);
 
-    let token_contract_id = env
-        .register_stellar_asset_contract_v2(admin_addr.clone())
-        .address();
-    let token_admin = token::StellarAssetClient::new(&env, &token_contract_id);
-    token_admin.mint(&client_addr, &5_000);
-
-    let contract_id = env.register(MilestoneEscrow, ());
-    let client = MilestoneEscrowClient::new(&env, &contract_id);
-
-    let allocation = client.multisig_split_refund(&10_000_i128, &1_u32, &9_999_u32);
+    let allocation = client.multisig_split_refund(&admin_addr, &10_000_i128, &1_u32, &9_999_u32);
     assert_eq!(
         allocation.client_refund + allocation.freelancer_payout,
         10_000
@@ -10127,4 +10124,53 @@ fn test_tax_withholding_deductions_independent_across_milestones() {
     assert_eq!(record_b.gross_amount, 600);
     assert_eq!(record_b.tax_amount, 450);
     assert_eq!(record_b.net_amount, 150);
+}
+
+#[test]
+fn test_admin_override_cancel_release_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, _, _, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    let attacker = Address::generate(&env);
+    let result = client.try_admin_override_cancel_release(&attacker);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_admin_override_cancel_release_illegal_source_state_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    // Escrow is funded but NOT cancel locked (illegal source state)
+    let result = client.try_admin_override_cancel_release(&admin_addr);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+#[test]
+fn test_multisig_split_refund_unauthorized_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+    client.multisig_lock(&admin_addr);
+
+    let attacker = Address::generate(&env);
+    let result = client.try_multisig_split_refund(&attacker, &1_000_i128, &5_000_u32, &5_000_u32);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_multisig_split_refund_illegal_source_state_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, _, _, admin_addr, _, _, client) = setup_funded_escrow(&env, vec![&env, 1_000_i128]);
+
+    // Escrow is funded but NOT multisig locked (illegal source state)
+    let result = client.try_multisig_split_refund(&admin_addr, &1_000_i128, &5_000_u32, &5_000_u32);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
 }
